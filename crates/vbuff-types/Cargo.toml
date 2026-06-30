@@ -1,0 +1,11 @@
+[package]
+name = "vbuff-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Plain data model shared across vbuff crates."
+
+[dependencies]
+serde.workspace = true
+ulid.workspace = true
+chrono.workspace = true

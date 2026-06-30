@@ -1,0 +1,92 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["vbuff contributors"]
+repository = "https://github.com/vbuff/vbuff"
+
+[workspace.dependencies]
+# Internal crates
+vbuff-types = { path = "crates/vbuff-types" }
+vbuff-core = { path = "crates/vbuff-core" }
+vbuff-store = { path = "crates/vbuff-store" }
+vbuff-platform = { path = "crates/vbuff-platform" }
+vbuff-gui = { path = "crates/vbuff-gui" }
+
+# Data / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ulid = { version = "1.2", features = ["serde"] }
+blake3 = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Storage
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# GUI
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.32"
+egui_extras = { version = "0.32", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+# Platform integrations
+arboard = "3.6"
+global-hotkey = "0.8"
+tray-icon = "0.24"
+enigo = "0.6"
+
+# Infra
+dirs = "6"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package]
+name = "vbuff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A cross-platform clipboard manager (MVP single-process build)."
+
+[[bin]]
+name = "vbuff"
+path = "src/main.rs"
+
+[features]
+# The tray integration is enabled by default; if it ever proves troublesome to
+# build/run on a given platform it can be disabled with `--no-default-features`.
+default = ["tray"]
+tray = ["dep:tray-icon"]
+
+[dependencies]
+vbuff-types.workspace = true
+vbuff-core.workspace = true
+vbuff-store.workspace = true
+vbuff-platform.workspace = true
+vbuff-gui.workspace = true
+
+eframe.workspace = true
+egui.workspace = true
+arboard.workspace = true
+global-hotkey.workspace = true
+tray-icon = { workspace = true, optional = true }
+image.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+blake3.workspace = true

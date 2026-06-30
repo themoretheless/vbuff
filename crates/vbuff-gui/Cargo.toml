@@ -1,0 +1,16 @@
+[package]
+name = "vbuff-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "egui/eframe popup UI for vbuff."
+
+[dependencies]
+vbuff-types.workspace = true
+vbuff-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+chrono.workspace = true
+tracing.workspace = true
