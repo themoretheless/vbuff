@@ -112,8 +112,22 @@ pub fn looks_like_code(s: &str) -> bool {
 
     // Single short line: only flag if it is clearly a statement/declaration.
     let strong_tokens = [
-        "fn ", "def ", "class ", "function ", "import ", "#include", "public ", "private ",
-        "const ", "let ", "var ", "=> ", "->", "::", "</", "/>",
+        "fn ",
+        "def ",
+        "class ",
+        "function ",
+        "import ",
+        "#include",
+        "public ",
+        "private ",
+        "const ",
+        "let ",
+        "var ",
+        "=> ",
+        "->",
+        "::",
+        "</",
+        "/>",
     ];
     let has_strong = strong_tokens.iter().any(|t| s.contains(t));
 

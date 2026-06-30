@@ -53,7 +53,10 @@ impl ClipboardBackend for ArboardClipboard {
         if flavors.is_empty()
             && let Ok(img) = self.clipboard.get_image()
         {
-            let mime = format!("{RGBA_MIME_PREFIX};width={};height={}", img.width, img.height);
+            let mime = format!(
+                "{RGBA_MIME_PREFIX};width={};height={}",
+                img.width, img.height
+            );
             flavors.push(Flavor::inline(mime, img.bytes.into_owned()));
         }
 
@@ -66,19 +69,24 @@ impl ClipboardBackend for ArboardClipboard {
     fn write(&mut self, flavors: &[Flavor]) -> Result<()> {
         // Prefer text; fall back to image. arboard can only hold one kind at a
         // time via its high-level API, so we pick the richest single flavor.
-        if let Some(text) = flavors.iter().find(|f| f.is_text()).and_then(|f| f.as_text()) {
+        if let Some(text) = flavors
+            .iter()
+            .find(|f| f.is_text())
+            .and_then(|f| f.as_text())
+        {
             return self
                 .clipboard
                 .set_text(text.to_owned())
                 .map_err(|e| PlatformError::Clipboard(e.to_string()));
         }
 
-        if let Some(flavor) = flavors.iter().find(|f| f.mime.starts_with(RGBA_MIME_PREFIX))
+        if let Some(flavor) = flavors
+            .iter()
+            .find(|f| f.mime.starts_with(RGBA_MIME_PREFIX))
             && let Body::Inline(bytes) = &flavor.body
         {
-            let (w, h) = parse_rgba_dims(&flavor.mime).ok_or_else(|| {
-                PlatformError::Clipboard("rgba flavor missing dimensions".into())
-            })?;
+            let (w, h) = parse_rgba_dims(&flavor.mime)
+                .ok_or_else(|| PlatformError::Clipboard("rgba flavor missing dimensions".into()))?;
             let image = ImageData {
                 width: w,
                 height: h,

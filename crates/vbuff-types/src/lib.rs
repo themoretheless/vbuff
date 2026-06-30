@@ -244,13 +244,9 @@ pub struct Clip {
 impl Clip {
     /// The first text flavor's content, if any (used for previews/search).
     pub fn primary_text(&self) -> Option<&str> {
-        self.flavors.iter().find_map(|f| {
-            if f.is_text() {
-                f.as_text()
-            } else {
-                None
-            }
-        })
+        self.flavors
+            .iter()
+            .find_map(|f| if f.is_text() { f.as_text() } else { None })
     }
 
     /// The first image flavor, if any.

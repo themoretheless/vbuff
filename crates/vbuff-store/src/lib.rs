@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
 
 mod error;
@@ -65,9 +65,9 @@ impl Store {
 
     /// Apply forward-only migrations based on `user_version`.
     fn migrate(&mut self) -> Result<()> {
-        let version: i64 =
-            self.conn
-                .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             self.conn.execute_batch(
                 r#"
@@ -121,7 +121,8 @@ impl Store {
                 "UPDATE clips SET updated_at = ?1, seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM clips) WHERE id = ?2",
                 params![now, id_str],
             )?;
-            return ClipId::parse(&id_str).map_err(|_| StoreError::Corrupt("bad ulid in db".into()));
+            return ClipId::parse(&id_str)
+                .map_err(|_| StoreError::Corrupt("bad ulid in db".into()));
         }
 
         let flavors_json = serde_clip::flavors_to_json(&clip.flavors)?;
@@ -224,7 +225,8 @@ impl Store {
 
     /// Delete every non-pinned clip. Pinned clips are preserved.
     pub fn clear(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM clips WHERE pinned = 0", [])?;
+        self.conn
+            .execute("DELETE FROM clips WHERE pinned = 0", [])?;
         Ok(())
     }
 
@@ -353,8 +355,8 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
     } else {
         return Err(StoreError::Corrupt("content_hash not 32 bytes".into()));
     }
-    let created_at = chrono::DateTime::from_timestamp_millis(raw.created_at)
-        .unwrap_or_else(chrono::Utc::now);
+    let created_at =
+        chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
     let meta = ClipMeta {
         created_at,
         byte_size: raw.byte_size as u64,
@@ -431,7 +433,11 @@ mod tests {
             id: ClipId::new(),
             flavors,
             content_hash,
-            meta: ClipMeta::now(ContentKind::Text, text.len() as u64, Some("test.app".into())),
+            meta: ClipMeta::now(
+                ContentKind::Text,
+                text.len() as u64,
+                Some("test.app".into()),
+            ),
             pinned: false,
             favorite: false,
         }

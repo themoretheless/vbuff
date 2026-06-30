@@ -131,10 +131,7 @@ mod tests {
 
     #[test]
     fn substring_is_case_insensitive() {
-        let clips = vec![
-            text_clip("Hello World", false),
-            text_clip("goodbye", false),
-        ];
+        let clips = vec![text_clip("Hello World", false), text_clip("goodbye", false)];
         let res = search(&clips, "WORLD");
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].clip.primary_text(), Some("Hello World"));

@@ -14,6 +14,6 @@ pub mod filter;
 pub mod hash;
 
 pub use classify::detect_kind;
-pub use eviction::{evict, EvictionPolicy};
-pub use filter::{search, SearchResult};
+pub use eviction::{EvictionPolicy, evict};
+pub use filter::{SearchResult, search};
 pub use hash::{content_hash, content_hash_from_flavors};

@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::GlobalHotKeyManager;
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 
 use crate::traits::{HotkeyBackend, KeyCombo, Modifier};
 use crate::{PlatformError, Result};

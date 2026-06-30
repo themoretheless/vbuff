@@ -10,7 +10,7 @@
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use crate::traits::PasteBackend;
-use crate::{paste_modifier, Modifier, PlatformError, Result};
+use crate::{Modifier, PlatformError, Result, paste_modifier};
 
 /// An `enigo`-backed paste simulator.
 pub struct EnigoPaste {

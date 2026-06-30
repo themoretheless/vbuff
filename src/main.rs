@@ -26,8 +26,8 @@ use global_hotkey::GlobalHotKeyEvent;
 use vbuff_core::{content_hash_from_flavors, detect_kind};
 use vbuff_gui::{AppState, PopupApp, SharedState, UiAction};
 use vbuff_platform::{
-    parse_combo, ArboardClipboard, ClipboardBackend, EnigoPaste, GlobalHotkeyBackend,
-    HotkeyBackend, PasteBackend,
+    ArboardClipboard, ClipboardBackend, EnigoPaste, GlobalHotkeyBackend, HotkeyBackend,
+    PasteBackend, parse_combo,
 };
 use vbuff_store::Store;
 use vbuff_types::{Clip, ClipId, ClipMeta};
@@ -239,9 +239,11 @@ fn run_gui(
         if !ticker_started {
             ticker_started = true;
             let ctx = ctx.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(100));
-                ctx.request_repaint();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    ctx.request_repaint();
+                }
             });
         }
 

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
-use vbuff_core::{search, SearchResult};
+use vbuff_core::{SearchResult, search};
 use vbuff_types::{Body, Clip, ClipId};
 
 use crate::state::{SharedState, UiAction};
@@ -416,7 +416,10 @@ mod tests {
 
     #[test]
     fn parses_short_hex() {
-        assert_eq!(parse_hex_color("#fff"), Some(Color32::from_rgb(255, 255, 255)));
+        assert_eq!(
+            parse_hex_color("#fff"),
+            Some(Color32::from_rgb(255, 255, 255))
+        );
     }
 
     #[test]

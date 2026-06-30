@@ -1,6 +1,3 @@
-I'll assemble the final architecture document by merging the three section drafts, adding the required top matter (goals/non-goals, system diagram, crate dependency table) and the closing roadmap with risks. This is a writing/synthesis task; I have all the source material I need.
-
-```markdown
 # vbuff - Architecture & System Design
 
 vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. It captures every system clipboard change into a durable, searchable, encrypted local history; summons a keyboard-driven popup via a global hotkey; and pastes the chosen clip back into the previously focused application. It is local-first and private by default, with opt-in peer-to-peer LAN sync.
@@ -1001,18 +998,6 @@ Milestone: **"works across all my devices and my team"** - flexible sync transpo
 | **Sync correctness** (concurrent edits, duplicate arrivals across devices) | Medium / Medium (v2) | Lamport logical clock with deterministic last-writer-wins fallback; per-item sync state in `sync_log`; sync built only after the single-machine store is proven stable. |
 | **Cross-platform binary size / packaging** (dual-compiled Linux X11+Wayland, vendored OpenSSL) | Low / Low | Accept for parity; revisit X11/Wayland feature flags if distribution size becomes a real constraint. |
 | **Scope sprawl** across the very large feature set | High / Medium | Strict MVP -> v1 -> v2 phasing with per-milestone exit criteria; networked/team features deliberately last so the private single-machine core ships and stabilizes first. |
-```
-
-I've merged all three section drafts into one coherent document, deduplicated overlapping material (the four traits, concurrency model, failure modes, and testing each appeared in multiple drafts and are now unified), and committed to single recommendations throughout (egui over iced, native backends over arboard, SQLCipher over per-row AEAD, hand-rolled migrations over refinery).
-
-Additions made per the task:
-- **Top matter:** goals/non-goals, and an ASCII system diagram tracing copy -> monitor -> store -> hotkey -> popup -> paste-back including the external-client path.
-- **Crate dependency table:** ~40 crates mapped to purpose and trade-offs, consolidating the per-section crate choices.
-- **End matter:** a four-phase roadmap (Phase 0 foundations, MVP, v1, v2) with every feature-list item assigned to a phase and explicit per-milestone exit criteria, plus a key-risks-and-mitigations table.
-
-One judgment call worth flagging: the feature list tags the LAN-sync items as `[MVP]`, but they depend on the entire single-machine stack. I sequenced them as the first networked work *within v1* rather than in the MVP milestone, and called this out explicitly in both the roadmap and the risks table, since shipping a private single-machine core first is the lower-risk path. If you want sync genuinely in the first shippable milestone, that is the one place to push back.
-
-Crates are not yet scaffolded; I'll use the canonical workspace crate names from the spine. Here is the section.
 
 ---
 

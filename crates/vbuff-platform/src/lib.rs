@@ -23,7 +23,7 @@ pub use traits::{
 };
 
 pub use clipboard::ArboardClipboard;
-pub use hotkey::{parse_combo, GlobalHotkeyBackend};
+pub use hotkey::{GlobalHotkeyBackend, parse_combo};
 pub use paste::EnigoPaste;
 
 /// Result type for platform operations.

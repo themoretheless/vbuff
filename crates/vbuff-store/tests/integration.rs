@@ -5,13 +5,20 @@ use vbuff_store::Store;
 use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
 
 fn make_clip(text: &str) -> Clip {
-    let flavors = vec![Flavor::inline("text/plain;charset=utf-8", text.as_bytes().to_vec())];
+    let flavors = vec![Flavor::inline(
+        "text/plain;charset=utf-8",
+        text.as_bytes().to_vec(),
+    )];
     let content_hash = content_hash_from_flavors(&flavors);
     Clip {
         id: ClipId::new(),
         flavors,
         content_hash,
-        meta: ClipMeta::now(ContentKind::Text, text.len() as u64, Some("integration.test".into())),
+        meta: ClipMeta::now(
+            ContentKind::Text,
+            text.len() as u64,
+            Some("integration.test".into()),
+        ),
         pinned: false,
         favorite: false,
     }
@@ -44,14 +51,19 @@ fn dedup_and_cap_on_disk() {
 
     // Insert 10 unique clips.
     for i in 0..10 {
-        store.insert(&make_clip(&format!("clip number {i}"))).unwrap();
+        store
+            .insert(&make_clip(&format!("clip number {i}")))
+            .unwrap();
     }
     assert_eq!(store.count().unwrap(), 10);
 
     // Re-insert a duplicate; count stays the same (dedup), clip floats to top.
     store.insert(&make_clip("clip number 3")).unwrap();
     assert_eq!(store.count().unwrap(), 10);
-    assert_eq!(store.list(1).unwrap()[0].primary_text(), Some("clip number 3"));
+    assert_eq!(
+        store.list(1).unwrap()[0].primary_text(),
+        Some("clip number 3")
+    );
 
     // Enforce a cap of 4: 6 oldest unpinned clips are evicted.
     let evicted = store.enforce_cap(4).unwrap();
