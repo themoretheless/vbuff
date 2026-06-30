@@ -1054,7 +1054,7 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 
 ## Ideas and improvements backlog (engineering & architecture)
 
-> Items 1-113 of a 246-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), user-facing feature ideas (198-246) in [README.md](README.md). Effort tags: `S`/`M`/`L`.
+> Items 1-113 of a 300-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), and user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md). Effort tags: `S`/`M`/`L`.
 
 ### Capture & monitoring engine
 

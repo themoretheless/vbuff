@@ -5,8 +5,8 @@
 //! * a background **capture thread** polls the clipboard (`arboard`) and inserts
 //!   new clips into the **store** (`rusqlite`), deduplicating by BLAKE3 hash;
 //! * a **global hotkey** (`global-hotkey`) shows/focuses the popup;
-//! * an optional **tray icon** (`tray-icon`, behind the `tray` feature) offers
-//!   Show / Pause / Quit;
+//! * an optional **tray/menu-bar icon** (`tray-icon`, behind the `tray` feature)
+//!   offers Show, Pause/Resume, Copy Latest, Clear History, and Quit actions;
 //! * the **popup** (`eframe`/`egui`) lists history, filters as you type, and on
 //!   pick writes the clip back to the clipboard and synthesizes a paste
 //!   keystroke (`enigo`).
@@ -275,10 +275,24 @@ fn run_gui(
         // 2. Poll tray menu/icon events.
         #[cfg(feature = "tray")]
         if let Some(t) = &tray {
+            {
+                let s = shared.lock().unwrap();
+                t.sync_state(s.paused, s.clips.len());
+            }
+
             for action in t.poll() {
                 match action {
                     tray_support::TrayAction::Show => {
                         shared.lock().unwrap().request_show();
+                    }
+                    tray_support::TrayAction::CopyLatest => {
+                        copy_latest_clip(&shared);
+                    }
+                    tray_support::TrayAction::ClearHistory => {
+                        if let Ok(store) = store.lock() {
+                            let _ = store.clear();
+                            refresh_snapshot(&store, &shared);
+                        }
                     }
                     tray_support::TrayAction::TogglePause => {
                         toggle_pause(&paused, &shared);
@@ -334,6 +348,21 @@ fn toggle_pause(paused: &Arc<AtomicBool>, shared: &SharedState) {
     paused.store(now, Ordering::Relaxed);
     shared.lock().unwrap().paused = now;
     tracing::info!(paused = now, "capture pause toggled");
+}
+
+/// Copy the most recent clip back to the system clipboard without paste-back.
+fn copy_latest_clip(shared: &SharedState) {
+    let clip = {
+        let s = shared.lock().unwrap();
+        s.clips.first().cloned()
+    };
+    let Some(clip) = clip else { return };
+
+    if let Ok(mut cb) = ArboardClipboard::new()
+        && let Err(e) = cb.write(&clip.flavors)
+    {
+        tracing::warn!("copy latest from tray failed: {e}");
+    }
 }
 
 /// Translate a GUI action into store/clipboard/paste side effects.
@@ -405,12 +434,14 @@ fn refresh_snapshot(store: &Store, shared: &SharedState) {
 /// Tray-icon support, compiled only when the `tray` feature is enabled.
 #[cfg(feature = "tray")]
 mod tray_support {
-    use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+    use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{TrayIcon, TrayIconBuilder};
 
     /// A high-level tray action.
     pub enum TrayAction {
         Show,
+        CopyLatest,
+        ClearHistory,
         TogglePause,
         Quit,
     }
@@ -419,8 +450,13 @@ mod tray_support {
     pub struct Tray {
         _icon: TrayIcon,
         show_id: MenuId,
+        copy_latest_id: MenuId,
+        clear_history_id: MenuId,
         pause_id: MenuId,
         quit_id: MenuId,
+        copy_latest: MenuItem,
+        clear_history: MenuItem,
+        pause: MenuItem,
     }
 
     impl Tray {
@@ -428,10 +464,16 @@ mod tray_support {
         pub fn new() -> anyhow::Result<Self> {
             let menu = Menu::new();
             let show = MenuItem::new("Show vbuff", true, None);
-            let pause = MenuItem::new("Pause / Resume capture", true, None);
+            let copy_latest = MenuItem::new("Copy latest clip", false, None);
+            let clear_history = MenuItem::new("Clear history", false, None);
+            let pause = MenuItem::new("Pause capture", true, None);
             let quit = MenuItem::new("Quit", true, None);
             menu.append(&show)?;
+            menu.append(&copy_latest)?;
+            menu.append(&clear_history)?;
+            menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&pause)?;
+            menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&quit)?;
 
             let icon = build_icon();
@@ -444,9 +486,25 @@ mod tray_support {
             Ok(Tray {
                 _icon: icon,
                 show_id: show.id().clone(),
+                copy_latest_id: copy_latest.id().clone(),
+                clear_history_id: clear_history.id().clone(),
                 pause_id: pause.id().clone(),
                 quit_id: quit.id().clone(),
+                copy_latest,
+                clear_history,
+                pause,
             })
+        }
+
+        /// Keep menu labels and disabled states in sync with the app state.
+        pub fn sync_state(&self, paused: bool, clip_count: usize) {
+            self.pause.set_text(if paused {
+                "Resume capture"
+            } else {
+                "Pause capture"
+            });
+            self.copy_latest.set_enabled(clip_count > 0);
+            self.clear_history.set_enabled(clip_count > 0);
         }
 
         /// Drain pending tray/menu events into high-level actions.
@@ -455,6 +513,10 @@ mod tray_support {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == self.show_id {
                     out.push(TrayAction::Show);
+                } else if event.id == self.copy_latest_id {
+                    out.push(TrayAction::CopyLatest);
+                } else if event.id == self.clear_history_id {
+                    out.push(TrayAction::ClearHistory);
                 } else if event.id == self.pause_id {
                     out.push(TrayAction::TogglePause);
                 } else if event.id == self.quit_id {

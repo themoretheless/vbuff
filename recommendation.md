@@ -257,21 +257,15 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/competitive-analysis.md` - competitor landscape and the four-corner wedge
 - `docs/competitor-extras.md` - the 122-item feature-gap sweep used in section 4
 - `docs/features-top-500.md` - the 640-feature catalog with MVP/v1/v2/future tiers
+- `docs/ideas-top-300.md` - user-facing, sync, integration, and operations ideas 198-300
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
 
 ---
 
-*Self-rating: 8/10. The document is opinionated, prioritized, decision-useful, and grounded in the actual canonical docs (architecture as the technical source of truth, the competitive analysis for the wedge, the extras catalog for section 4, and pain-points/mistakes for the attributed competitor failures), with the single-process MVP vs full-workspace distinction respected throughout and no em dashes. It reconciles the one real conflict honestly (the feature catalog tags LAN sync MVP; architecture and this doc sequence it into v1). Held back from higher because the section-4 effort ratings are relative S/M/L judgments rather than bottom-up estimates, and the two flagged spikes (egui native-feel, internet-sync) are genuine open questions that only a real prototype can close.*
-
-*Suggested next steps (pick any): (1) run the Phase-0 egui polish spike and the LAN-sync round-trip spike before locking scope; (2) confirm which OS is the first concrete capture backend so step 4 of the MVP list is concrete; (3) reconcile the feature catalog's MVP-tagged sync items to v1 so the tiers stop contradicting the roadmap.*
-
-
----
-
 ## Ideas and improvements backlog (product & strategy)
 
-> Items 114-197 of a 246-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing feature ideas (198-246) in [README.md](README.md). Effort tags: `S`/`M`/`L`.
+> Items 114-197 of a 300-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), and user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md). Effort tags: `S`/`M`/`L`.
 
 ### Differentiation & positioning bets
 

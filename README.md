@@ -168,7 +168,8 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
 5. **Press Enter** to paste the selected clip back into the app you were just using.
 6. **Number keys (1-9)** quick-pick the corresponding item directly.
 7. **Pin** an item to keep it at the top and exempt it from eviction; **delete** removes it from history.
-8. **Press Esc** (or click away) to dismiss the popup without pasting.
+8. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, or quit.
+9. **Press Esc** (or click away) to dismiss the popup without pasting.
 
 The hotkey is rebindable in settings, with conflict detection at bind time. The popup opens near the cursor and is clamped to the work area. Pasting back is fully keyboard-driven: open, filter, navigate, paste, all without the mouse.
 
@@ -213,6 +214,7 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape and the four-corner gap.
 - [docs/competitor-extras.md](docs/competitor-extras.md) - 122 additional/advanced competitor features and their suggested priority.
 - [docs/features-top-500.md](docs/features-top-500.md) - the 640-feature catalog with priority tiers.
+- [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 completing the 300-idea backlog.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 
 ---
