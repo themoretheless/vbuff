@@ -258,6 +258,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/competitor-extras.md` - the 122-item feature-gap sweep used in section 4
 - `docs/features-top-500.md` - the 640-feature catalog with MVP/v1/v2/future tiers
 - `docs/ideas-top-300.md` - user-facing, sync, integration, and operations ideas 198-300
+- `docs/ideas-301-400.md` - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
 
@@ -265,7 +266,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 
 ## Ideas and improvements backlog (product & strategy)
 
-> Items 114-197 of a 300-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), and user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md). Effort tags: `S`/`M`/`L`.
+> Items 114-197 of a 400-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), and extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md). Effort tags: `S`/`M`/`L`.
 
 ### Differentiation & positioning bets
 

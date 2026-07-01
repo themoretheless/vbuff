@@ -1,6 +1,6 @@
 # vbuff - Ideas and Improvements Backlog, Items 198-300
 
-This file completes the 300-idea backlog. Companion lists: engineering ideas (1-113) live in [../architecture.md](../architecture.md), and product/strategy ideas (114-197) live in [../recommendation.md](../recommendation.md). Effort tags are `S`/`M`/`L`.
+This file covers ideas 198-300 of the 400-idea backlog. Companion lists: engineering ideas (1-113) live in [../architecture.md](../architecture.md), product/strategy ideas (114-197) live in [../recommendation.md](../recommendation.md), and extended ideas (301-400) live in [ideas-301-400.md](ideas-301-400.md). Effort tags are `S`/`M`/`L`.
 
 The backlog is source material, not an automatic commitment. [../plan.md](../plan.md) remains the execution order; an idea only becomes planned work when it is pulled into a milestone.
 
@@ -125,4 +125,4 @@ The backlog is source material, not an automatic commitment. [../plan.md](../pla
 297. **Release evidence bundle** `[M]` - Attach test matrix results, canary-grep output, dependency audit, SBOM, and benchmark summaries to every release. _Value: Makes trust claims inspectable by users and security teams._
 298. **Config migration preview** `[S]` - Before changing config schema, show what will be rewritten and keep a rollback copy. _Value: Prevents settings upgrades from feeling like data loss._
 299. **Maintainer handoff playbook** `[S]` - Document release keys, emergency patch flow, dependency update cadence, and sunset policy. _Value: Reduces abandonment risk for a sensitive daily-driver tool._
-300. **Quarterly scope pruning review** `[S]` - Re-rank the 300-idea backlog every quarter and explicitly cut or defer anything that threatens the current milestone. _Value: Keeps the catalog from quietly eating the product plan while preserving the imagination that made it useful._
+300. **Quarterly scope pruning review** `[S]` - Re-rank the full backlog every quarter and explicitly cut or defer anything that threatens the current milestone. _Value: Keeps the catalog from quietly eating the product plan while preserving the imagination that made it useful._

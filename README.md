@@ -214,7 +214,8 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape and the four-corner gap.
 - [docs/competitor-extras.md](docs/competitor-extras.md) - 122 additional/advanced competitor features and their suggested priority.
 - [docs/features-top-500.md](docs/features-top-500.md) - the 640-feature catalog with priority tiers.
-- [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 completing the 300-idea backlog.
+- [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 in the extended backlog.
+- [docs/ideas-301-400.md](docs/ideas-301-400.md) - ideas 301-400 extending the backlog to 400.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 
 ---
