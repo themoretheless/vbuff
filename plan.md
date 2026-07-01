@@ -53,7 +53,7 @@ Phases follow the spine roadmap exactly: Phase 0 (foundations/scaffolding) -> MV
 
 M0-M6 deliver the single-process MVP. M7-M10 deliver v1 (the multi-crate split happens at M7). M11 is v2. Future-tier work (AI actions, OCR, mobile peers, team libraries, shared boards) is explicitly out of scope here.
 
-The expanded 400-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, and extended ideas 301-400 live in `docs/ideas-301-400.md`. The milestone gates below decide when an idea becomes planned work.
+The expanded 500-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, and review backlog items 401-500 live in `docs/ideas-401-500.md`. The milestone gates below decide when an idea becomes planned work.
 
 ---
 

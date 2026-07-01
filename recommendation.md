@@ -100,6 +100,32 @@ Open-source the core (the trust + longevity signal that Ditto, CopyQ, CrossPaste
 
 ---
 
+### Design direction and product cut line
+
+vbuff's design should feel more like a precise resident instrument than a content app: quiet, dense, fast, trustworthy, and immediately usable. The strongest design move is restraint. The popup is the product; it should open, filter, expose state, and paste without a tour or a decorative shell.
+
+| Surface | Design rule | Cut line |
+|---|---|---|
+| Popup | Stable row heights, strong selected state, small badges, zero layout jump while typing | Cut decorative animation before cutting keyboard speed |
+| Row actions | Icons plus tooltips for common tools; explicit text for destructive actions | Cut rare row actions into a command palette before crowding every row |
+| Sensitive content | Mask by default, show reason, allow deliberate peek, never use panic styling | Cut visual cleverness before cutting trust clarity |
+| Settings | Dense, grouped controls with search and keyboard navigation | Cut deep customization before cutting privacy defaults |
+| Tray/menu bar | Same command names as popup/CLI: Show, Copy latest, Clear history, Pause/Resume, Quit | Cut extra menu items before duplicating command semantics |
+| Onboarding | One successful copy -> popup -> paste-back loop | Cut explanatory tours before cutting the first success path |
+
+Design review checklist:
+
+- Can the user identify the selected clip within 100 ms?
+- Does every privacy state have a visible, plain-language reason?
+- Does text fit in compact mode and high-contrast mode?
+- Can every critical workflow run without a mouse?
+- Are destructive actions unmistakable and undoable where possible?
+- Does the UI distinguish current implementation from target/future capability?
+
+The SOLID/DRY product rule: a command should have one name, one behavior, and one permission model across popup, tray, CLI, IPC, and docs. If "clear history" means different things in two surfaces, the design is wrong even if the code compiles.
+
+---
+
 ## 3. Top competitor mistakes to avoid, by theme
 
 Each row names the competitor(s) and maps to a concrete vbuff decision. Grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the architecture's own "How vbuff avoids competitors' mistakes" table.
@@ -259,6 +285,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/features-top-500.md` - the 640-feature catalog with MVP/v1/v2/future tiers
 - `docs/ideas-top-300.md` - user-facing, sync, integration, and operations ideas 198-300
 - `docs/ideas-301-400.md` - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
+- `docs/ideas-401-500.md` - review backlog: current implementation problems, SOLID/DRY refactors, testing gaps, design fixes, and roadmap hygiene
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
 
@@ -266,7 +293,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 
 ## Ideas and improvements backlog (product & strategy)
 
-> Items 114-197 of a 400-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), and extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md). Effort tags: `S`/`M`/`L`.
+> Items 114-197 of a 500-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), and review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md). Effort tags: `S`/`M`/`L`.
 
 ### Differentiation & positioning bets
 

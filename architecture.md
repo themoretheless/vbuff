@@ -189,6 +189,40 @@ vbuff/
 
 `vbuff-store` is split from `vbuff-core` because eviction/retention/dedup *policy* (core) is independent of *persistence* (store), letting us fuzz the policy logic against an in-memory fake store. `vbuff-types` is separate so the CLI and IPC can serialize `Clip` without pulling in rusqlite or egui. Dependency direction is strictly downward; `vbuff-core` never depends on `vbuff-gui`, `vbuff-store`, or `vbuff-platform`'s *impls* (only its *traits*).
 
+### SOLID/DRY decomposition and small reading slices
+
+The implementation should remain learnable as a set of small, single-purpose slices. The current repository already has the workspace split; the next cleanup is to keep the root binary as composition glue instead of a second architecture.
+
+| Slice | Owns | Does not own | First files to read |
+|---|---|---|---|
+| **Types** | Serializable clip data, flavor bodies, ids, content-kind labels | SQL, UI state, OS calls, business rules | `crates/vbuff-types/src/lib.rs` |
+| **Core** | Pure dedup, classification, search ranking, eviction, capture-policy decisions | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs` |
+| **Store** | SQLite schema, migrations, transactions, durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs` |
+| **Platform** | Clipboard, hotkey, paste, tray capabilities behind traits | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs` |
+| **GUI state** | Query text, selection, view visibility, queued UI actions | Clipboard reads/writes, DB mutations | `crates/vbuff-gui/src/state.rs` |
+| **GUI view** | Search box, rows, badges, thumbnails, keyboard navigation | Capture loop, retention, config parsing | `crates/vbuff-gui/src/app.rs`, `view.rs` |
+| **Capture supervisor** | Subscribe/poll, read flavors, evaluate gate, emit store command | Rendering, SQL details, paste injection | target extraction from `src/main.rs` |
+| **Paste coordinator** | Focus snapshot, write selected flavors, hide popup, inject paste, report failure | Searching, storage schema, row rendering | target extraction from `src/main.rs` |
+| **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, `Quit` semantics | UI widget styling, OS-specific event delivery | target extraction from tray/UI wiring |
+| **Diagnostics** | Redacted logs, health state, capability badges, doctor checks | Clip payload storage, transform behavior | target extraction from tracing/status code |
+
+SOLID rules for future edits:
+
+- **Single responsibility:** a module should have one reason to change. If a change touches capture policy, paste sequencing, and row layout at once, the boundaries are wrong.
+- **Open/closed:** add OS behavior by implementing platform traits, not by branching through the core or GUI.
+- **Liskov/substitution:** mock backends must behave like real backends at the trait boundary; tests should prove the core cannot tell the difference.
+- **Interface segregation:** keep narrow traits (`ClipboardBackend`, `HotkeyBackend`, `PasteBackend`, future `TrayBackend`/`EmbeddingBackend`) instead of one god backend.
+- **Dependency inversion:** high-level policy depends on abstractions and pure data, never concrete OS crates.
+- **DRY:** shared commands, design tokens, capability badges, privacy gate reasons, and retention rules must have one source of truth. Duplication in labels or logic is a bug, not harmless documentation drift.
+
+Concrete extraction order:
+
+1. Move capture-loop code from `src/main.rs` into `capture::CaptureSupervisor` with a pure `CapturePolicy`.
+2. Introduce a shared `AppCommand` enum used by hotkey, tray, popup, and future IPC.
+3. Move paste timing/focus work into `paste::PasteCoordinator`.
+4. Move store mutations behind a small writer API and give the GUI a read-only snapshot.
+5. Add `vbuff-gui::design` for spacing, row height, badges, color roles, and icon rules.
+
 ### Core data model
 
 ```rust
@@ -1046,6 +1080,9 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [recommendation.md](recommendation.md) - prioritized product & engineering recommendations
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
+- [docs/ideas-top-300.md](docs/ideas-top-300.md) - user-facing, sync, integration, and operations ideas 198-300
+- [docs/ideas-301-400.md](docs/ideas-301-400.md) - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
+- [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog: current problems, SOLID/DRY cuts, design issues, quality gaps, and roadmap hygiene
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
 
@@ -1054,7 +1091,7 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 
 ## Ideas and improvements backlog (engineering & architecture)
 
-> Items 1-113 of a 400-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), and extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md). Effort tags: `S`/`M`/`L`.
+> Items 1-113 of a 500-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), and review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md). Effort tags: `S`/`M`/`L`.
 
 ### Capture & monitoring engine
 

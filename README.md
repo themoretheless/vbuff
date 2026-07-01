@@ -102,17 +102,42 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | Crate | Role | In MVP? |
 |---|---|---|
 | `vbuff-types` | Plain shared data types (`Clip`, `Flavor`, `ContentKind`, ids); serde only | Yes |
-| `vbuff-core` | Engine: dedup, eviction, retention, search, redaction rules, transforms, snippet expansion (pure logic + trait calls) | Yes |
-| `vbuff-store` | SQLite + SQLCipher persistence, FTS5, migrations, blob spill, at-rest crypto | Yes |
-| `vbuff-platform` | The four backend trait definitions + per-OS impls (clipboard, hotkey, paste, tray) | Yes |
-| `vbuff-gui` | `eframe` app: popup + settings viewports | Yes |
+| `vbuff-core` | Current pure logic: dedup, eviction, classification, substring search; target adds redaction rules, transforms, snippet expansion | Yes (partial) |
+| `vbuff-store` | Current bundled SQLite JSON-flavor store; target adds SQLCipher, FTS5, migrations, blob spill, at-rest crypto | Yes (partial) |
+| `vbuff-platform` | Current trait layer plus `arboard` / `global-hotkey` / `enigo` adapters; target adds native per-OS clipboard, hotkey, paste and tray impls | Yes (partial) |
+| `vbuff-gui` | Current `eframe` popup; target adds deeper settings viewports, richer badges, accessibility depth | Yes (partial) |
 | *(root binary)* | `src/main.rs`: launches the single-process app, owns the watcher/store/GUI | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
 | `vbuff-ipc` | Framed protocol over Unix socket / named pipe | Later |
 | `vbuff-sync` | mDNS discovery, Noise/TLS transport, pairing, LAN P2P replication | Later |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
-The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. Storage is **SQLite** via `rusqlite` (bundled, with SQLCipher and FTS5); dedup uses **BLAKE3**; large payloads spill to an out-of-row, content-addressable blob store. See [architecture.md](architecture.md) for the full design, data model and crate dependency table.
+The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. The current MVP store is **SQLite** via bundled `rusqlite`; target work adds SQLCipher, FTS5, and an out-of-row content-addressable blob store. Dedup already uses **BLAKE3**. See [architecture.md](architecture.md) for the full design, data model and crate dependency table.
+
+---
+
+## Read the project in small pieces
+
+The repo is intentionally split so you can understand it without loading the whole product into your head at once:
+
+1. **Data shapes:** start with `crates/vbuff-types/src/lib.rs` (`Clip`, `Flavor`, `Body`, `ContentKind`, ids).
+2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, and eviction. This crate should stay OS-free and GUI-free.
+3. **Persistence:** read `crates/vbuff-store/src/lib.rs` for the current SQLite MVP store and its transitional JSON-flavor schema.
+4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
+5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `app.rs`, then `view.rs`.
+6. **Composition shell:** read `src/main.rs` last. It currently wires the MVP together, but the long-term direction is to move capture, commands, paste coordination, and diagnostics into smaller modules.
+
+The SOLID/DRY rule of thumb is simple: data types are shared, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, and `main.rs` should only compose the pieces.
+
+## Design direction
+
+vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
+
+- **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
+- **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
+- **Density:** compact and comfortable modes should share one layout system instead of ad hoc spacing.
+- **Accessibility:** focus rings, high contrast, screen-reader labels, reduced motion, and pointer-free navigation are part of the core design, not a later cleanup.
+- **Trust:** privacy state should be visible at decision points. A sensitive row should look protected and understandable, not alarming or hidden behind mystery UI.
 
 ---
 
@@ -215,7 +240,8 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/competitor-extras.md](docs/competitor-extras.md) - 122 additional/advanced competitor features and their suggested priority.
 - [docs/features-top-500.md](docs/features-top-500.md) - the 640-feature catalog with priority tiers.
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 in the extended backlog.
-- [docs/ideas-301-400.md](docs/ideas-301-400.md) - ideas 301-400 extending the backlog to 400.
+- [docs/ideas-301-400.md](docs/ideas-301-400.md) - ideas 301-400 in the extended backlog.
+- [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog items 401-500: problems, SOLID/DRY cuts, UX/design fixes, and roadmap hygiene.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 
 ---
