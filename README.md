@@ -193,7 +193,7 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
 5. **Press Enter** to paste the selected clip back into the app you were just using.
 6. **Number keys (1-9)** quick-pick the corresponding item directly.
 7. **Pin** an item to keep it at the top and exempt it from eviction; **delete** removes it from history.
-8. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, or quit.
+8. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, toggle start-at-login, or quit.
 9. **Press Esc** (or click away) to dismiss the popup without pasting.
 
 The hotkey is rebindable in settings, with conflict detection at bind time. The popup opens near the cursor and is clamped to the work area. Pasting back is fully keyboard-driven: open, filter, navigate, paste, all without the mouse.
@@ -213,6 +213,8 @@ Settings, hotkeys, exclusion lists and the per-app blacklist live in a human-edi
 | Linux | `$XDG_CONFIG_HOME/vbuff/` (default `~/.config/vbuff/`) | `$XDG_DATA_HOME/vbuff/vbuff.db` (default `~/.local/share/vbuff/`) |
 
 The target architecture adds an encrypted database, storage-location overrides, cloud-folder warnings, and stronger path validation before broader releases.
+
+Set `launch_at_login = true` in the config, or use the tray/menu-bar action, to register vbuff with the current OS login startup mechanism. The current MVP writes a LaunchAgent on macOS, an XDG autostart desktop entry on Linux, or a user Run-key entry on Windows.
 
 ---
 

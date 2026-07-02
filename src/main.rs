@@ -14,6 +14,7 @@
 //! All side effects flow through the eframe `update` loop, which owns the event
 //! loop; the capture thread is the one true background worker.
 
+mod autostart;
 mod config;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +43,11 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::load_or_create().context("loading config")?;
     tracing::info!(?config.hotkey, config.poll_interval_ms, "vbuff starting");
+    if config.launch_at_login
+        && let Err(e) = autostart::set_enabled(true)
+    {
+        tracing::warn!("failed to register launch-at-login: {e}");
+    }
 
     // Open the persistent store and hydrate the GUI snapshot.
     let store = Store::open_default().context("opening store")?;
@@ -224,6 +230,8 @@ fn run_gui(
     // be active and the call to be on the main thread).
     #[cfg(feature = "tray")]
     let mut tray: Option<tray_support::Tray> = None;
+    #[cfg(feature = "tray")]
+    let mut config = config;
 
     let mut pending_paste: Option<PendingPaste> = None;
     // Spawned once, on the first frame: a ticker that pings the egui context
@@ -277,7 +285,7 @@ fn run_gui(
         if let Some(t) = &tray {
             {
                 let s = shared.lock().unwrap();
-                t.sync_state(s.paused, s.clips.len());
+                t.sync_state(s.paused, s.clips.len(), config.launch_at_login);
             }
 
             for action in t.poll() {
@@ -296,6 +304,9 @@ fn run_gui(
                     }
                     tray_support::TrayAction::TogglePause => {
                         toggle_pause(&paused, &shared);
+                    }
+                    tray_support::TrayAction::ToggleAutostart => {
+                        toggle_autostart(&mut config);
                     }
                     tray_support::TrayAction::Quit => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -351,6 +362,7 @@ fn toggle_pause(paused: &Arc<AtomicBool>, shared: &SharedState) {
 }
 
 /// Copy the most recent clip back to the system clipboard without paste-back.
+#[cfg(feature = "tray")]
 fn copy_latest_clip(shared: &SharedState) {
     let clip = {
         let s = shared.lock().unwrap();
@@ -362,6 +374,24 @@ fn copy_latest_clip(shared: &SharedState) {
         && let Err(e) = cb.write(&clip.flavors)
     {
         tracing::warn!("copy latest from tray failed: {e}");
+    }
+}
+
+/// Toggle launch-at-login and persist the config if OS registration succeeds.
+#[cfg(feature = "tray")]
+fn toggle_autostart(config: &mut Config) {
+    let desired = !config.launch_at_login;
+    match autostart::set_enabled(desired) {
+        Ok(()) => {
+            config.launch_at_login = desired;
+            if let Err(e) = config.save() {
+                tracing::warn!("saving launch-at-login config failed: {e}");
+            }
+            tracing::info!(launch_at_login = desired, "launch-at-login toggled");
+        }
+        Err(e) => {
+            tracing::warn!("launch-at-login toggle failed: {e}");
+        }
     }
 }
 
@@ -443,6 +473,7 @@ mod tray_support {
         CopyLatest,
         ClearHistory,
         TogglePause,
+        ToggleAutostart,
         Quit,
     }
 
@@ -453,10 +484,12 @@ mod tray_support {
         copy_latest_id: MenuId,
         clear_history_id: MenuId,
         pause_id: MenuId,
+        autostart_id: MenuId,
         quit_id: MenuId,
         copy_latest: MenuItem,
         clear_history: MenuItem,
         pause: MenuItem,
+        autostart: MenuItem,
     }
 
     impl Tray {
@@ -467,12 +500,14 @@ mod tray_support {
             let copy_latest = MenuItem::new("Copy latest clip", false, None);
             let clear_history = MenuItem::new("Clear history", false, None);
             let pause = MenuItem::new("Pause capture", true, None);
+            let autostart = MenuItem::new("Start at login", true, None);
             let quit = MenuItem::new("Quit", true, None);
             menu.append(&show)?;
             menu.append(&copy_latest)?;
             menu.append(&clear_history)?;
             menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&pause)?;
+            menu.append(&autostart)?;
             menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&quit)?;
 
@@ -489,19 +524,26 @@ mod tray_support {
                 copy_latest_id: copy_latest.id().clone(),
                 clear_history_id: clear_history.id().clone(),
                 pause_id: pause.id().clone(),
+                autostart_id: autostart.id().clone(),
                 quit_id: quit.id().clone(),
                 copy_latest,
                 clear_history,
                 pause,
+                autostart,
             })
         }
 
         /// Keep menu labels and disabled states in sync with the app state.
-        pub fn sync_state(&self, paused: bool, clip_count: usize) {
+        pub fn sync_state(&self, paused: bool, clip_count: usize, launch_at_login: bool) {
             self.pause.set_text(if paused {
                 "Resume capture"
             } else {
                 "Pause capture"
+            });
+            self.autostart.set_text(if launch_at_login {
+                "Don't start at login"
+            } else {
+                "Start at login"
             });
             self.copy_latest.set_enabled(clip_count > 0);
             self.clear_history.set_enabled(clip_count > 0);
@@ -519,6 +561,8 @@ mod tray_support {
                     out.push(TrayAction::ClearHistory);
                 } else if event.id == self.pause_id {
                     out.push(TrayAction::TogglePause);
+                } else if event.id == self.autostart_id {
+                    out.push(TrayAction::ToggleAutostart);
                 } else if event.id == self.quit_id {
                     out.push(TrayAction::Quit);
                 }

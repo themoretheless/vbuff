@@ -25,6 +25,8 @@ pub struct Config {
     pub excluded_apps: Vec<String>,
     /// Skip capturing empty/whitespace-only text copies.
     pub skip_whitespace_only: bool,
+    /// Register vbuff to launch when the user logs in.
+    pub launch_at_login: bool,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             paste_modifier: String::new(),
             excluded_apps: Vec::new(),
             skip_whitespace_only: true,
+            launch_at_login: false,
         }
     }
 }
@@ -106,6 +109,7 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg.hotkey, back.hotkey);
         assert_eq!(cfg.max_history, back.max_history);
+        assert_eq!(cfg.launch_at_login, back.launch_at_login);
     }
 
     #[test]
