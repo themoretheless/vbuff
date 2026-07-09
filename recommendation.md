@@ -291,6 +291,20 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 
 ---
 
+## 500-point review backlog map
+
+The full 500-item review is shared with `README.md` and `architecture.md` through one DRY range map. Use these ranges as raw decision input; promote an item into `plan.md` only after it has scope, test strategy, and a clear cut line.
+
+| Range | Canonical file | Product/engineering lens |
+|---|---|---|
+| 1-113 | [architecture.md](architecture.md) | Engineering architecture, platform traits, storage/search, security, sync, reliability |
+| 114-197 | [recommendation.md](recommendation.md) | Strategy, positioning, build-now/build-later calls, monetization, integrations |
+| 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | User workflows, UI/UX, everyday quality, sync experience, integrations, operations |
+| 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy controls, search, data model, platform fit, collaboration, automation |
+| 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY cuts, testing gaps, design fixes, roadmap hygiene |
+
+---
+
 ## Ideas and improvements backlog (product & strategy)
 
 > Items 114-197 of a 500-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), and review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md). Effort tags: `S`/`M`/`L`.

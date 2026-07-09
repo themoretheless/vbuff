@@ -1086,6 +1086,19 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
 
+---
+
+## 500-point review backlog map
+
+The backlog is intentionally split instead of duplicated. `architecture.md`, `README.md`, and `recommendation.md` should all point to the same ranges so the docs stay DRY while still making the full 500-item review easy to navigate.
+
+| Range | Canonical file | Ownership lens |
+|---|---|---|
+| 1-113 | [architecture.md](architecture.md) | Engineering architecture, native backends, data model, security, sync, testing |
+| 114-197 | [recommendation.md](recommendation.md) | Product bets, positioning, monetization, roadmap tradeoffs, integrations |
+| 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | Power-user workflows, UI/UX, everyday quality, sync, operations |
+| 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy, search, storage, platform fit, teams, automation, governance |
+| 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current problems, SOLID/DRY refactors, test gaps, designer-grade UX, review hygiene |
 
 ---
 

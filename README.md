@@ -141,6 +141,20 @@ vbuff should feel like a quiet resident tool, not a marketing page or a scriptin
 
 ---
 
+## 500-point review backlog
+
+The 500 proposals, improvements, problems, bugs and "done badly" notes are kept as one numbered backlog, split by decision level so each file stays readable. Treat this as review input, not an automatic scope increase; `plan.md` decides what graduates into implementation.
+
+| Range | Canonical file | Lens |
+|---|---|---|
+| 1-113 | [architecture.md](architecture.md) | Engineering architecture, backends, storage, privacy, sync, testability |
+| 114-197 | [recommendation.md](recommendation.md) | Product strategy, differentiation, business model, roadmap tradeoffs |
+| 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | User workflows, UI/UX, sync experience, integrations, operations |
+| 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy controls, search, data model, platform fit, teams, automation |
+| 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY slices, design fixes, review hygiene |
+
+---
+
 ## Build from source
 
 vbuff is a standard Cargo workspace. You need a recent stable **Rust toolchain** (install via [rustup](https://rustup.rs)) plus a few per-OS native dependencies.
