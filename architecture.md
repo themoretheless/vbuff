@@ -189,6 +189,20 @@ vbuff/
 
 `vbuff-store` is split from `vbuff-core` because eviction/retention/dedup *policy* (core) is independent of *persistence* (store), letting us fuzz the policy logic against an in-memory fake store. `vbuff-types` is separate so the CLI and IPC can serialize `Clip` without pulling in rusqlite or egui. Dependency direction is strictly downward; `vbuff-core` never depends on `vbuff-gui`, `vbuff-store`, or `vbuff-platform`'s *impls* (only its *traits*).
 
+The crate tree above is the target workspace. Inside the **current single-process root app**, responsibilities are already split so the target extraction is mechanical rather than a rewrite:
+
+| Current module | One reason to change |
+|---|---|
+| `src/main.rs` | Startup composition and dependency construction |
+| `src/app.rs` | eframe event-loop coordination and command dispatch |
+| `src/capture.rs` | Clipboard polling, capture policy, retry-on-store-failure |
+| `src/history.rs` | Store mutation plus GUI snapshot publication |
+| `src/paste.rs` | Clipboard staging and delayed paste-back sequencing |
+| `src/commands.rs` | Canonical `AppCommand` vocabulary for popup, tray, and hotkey |
+| `src/tray.rs` | Menu-bar icon, menu state, and menu-event mapping |
+| `src/autostart.rs` | Per-OS launch-at-login registration |
+| `src/config.rs` | TOML configuration and defaults |
+
 ### SOLID/DRY decomposition and small reading slices
 
 The implementation should remain learnable as a set of small, single-purpose slices. The current repository already has the workspace split; the next cleanup is to keep the root binary as composition glue instead of a second architecture.
@@ -201,9 +215,10 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | **Platform** | Clipboard, hotkey, paste, tray capabilities behind traits | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs` |
 | **GUI state** | Query text, selection, view visibility, queued UI actions | Clipboard reads/writes, DB mutations | `crates/vbuff-gui/src/state.rs` |
 | **GUI view** | Search box, rows, badges, thumbnails, keyboard navigation | Capture loop, retention, config parsing | `crates/vbuff-gui/src/app.rs`, `view.rs` |
-| **Capture supervisor** | Subscribe/poll, read flavors, evaluate gate, emit store command | Rendering, SQL details, paste injection | target extraction from `src/main.rs` |
-| **Paste coordinator** | Focus snapshot, write selected flavors, hide popup, inject paste, report failure | Searching, storage schema, row rendering | target extraction from `src/main.rs` |
-| **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, `Quit` semantics | UI widget styling, OS-specific event delivery | target extraction from tray/UI wiring |
+| **History facade** | Serialize store mutations and publish bounded GUI snapshots | SQL schema, capture decisions, widget layout | `src/history.rs` |
+| **Capture supervisor** | Poll, read flavors, evaluate the cheap gate, retry failed persistence | Rendering, SQL details, paste injection | `src/capture.rs` |
+| **Paste coordinator** | Write selected flavors before scheduling delayed paste injection | Searching, storage schema, row rendering | `src/paste.rs` |
+| **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, autostart, and `Quit` semantics | UI widget styling, OS-specific event delivery | `src/commands.rs`, dispatched by `src/app.rs` |
 | **Diagnostics** | Redacted logs, health state, capability badges, doctor checks | Clip payload storage, transform behavior | target extraction from tracing/status code |
 
 SOLID rules for future edits:
@@ -215,13 +230,14 @@ SOLID rules for future edits:
 - **Dependency inversion:** high-level policy depends on abstractions and pure data, never concrete OS crates.
 - **DRY:** shared commands, design tokens, capability badges, privacy gate reasons, and retention rules must have one source of truth. Duplication in labels or logic is a bug, not harmless documentation drift.
 
-Concrete extraction order:
+Current extraction status:
 
-1. Move capture-loop code from `src/main.rs` into `capture::CaptureSupervisor` with a pure `CapturePolicy`.
-2. Introduce a shared `AppCommand` enum used by hotkey, tray, popup, and future IPC.
-3. Move paste timing/focus work into `paste::PasteCoordinator`.
-4. Move store mutations behind a small writer API and give the GUI a read-only snapshot.
-5. Add `vbuff-gui::design` for spacing, row height, badges, color roles, and icon rules.
+1. **Done:** capture polling and pure cheap-gate rules live in `src/capture.rs`; a failed store write is retried instead of poisoning the last-seen hash.
+2. **Done:** `AppCommand` is shared by popup, tray, and hotkey dispatch, including one `ClearHistory` meaning (pinned clips survive).
+3. **Done:** `PasteCoordinator` owns clipboard staging and timing; paste injection is impossible when clipboard staging fails.
+4. **Done:** `History` is the small app-layer writer/snapshot API, so capture and commands do not manipulate the store mutex directly.
+5. **Done:** `vbuff-gui::design` owns stable dimensions, spacing, and font-independent icon buttons; the menu-bar icon is isolated in `src/tray.rs`.
+6. **Next:** extract capture health and command outcomes into observable state, then move the same modules into `vbuff-daemon`/`vbuff-ipc` at M7 without changing their contracts.
 
 ### Core data model
 

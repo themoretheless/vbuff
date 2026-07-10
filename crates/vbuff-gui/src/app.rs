@@ -16,6 +16,7 @@ use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::{SearchResult, search};
 use vbuff_types::{Body, Clip, ClipId};
 
+use crate::design::{self, Icon};
 use crate::state::{SharedState, UiAction};
 use crate::view::{relative_time, short_app_name};
 
@@ -42,6 +43,12 @@ pub struct PopupApp {
     /// sequence the hide + keystroke. Mirrors the action queue but is simpler
     /// to consume.
     request_focus_next_frame: bool,
+    /// Set after global spacing and interaction tokens are installed.
+    design_applied: bool,
+    /// True while the destructive clear-history confirmation is open.
+    confirm_clear_history: bool,
+    /// Clip awaiting explicit delete confirmation.
+    confirm_delete: Option<ClipId>,
 }
 
 impl PopupApp {
@@ -57,6 +64,9 @@ impl PopupApp {
             thumbnails: std::collections::HashMap::new(),
             shown_at: None,
             request_focus_next_frame: false,
+            design_applied: false,
+            confirm_clear_history: false,
+            confirm_delete: None,
         }
     }
 
@@ -70,10 +80,18 @@ impl PopupApp {
         self.visible = true;
         self.query.clear();
         self.selected = 0;
+        self.confirm_clear_history = false;
+        self.confirm_delete = None;
         self.shown_at = Some(Instant::now());
         self.request_focus_next_frame = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
+    }
+
+    /// Open the popup directly on the clear-history confirmation.
+    pub fn request_clear_history_confirmation(&mut self, ctx: &egui::Context) {
+        self.show(ctx);
+        self.confirm_clear_history = true;
     }
 
     /// Hide the popup.
@@ -96,12 +114,17 @@ impl eframe::App for PopupApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Light/dark follows the system theme via `NativeOptions` in the app
-        // wiring; nothing to set per-frame here.
+        if !self.design_applied {
+            design::apply(ctx);
+            self.design_applied = true;
+        }
 
         // 1. Check for a show request from the wiring.
         let (clips, paused, show_requested, revision) = {
-            let mut s = self.state.lock().unwrap();
+            let Ok(mut s) = self.state.lock() else {
+                tracing::error!("GUI state mutex poisoned");
+                return;
+            };
             let show = std::mem::take(&mut s.show_requested);
             (s.clips.clone(), s.paused, show, s.revision)
         };
@@ -144,43 +167,45 @@ impl eframe::App for PopupApp {
 
         // 4. Global key handling.
         let modifier_down = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
-        ctx.input(|i| {
-            if i.key_pressed(Key::Escape) {
-                self.actions.push_back(UiAction::Hide);
-            }
-            if i.key_pressed(Key::ArrowDown) && total > 0 {
-                self.selected = (self.selected + 1).min(total - 1);
-            }
-            if i.key_pressed(Key::ArrowUp) && total > 0 {
-                self.selected = self.selected.saturating_sub(1);
-            }
-            if i.key_pressed(Key::Enter)
-                && total > 0
-                && let Some(id) = filtered.get(self.selected)
-            {
-                self.actions.push_back(UiAction::Paste(*id));
-            }
-            // Cmd/Ctrl + 1..9 quick select.
-            if modifier_down {
-                for (n, key) in [
-                    (1, Key::Num1),
-                    (2, Key::Num2),
-                    (3, Key::Num3),
-                    (4, Key::Num4),
-                    (5, Key::Num5),
-                    (6, Key::Num6),
-                    (7, Key::Num7),
-                    (8, Key::Num8),
-                    (9, Key::Num9),
-                ] {
-                    if i.key_pressed(key)
-                        && let Some(id) = filtered.get(n - 1)
-                    {
-                        self.actions.push_back(UiAction::Paste(*id));
+        if !self.confirm_clear_history && self.confirm_delete.is_none() {
+            ctx.input(|i| {
+                if i.key_pressed(Key::Escape) {
+                    self.actions.push_back(UiAction::Hide);
+                }
+                if i.key_pressed(Key::ArrowDown) && total > 0 {
+                    self.selected = (self.selected + 1).min(total - 1);
+                }
+                if i.key_pressed(Key::ArrowUp) && total > 0 {
+                    self.selected = self.selected.saturating_sub(1);
+                }
+                if i.key_pressed(Key::Enter)
+                    && total > 0
+                    && let Some(id) = filtered.get(self.selected)
+                {
+                    self.actions.push_back(UiAction::Paste(*id));
+                }
+                // Cmd/Ctrl + 1..9 quick select.
+                if modifier_down {
+                    for (n, key) in [
+                        (1, Key::Num1),
+                        (2, Key::Num2),
+                        (3, Key::Num3),
+                        (4, Key::Num4),
+                        (5, Key::Num5),
+                        (6, Key::Num6),
+                        (7, Key::Num7),
+                        (8, Key::Num8),
+                        (9, Key::Num9),
+                    ] {
+                        if i.key_pressed(key)
+                            && let Some(id) = filtered.get(n - 1)
+                        {
+                            self.actions.push_back(UiAction::Paste(*id));
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         // If Esc requested a hide, do it now.
         if self.actions.iter().any(|a| *a == UiAction::Hide) {
@@ -215,34 +240,59 @@ impl eframe::App for PopupApp {
             ui.horizontal(|ui| {
                 ui.small(format!("{total} items"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Clear all").clicked() {
-                        self.actions.push_back(UiAction::ClearAll);
+                    if ui
+                        .add_enabled(!clips.is_empty(), egui::Button::new("Clear history"))
+                        .clicked()
+                    {
+                        self.confirm_clear_history = true;
+                        self.confirm_delete = None;
                     }
-                    let pause_label = if paused { "Resume" } else { "Pause" };
-                    if ui.small_button(pause_label).clicked() {
+                    let (pause_icon, pause_tooltip) = if paused {
+                        (Icon::Resume, "Resume capture")
+                    } else {
+                        (Icon::Pause, "Pause capture")
+                    };
+                    if design::icon_button(ui, pause_icon, pause_tooltip, paused).clicked() {
                         self.actions.push_back(UiAction::TogglePause);
                     }
                 });
             });
             ui.separator();
 
-            // Virtualized results list.
-            let row_height = 52.0;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, total, |ui, row_range| {
-                    for row in row_range {
-                        let Some(id) = filtered.get(row) else {
-                            continue;
+            if total == 0 {
+                ui.with_layout(
+                    egui::Layout::top_down_justified(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(72.0);
+                        let message = if self.query.trim().is_empty() {
+                            "No clipboard history yet"
+                        } else {
+                            "No matching clips"
                         };
-                        let Some(clip) = clip_by_id.get(id) else {
-                            continue;
-                        };
-                        let selected = row == self.selected;
-                        self.render_row(ui, ctx, row, clip, selected);
-                    }
-                });
+                        ui.label(RichText::new(message).strong());
+                    },
+                );
+            } else {
+                // Stable-height virtualized rows keep controls from shifting.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, design::ROW_HEIGHT, total, |ui, row_range| {
+                        for row in row_range {
+                            let Some(id) = filtered.get(row) else {
+                                continue;
+                            };
+                            let Some(clip) = clip_by_id.get(id) else {
+                                continue;
+                            };
+                            let selected = row == self.selected;
+                            self.render_row(ui, ctx, row, clip, selected);
+                        }
+                    });
+            }
         });
+
+        self.render_clear_history_confirmation(ctx);
+        self.render_delete_confirmation(ctx);
 
         // Keep repainting while visible so focus/typing feels live.
         ctx.request_repaint();
@@ -265,12 +315,17 @@ impl PopupApp {
             Color32::TRANSPARENT
         };
 
-        let frame = egui::Frame::new().fill(bg).inner_margin(6.0);
+        let frame = egui::Frame::new().fill(bg).inner_margin(design::ROW_MARGIN);
         frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Quick-pick number badge for the first nine rows.
                 if row < 9 {
-                    ui.label(RichText::new(format!("{}", row + 1)).weak().monospace());
+                    ui.add_sized(
+                        [18.0, design::THUMBNAIL_SIZE],
+                        egui::Label::new(RichText::new(format!("{}", row + 1)).weak().monospace()),
+                    );
+                } else {
+                    ui.allocate_space(egui::vec2(18.0, design::THUMBNAIL_SIZE));
                 }
 
                 // Kind icon / color swatch / thumbnail.
@@ -279,49 +334,133 @@ impl PopupApp {
                         draw_color_swatch(ui, text.trim());
                     }
                 } else if let Some(tex) = self.thumbnail(ctx, clip) {
-                    let size = egui::vec2(40.0, 40.0);
+                    let size = egui::Vec2::splat(design::THUMBNAIL_SIZE);
                     ui.add(egui::Image::from_texture(&tex).fit_to_exact_size(size));
                 } else {
-                    ui.label(RichText::new(clip.meta.kind.icon()).size(20.0));
+                    ui.add_sized(
+                        [design::THUMBNAIL_SIZE, design::THUMBNAIL_SIZE],
+                        egui::Label::new(RichText::new(clip.meta.kind.icon()).size(20.0)),
+                    );
                 }
 
-                ui.vertical(|ui| {
-                    // Preview line.
-                    let preview = clip.preview(80);
-                    let resp = ui.add(
-                        egui::Label::new(RichText::new(preview).strong())
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    );
-                    if resp.clicked() {
-                        self.actions.push_back(UiAction::Paste(clip.id));
-                    }
-
-                    // Meta line: kind, source app, relative time.
-                    ui.horizontal(|ui| {
-                        let mut meta = vec![clip.meta.kind.label().to_string()];
-                        if let Some(app) = &clip.meta.source_app {
-                            meta.push(short_app_name(app));
+                let action_width = design::ICON_BUTTON_SIZE * 2.0 + 12.0;
+                let content_width = (ui.available_width() - action_width).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, design::THUMBNAIL_SIZE),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Preview line.
+                        let preview = clip.preview(80);
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(preview).strong())
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        if resp.clicked() {
+                            self.actions.push_back(UiAction::Paste(clip.id));
                         }
-                        meta.push(relative_time(clip.meta.created_at, Utc::now()));
-                        ui.small(meta.join(" · "));
-                    });
-                });
+
+                        // Meta line: kind, source app, relative time.
+                        ui.horizontal(|ui| {
+                            let mut meta = vec![clip.meta.kind.label().to_string()];
+                            if let Some(app) = &clip.meta.source_app {
+                                meta.push(short_app_name(app));
+                            }
+                            meta.push(relative_time(clip.meta.created_at, Utc::now()));
+                            ui.small(meta.join(" · "));
+                        });
+                    },
+                );
 
                 // Right-aligned actions.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("🗑").on_hover_text("Delete").clicked() {
-                        self.actions.push_back(UiAction::Delete(clip.id));
+                    if design::icon_button(ui, Icon::Delete, "Delete clip", false).clicked() {
+                        self.confirm_delete = Some(clip.id);
+                        self.confirm_clear_history = false;
                     }
-                    let pin_icon = if clip.pinned { "📌" } else { "📍" };
                     let pin_hover = if clip.pinned { "Unpin" } else { "Pin" };
-                    if ui.small_button(pin_icon).on_hover_text(pin_hover).clicked() {
+                    if design::icon_button(
+                        ui,
+                        Icon::Pin {
+                            filled: clip.pinned,
+                        },
+                        pin_hover,
+                        clip.pinned,
+                    )
+                    .clicked()
+                    {
                         self.actions
                             .push_back(UiAction::SetPinned(clip.id, !clip.pinned));
                     }
                 });
             });
         });
+    }
+
+    fn render_clear_history_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_clear_history {
+            return;
+        }
+
+        let response =
+            egui::Modal::new(egui::Id::new("clear_history_confirmation")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading("Clear clipboard history?");
+                ui.label("Pinned clips will be kept.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Cancel").clicked();
+                    let clear = ui
+                        .add(
+                            egui::Button::new(RichText::new("Clear history").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(176, 48, 56)),
+                        )
+                        .clicked();
+                    (cancel, clear)
+                })
+                .inner
+            });
+
+        let (cancel, clear) = response.inner;
+        if clear {
+            self.actions.push_back(UiAction::ClearHistory);
+            self.confirm_clear_history = false;
+        } else if cancel || response.should_close() {
+            self.confirm_clear_history = false;
+        }
+    }
+
+    fn render_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.confirm_delete else {
+            return;
+        };
+
+        let response =
+            egui::Modal::new(egui::Id::new("delete_clip_confirmation")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading("Delete this clip?");
+                ui.label("This removes it from local history.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Cancel").clicked();
+                    let delete = ui
+                        .add(
+                            egui::Button::new(RichText::new("Delete clip").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(176, 48, 56)),
+                        )
+                        .clicked();
+                    (cancel, delete)
+                })
+                .inner
+            });
+
+        let (cancel, delete) = response.inner;
+        if delete {
+            self.actions.push_back(UiAction::Delete(id));
+            self.confirm_delete = None;
+        } else if cancel || response.should_close() {
+            self.confirm_delete = None;
+        }
     }
 
     /// Get or build a thumbnail texture for an image clip.
@@ -340,7 +479,10 @@ impl PopupApp {
 /// Draw a small filled rectangle for a color clip.
 fn draw_color_swatch(ui: &mut egui::Ui, text: &str) {
     let color = parse_hex_color(text).unwrap_or(Color32::GRAY);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::splat(design::THUMBNAIL_SIZE),
+        egui::Sense::hover(),
+    );
     ui.painter().rect_filled(rect, 4.0, color);
 }
 

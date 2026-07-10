@@ -110,7 +110,7 @@ vbuff's design should feel more like a precise resident instrument than a conten
 | Row actions | Icons plus tooltips for common tools; explicit text for destructive actions | Cut rare row actions into a command palette before crowding every row |
 | Sensitive content | Mask by default, show reason, allow deliberate peek, never use panic styling | Cut visual cleverness before cutting trust clarity |
 | Settings | Dense, grouped controls with search and keyboard navigation | Cut deep customization before cutting privacy defaults |
-| Tray/menu bar | Same command names as popup/CLI: Show, Copy latest, Clear history, Pause/Resume, Quit | Cut extra menu items before duplicating command semantics |
+| Tray/menu bar | Recognizable clipboard icon; same command names as popup/CLI: Show, Copy latest, Clear history, Pause/Resume, Start at login, Quit | Cut extra menu items before duplicating command semantics |
 | Onboarding | One successful copy -> popup -> paste-back loop | Cut explanatory tours before cutting the first success path |
 
 Design review checklist:
@@ -123,6 +123,8 @@ Design review checklist:
 - Does the UI distinguish current implementation from target/future capability?
 
 The SOLID/DRY product rule: a command should have one name, one behavior, and one permission model across popup, tray, CLI, IPC, and docs. If "clear history" means different things in two surfaces, the design is wrong even if the code compiles.
+
+Current implementation review: the popup now consumes one design-token module for stable dimensions and spacing, uses fixed-size native icon buttons with accessibility labels/tooltips instead of platform-dependent emoji, distinguishes empty history from no search results, and explicitly confirms both `Delete clip` and `Clear history` while stating that pinned clips survive the latter. The tray/menu-bar has a transparent clipboard/check glyph, dynamic Pause/Resume and Start/Don't start at login labels, emits the same `AppCommand` values as the popup, and routes destructive clearing through the popup confirmation. Remaining design work is capability/privacy status, full screen-reader verification, and screenshot regression coverage.
 
 ---
 

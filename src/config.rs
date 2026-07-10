@@ -81,14 +81,6 @@ impl Config {
         std::fs::write(&path, text)?;
         Ok(())
     }
-
-    /// True if the given source-app identifier matches an exclusion entry.
-    pub fn is_excluded(&self, source_app: &str) -> bool {
-        let lower = source_app.to_lowercase();
-        self.excluded_apps
-            .iter()
-            .any(|e| !e.is_empty() && lower.contains(&e.to_lowercase()))
-    }
 }
 
 /// The config file path: `<config_dir>/vbuff/config.toml`.
@@ -110,17 +102,5 @@ mod tests {
         assert_eq!(cfg.hotkey, back.hotkey);
         assert_eq!(cfg.max_history, back.max_history);
         assert_eq!(cfg.launch_at_login, back.launch_at_login);
-    }
-
-    #[test]
-    fn exclusion_matches_substring() {
-        let cfg = Config {
-            excluded_apps: vec!["onepassword".into()],
-            ..Default::default()
-        };
-        assert!(cfg.is_excluded("com.agilebits.onepassword7"));
-        assert!(!cfg.is_excluded("com.apple.Safari"));
-        // Matching is case-insensitive.
-        assert!(cfg.is_excluded("com.AgileBits.OnePassword7"));
     }
 }

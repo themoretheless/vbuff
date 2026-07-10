@@ -55,6 +55,8 @@ M0-M6 deliver the single-process MVP. M7-M10 deliver v1 (the multi-crate split h
 
 The expanded 500-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, and review backlog items 401-500 live in `docs/ideas-401-500.md`. The milestone gates below decide when an idea becomes planned work.
 
+Current baseline before the formal M7 crate extraction: the single-process root is already divided into `capture`, `history`, `paste`, `commands`, `tray`, `autostart`, `config`, and event-loop `app` modules. Preserve those ownership boundaries through M0-M6; M7 moves them behind daemon/IPC contracts instead of recombining their responsibilities in `main.rs`.
+
 ---
 
 ## 2. Milestones in detail

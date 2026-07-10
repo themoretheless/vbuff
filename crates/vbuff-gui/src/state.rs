@@ -45,8 +45,8 @@ pub enum UiAction {
     SetPinned(ClipId, bool),
     /// Delete a single clip.
     Delete(ClipId),
-    /// Clear all non-pinned clips.
-    ClearAll,
+    /// Clear history while preserving pinned clips.
+    ClearHistory,
     /// Toggle capture pause.
     TogglePause,
     /// Hide the popup (Esc / focus loss).

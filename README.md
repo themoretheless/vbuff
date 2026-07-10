@@ -106,7 +106,7 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | `vbuff-store` | Current bundled SQLite JSON-flavor store; target adds SQLCipher, FTS5, migrations, blob spill, at-rest crypto | Yes (partial) |
 | `vbuff-platform` | Current trait layer plus `arboard` / `global-hotkey` / `enigo` adapters; target adds native per-OS clipboard, hotkey, paste and tray impls | Yes (partial) |
 | `vbuff-gui` | Current `eframe` popup; target adds deeper settings viewports, richer badges, accessibility depth | Yes (partial) |
-| *(root binary)* | `src/main.rs`: launches the single-process app, owns the watcher/store/GUI | Yes |
+| *(root app)* | `src/main.rs` composes startup; focused modules own capture, history, commands, paste timing, event-loop wiring, autostart, and tray/menu-bar integration | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
 | `vbuff-ipc` | Framed protocol over Unix socket / named pipe | Later |
 | `vbuff-sync` | mDNS discovery, Noise/TLS transport, pairing, LAN P2P replication | Later |
@@ -124,14 +124,19 @@ The repo is intentionally split so you can understand it without loading the who
 2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, and eviction. This crate should stay OS-free and GUI-free.
 3. **Persistence:** read `crates/vbuff-store/src/lib.rs` for the current SQLite MVP store and its transitional JSON-flavor schema.
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
-5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `app.rs`, then `view.rs`.
-6. **Composition shell:** read `src/main.rs` last. It currently wires the MVP together, but the long-term direction is to move capture, commands, paste coordination, and diagnostics into smaller modules.
+5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `view.rs`, and `app.rs`.
+6. **History boundary:** read `src/history.rs`; it is the only app-layer facade that couples store mutations to refreshed GUI snapshots.
+7. **Resident workflows:** read `src/capture.rs` for polling/policy and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
+8. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
+9. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` now loads dependencies and starts the focused modules; it does not contain workflow logic.
 
-The SOLID/DRY rule of thumb is simple: data types are shared, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, and `main.rs` should only compose the pieces.
+The SOLID/DRY rule of thumb is simple: data types are shared, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, and `main.rs` only composes the pieces.
 
 ## Design direction
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
+
+The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The tray/menu-bar now uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
