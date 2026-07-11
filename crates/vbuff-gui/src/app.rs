@@ -531,7 +531,8 @@ fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth)
             CaptureHealth::Watching => Color32::from_rgb(44, 156, 103),
             CaptureHealth::ClipboardUnavailable
             | CaptureHealth::ClipboardReadError
-            | CaptureHealth::StorageError => Color32::from_rgb(194, 64, 72),
+            | CaptureHealth::StorageError
+            | CaptureHealth::Stalled => Color32::from_rgb(194, 64, 72),
         };
         (health.label(), color)
     };

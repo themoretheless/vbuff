@@ -81,6 +81,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("`AppCommand` is the one command vocabulary"));
     assert!(readme.contains("typed capture-health state"));
     assert!(readme.contains("read `src/diagnostics.rs`"));
+    assert!(readme.contains("read `src/single_instance/mod.rs`"));
+    assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -88,16 +90,21 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("| `src/paste.rs` |"));
     assert!(architecture.contains("the narrow `Diagnostics` publisher"));
     assert!(architecture.contains("`crates/vbuff-types/src/status.rs`"));
+    assert!(architecture.contains("| `src/single_instance/` |"));
+    assert!(architecture.contains("`CaptureHealth::Stalled`"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
     assert!(recommendation.contains("The SOLID/DRY product rule"));
     assert!(recommendation.contains("one typed capture-health vocabulary"));
+    assert!(recommendation.contains("pause-aware heartbeat/watchdog"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
     assert!(plan.contains("Current baseline before the formal M7 crate extraction"));
     assert!(plan.contains("Serializable status contracts live in `vbuff-types`"));
+    assert!(plan.contains("Bootstrap already landed in the root app"));
+    assert!(plan.contains("native hook re-subscribe/auto-restart"));
 }
 
 #[test]

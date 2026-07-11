@@ -6,13 +6,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eframe::App as _;
 use global_hotkey::GlobalHotKeyEvent;
 use vbuff_gui::{PopupApp, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend};
-use vbuff_types::NoticeLevel;
+use vbuff_types::{ClientIntent, NoticeLevel};
 
 #[cfg(feature = "tray")]
 use crate::autostart;
@@ -27,12 +28,38 @@ use crate::tray::Tray;
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_REPAINT_INTERVAL: Duration = Duration::from_millis(20);
 
-pub(crate) fn run(
+/// Resident services consumed by the eframe event loop.
+pub(crate) struct AppServices {
     history: History,
     shared: SharedState,
     diagnostics: Diagnostics,
+    instance_intents: Receiver<ClientIntent>,
     paused: Arc<AtomicBool>,
     config: Config,
+}
+
+impl AppServices {
+    pub(crate) fn new(
+        history: History,
+        shared: SharedState,
+        diagnostics: Diagnostics,
+        instance_intents: Receiver<ClientIntent>,
+        paused: Arc<AtomicBool>,
+        config: Config,
+    ) -> Self {
+        Self {
+            history,
+            shared,
+            diagnostics,
+            instance_intents,
+            paused,
+            config,
+        }
+    }
+}
+
+pub(crate) fn run(
+    services: AppServices,
     mut hotkey_backend: GlobalHotkeyBackend,
     hotkey_id: Option<u32>,
 ) -> anyhow::Result<()> {
@@ -49,7 +76,7 @@ pub(crate) fn run(
         ..Default::default()
     };
 
-    let mut runtime = Runtime::new(history, shared, diagnostics, paused, config);
+    let mut runtime = Runtime::new(services);
     let result = eframe::run_simple_native("vbuff", native_options, move |ctx, frame| {
         runtime.update(ctx, frame);
     });
@@ -67,6 +94,7 @@ struct Runtime {
     history: History,
     shared: SharedState,
     diagnostics: Diagnostics,
+    instance_intents: Receiver<ClientIntent>,
     paused: Arc<AtomicBool>,
     #[cfg(feature = "tray")]
     config: Config,
@@ -80,13 +108,15 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(
-        history: History,
-        shared: SharedState,
-        diagnostics: Diagnostics,
-        paused: Arc<AtomicBool>,
-        config: Config,
-    ) -> Self {
+    fn new(services: AppServices) -> Self {
+        let AppServices {
+            history,
+            shared,
+            diagnostics,
+            instance_intents,
+            paused,
+            config,
+        } = services;
         #[cfg(not(feature = "tray"))]
         let _ = config;
 
@@ -95,6 +125,7 @@ impl Runtime {
             popup: PopupApp::new(Arc::clone(&shared)),
             shared,
             diagnostics,
+            instance_intents,
             paused,
             #[cfg(feature = "tray")]
             config,
@@ -111,6 +142,13 @@ impl Runtime {
         self.ensure_ticker(ctx);
         self.ensure_tray();
         ctx.request_repaint_after(IDLE_REPAINT_INTERVAL);
+
+        while let Ok(intent) = self.instance_intents.try_recv() {
+            match intent {
+                ClientIntent::ShowPopup => self.handle(AppCommand::Show, ctx),
+                ClientIntent::Ping => {}
+            }
+        }
 
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if event.state == global_hotkey::HotKeyState::Pressed {

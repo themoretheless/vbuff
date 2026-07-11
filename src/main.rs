@@ -1,8 +1,8 @@
 //! vbuff - cross-platform clipboard manager (MVP single-process build).
 //!
-//! The root binary is composition only. Capture, history, commands, paste-back,
-//! tray integration, configuration, and the eframe loop each live in a focused
-//! module so the implementation can be read in small pieces.
+//! The root binary is composition only. Single-instance handoff, capture,
+//! history, commands, paste-back, tray integration, configuration, and the
+//! eframe loop each live in a focused module.
 
 mod app;
 mod autostart;
@@ -12,6 +12,7 @@ mod config;
 mod diagnostics;
 mod history;
 mod paste;
+mod single_instance;
 #[cfg(feature = "tray")]
 mod tray;
 
@@ -22,16 +23,26 @@ use anyhow::Context as _;
 use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
+use vbuff_types::ClientIntent;
 
 use config::Config;
 use diagnostics::Diagnostics;
 use history::History;
+use single_instance::LaunchOutcome;
 
 /// How many clips to keep loaded in the GUI snapshot.
 const GUI_LIMIT: usize = 1000;
 
 fn main() -> anyhow::Result<()> {
     init_tracing();
+
+    let (_instance_guard, instance_intents) =
+        match single_instance::acquire_or_forward(ClientIntent::ShowPopup)
+            .context("acquiring single-instance endpoint")?
+        {
+            LaunchOutcome::Primary { guard, intents } => (guard, intents),
+            LaunchOutcome::Forwarded => return Ok(()),
+        };
 
     let config = Config::load_or_create().context("loading config")?;
     tracing::info!(?config.hotkey, config.poll_interval_ms, "vbuff starting");
@@ -69,15 +80,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    app::run(
+    let app_services = app::AppServices::new(
         history,
         shared,
         diagnostics,
+        instance_intents,
         paused,
         config,
-        hotkey_backend,
-        hotkey_id,
-    )
+    );
+    app::run(app_services, hotkey_backend, hotkey_id)
 }
 
 fn init_tracing() {

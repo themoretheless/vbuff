@@ -55,7 +55,7 @@ M0-M6 deliver the single-process MVP. M7-M10 deliver v1 (the multi-crate split h
 
 The expanded 500-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, and review backlog items 401-500 live in `docs/ideas-401-500.md`. The milestone gates below decide when an idea becomes planned work.
 
-Current baseline before the formal M7 crate extraction: the single-process root is already divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `tray`, `autostart`, `config`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; capture and commands publish through `Diagnostics`, while popup/tray only consume the resulting typed health and redacted notices. Preserve those ownership boundaries through M0-M6; M7 adds heartbeat/watchdog and moves the modules behind daemon/IPC contracts instead of recombining their responsibilities in `main.rs`.
+Current baseline before the formal M7 crate extraction: the single-process root is already divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`, alongside the minimal `ShowPopup`/`Ping` startup protocol; capture and commands publish through `Diagnostics`, while popup/tray only consume the resulting typed health and redacted notices. A pause-aware capture heartbeat surfaces `Stalled`, and bind-or-forward runs before database/hotkey initialization with liveness, OS-released owner-lock serialization, and stale-endpoint recovery. Preserve those ownership boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, the full IPC verb surface, and moves the modules behind daemon/IPC contracts instead of recombining their responsibilities in `main.rs`.
 
 ---
 
@@ -326,6 +326,8 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 **Phase.** v1.
 
 **Crates/modules touched.** New `vbuff-daemon` (owns background threads/runtime, wires watcher<->store<->core<->IPC); new `vbuff-ipc` (UDS/named-pipe framing, `ClientIntent`/`Response` serde); root `src/main.rs` (role dispatch now delegates to `vbuff-daemon`); `vbuff-platform` (watchdog re-subscribe hook).
+
+**Bootstrap already landed in the root app.** `ClientIntent::{ShowPopup, Ping}` and `ServerResponse` are serializable in `vbuff-types`; the root owns bounded framing, Unix-socket or authenticated Windows-loopback bind-or-forward, liveness probing, stale-endpoint recovery, and capture heartbeat/stalled visibility. This is an intentionally narrow precursor, not completion of M7: native hook re-subscribe/auto-restart, the Windows named pipe, process-level handoff tests, daemon extraction, and the full control protocol remain below.
 
 **Task checklist.**
 - [ ] Extract the watcher/store/core wiring from the root binary into `vbuff-daemon`; the daemon owns the tokio runtime for IPC/timers and the dedicated (non-tokio) capture thread.

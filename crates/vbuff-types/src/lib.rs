@@ -9,6 +9,7 @@
 //! ULID-based [`ClipId`] and deduplicated by a BLAKE3 `content_hash` computed
 //! over its canonical flavor bytes (see `vbuff-core`).
 
+mod ipc;
 mod status;
 
 use std::fmt;
@@ -17,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+pub use ipc::{ClientIntent, ServerResponse};
 pub use status::{CaptureHealth, CommandNotice, NoticeLevel};
 
 /// A ULID-based identifier for a clip.

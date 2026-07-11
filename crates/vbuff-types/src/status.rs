@@ -17,6 +17,8 @@ pub enum CaptureHealth {
     ClipboardReadError,
     /// A captured clip could not be persisted; the same clip will be retried.
     StorageError,
+    /// The worker stopped publishing heartbeats within the watchdog budget.
+    Stalled,
 }
 
 impl CaptureHealth {
@@ -28,6 +30,7 @@ impl CaptureHealth {
             Self::ClipboardUnavailable => "Clipboard unavailable",
             Self::ClipboardReadError => "Clipboard read issue",
             Self::StorageError => "History write issue",
+            Self::Stalled => "Capture stalled",
         }
     }
 }
@@ -60,6 +63,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<CaptureHealth>(&health_json).unwrap(),
             health
+        );
+        assert_eq!(
+            serde_json::to_string(&CaptureHealth::Stalled).unwrap(),
+            r#""stalled""#
         );
 
         let notice = CommandNotice {

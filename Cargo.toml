@@ -84,6 +84,7 @@ tray-icon = { workspace = true, optional = true }
 image.workspace = true
 
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 dirs.workspace = true
 anyhow.workspace = true

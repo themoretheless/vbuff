@@ -91,7 +91,7 @@ vbuff is designed around a single hard rule: **fail closed.** Every uncertainty 
 
 ## Status
 
-vbuff is in active early development. The repository already contains a Cargo workspace with `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and a root single-process binary. The current executable polls the clipboard through `arboard`, captures text/images, stores history in a compact `rusqlite` schema, opens an `egui` popup through a global hotkey, and writes the selected clip back before invoking an `enigo` paste keystroke. Native all-flavor clipboard backends, SQLCipher encryption, full per-OS parity, the formal daemon/IPC split, CLI, and sync remain target work tracked in [architecture.md](architecture.md) and [plan.md](plan.md).
+vbuff is in active early development. The repository already contains a Cargo workspace with `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and a root single-process binary. The current executable polls the clipboard through `arboard`, captures text/images, stores history in a compact `rusqlite` schema, opens an `egui` popup through a global hotkey, and writes the selected clip back before invoking an `enigo` paste keystroke. It also owns a minimal single-instance endpoint: a duplicate launch forwards `ShowPopup` to the resident process and exits, stale endpoints are recovered once, and a capture heartbeat makes a stalled worker visible. Native all-flavor clipboard backends, SQLCipher encryption, full per-OS parity, the formal daemon/IPC split, CLI, and sync remain target work tracked in [architecture.md](architecture.md) and [plan.md](plan.md).
 
 ---
 
@@ -101,14 +101,14 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 
 | Crate | Role | In MVP? |
 |---|---|---|
-| `vbuff-types` | Plain shared data types (`Clip`, `Flavor`, `ContentKind`, ids); serde only | Yes |
+| `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
 | `vbuff-core` | Current pure logic: dedup, eviction, classification, substring search; target adds redaction rules, transforms, snippet expansion | Yes (partial) |
 | `vbuff-store` | Current bundled SQLite JSON-flavor store; target adds SQLCipher, FTS5, migrations, blob spill, at-rest crypto | Yes (partial) |
 | `vbuff-platform` | Current trait layer plus `arboard` / `global-hotkey` / `enigo` adapters; target adds native per-OS clipboard, hotkey, paste and tray impls | Yes (partial) |
 | `vbuff-gui` | Current `eframe` popup; target adds deeper settings viewports, richer badges, accessibility depth | Yes (partial) |
-| *(root app)* | `src/main.rs` composes startup; focused modules own capture, history, commands, paste timing, event-loop wiring, autostart, and tray/menu-bar integration | Yes |
+| *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, paste timing, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
-| `vbuff-ipc` | Framed protocol over Unix socket / named pipe | Later |
+| `vbuff-ipc` | Full framed control protocol over Unix socket / Windows named pipe; the root app currently carries only `ShowPopup`/`Ping` bootstrap framing | Later |
 | `vbuff-sync` | mDNS discovery, Noise/TLS transport, pairing, LAN P2P replication | Later |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
@@ -120,24 +120,25 @@ The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for
 
 The repo is intentionally split so you can understand it without loading the whole product into your head at once:
 
-1. **Data shapes and status contracts:** start with `crates/vbuff-types/src/lib.rs`, then `status.rs` (`Clip`, flavors, ids, `CaptureHealth`, and redacted notices).
+1. **Data shapes and wire contracts:** start with `crates/vbuff-types/src/lib.rs`, then `status.rs` and `ipc.rs` (`Clip`, flavors, ids, `CaptureHealth`, redacted notices, and the minimal startup intents).
 2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, and eviction. This crate should stay OS-free and GUI-free.
 3. **Persistence:** read `crates/vbuff-store/src/lib.rs` for the current SQLite MVP store and its transitional JSON-flavor schema.
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
 5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `view.rs`, and `app.rs`.
 6. **History boundary:** read `src/history.rs`; it is the only app-layer facade that couples store mutations to refreshed GUI snapshots.
-7. **Resident workflows:** read `src/capture.rs` for polling/policy and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
+7. **Resident workflows:** read `src/capture.rs` for polling, policy, heartbeat/watchdog supervision, and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
 8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
-9. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
-10. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` now loads dependencies and starts the focused modules; it does not contain workflow logic.
+9. **Startup handoff:** read `src/single_instance/mod.rs` for framing/ownership, then `unix.rs` or `windows_fallback.rs` for one transport; this slice owns bind-or-forward, liveness, stale recovery, and cleanup.
+10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
+11. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` loads dependencies and starts the focused modules; it does not contain workflow logic.
 
-The SOLID/DRY rule of thumb is simple: data and serializable status contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, and `main.rs` only composes the pieces.
+The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, single-instance transport stays isolated, and `main.rs` only composes the pieces.
 
 ## Design direction
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
 
-The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The popup and tray show the same typed capture-health state (`Capture active`, starting, unavailable, read issue, or history-write issue), while redacted command notices report copy/paste/delete/clear/autostart outcomes without exposing clip content. The tray/menu-bar uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
+The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The popup and tray show the same typed capture-health state (`Capture active`, starting, stalled, unavailable, read issue, or history-write issue), while redacted command notices report copy/paste/delete/clear/autostart outcomes without exposing clip content. The tray/menu-bar uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
