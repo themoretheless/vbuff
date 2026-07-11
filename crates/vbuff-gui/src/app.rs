@@ -14,7 +14,7 @@ use std::time::Instant;
 use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::{SearchResult, search};
-use vbuff_types::{Body, Clip, ClipId};
+use vbuff_types::{Body, CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel};
 
 use crate::design::{self, Icon};
 use crate::state::{SharedState, UiAction};
@@ -120,13 +120,20 @@ impl eframe::App for PopupApp {
         }
 
         // 1. Check for a show request from the wiring.
-        let (clips, paused, show_requested, revision) = {
+        let (clips, paused, capture_health, notice, show_requested, revision) = {
             let Ok(mut s) = self.state.lock() else {
                 tracing::error!("GUI state mutex poisoned");
                 return;
             };
             let show = std::mem::take(&mut s.show_requested);
-            (s.clips.clone(), s.paused, show, s.revision)
+            (
+                s.clips.clone(),
+                s.paused,
+                s.capture_health,
+                s.notice.clone(),
+                show,
+                s.revision,
+            )
         };
 
         if show_requested {
@@ -238,6 +245,7 @@ impl eframe::App for PopupApp {
             });
 
             ui.horizontal(|ui| {
+                render_capture_status(ui, paused, capture_health);
                 ui.small(format!("{total} items"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -257,6 +265,9 @@ impl eframe::App for PopupApp {
                     }
                 });
             });
+            if let Some(notice) = &notice {
+                self.render_notice(ui, notice);
+            }
             ui.separator();
 
             if total == 0 {
@@ -300,6 +311,41 @@ impl eframe::App for PopupApp {
 }
 
 impl PopupApp {
+    fn render_notice(&mut self, ui: &mut egui::Ui, notice: &CommandNotice) {
+        let (accent, fill) = match notice.level {
+            NoticeLevel::Info => (
+                Color32::from_rgb(48, 132, 190),
+                Color32::from_rgba_unmultiplied(48, 132, 190, 24),
+            ),
+            NoticeLevel::Warning => (
+                Color32::from_rgb(210, 144, 32),
+                Color32::from_rgba_unmultiplied(210, 144, 32, 24),
+            ),
+            NoticeLevel::Error => (
+                Color32::from_rgb(194, 64, 72),
+                Color32::from_rgba_unmultiplied(194, 64, 72, 24),
+            ),
+        };
+
+        egui::Frame::new()
+            .fill(fill)
+            .inner_margin(5.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    design::status_dot(ui, accent);
+                    let width = (ui.available_width() - design::ICON_BUTTON_SIZE - 12.0).max(120.0);
+                    ui.add_sized(
+                        [width, design::ICON_BUTTON_SIZE],
+                        egui::Label::new(&notice.message).truncate(),
+                    )
+                    .on_hover_text(&notice.message);
+                    if design::icon_button(ui, Icon::Close, "Dismiss message", false).clicked() {
+                        self.actions.push_back(UiAction::DismissNotice);
+                    }
+                });
+            });
+    }
+
     /// Render a single clip row.
     fn render_row(
         &mut self,
@@ -474,6 +520,24 @@ impl PopupApp {
         self.thumbnails.insert(key, tex.clone());
         tex
     }
+}
+
+fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth) {
+    let (label, color) = if paused {
+        ("Capture paused", Color32::from_rgb(210, 144, 32))
+    } else {
+        let color = match health {
+            CaptureHealth::Starting => Color32::from_rgb(112, 120, 132),
+            CaptureHealth::Watching => Color32::from_rgb(44, 156, 103),
+            CaptureHealth::ClipboardUnavailable
+            | CaptureHealth::ClipboardReadError
+            | CaptureHealth::StorageError => Color32::from_rgb(194, 64, 72),
+        };
+        (health.label(), color)
+    };
+
+    design::status_dot(ui, color);
+    ui.label(RichText::new(label).small().color(color));
 }
 
 /// Draw a small filled rectangle for a color clip.

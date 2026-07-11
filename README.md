@@ -120,23 +120,24 @@ The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for
 
 The repo is intentionally split so you can understand it without loading the whole product into your head at once:
 
-1. **Data shapes:** start with `crates/vbuff-types/src/lib.rs` (`Clip`, `Flavor`, `Body`, `ContentKind`, ids).
+1. **Data shapes and status contracts:** start with `crates/vbuff-types/src/lib.rs`, then `status.rs` (`Clip`, flavors, ids, `CaptureHealth`, and redacted notices).
 2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, and eviction. This crate should stay OS-free and GUI-free.
 3. **Persistence:** read `crates/vbuff-store/src/lib.rs` for the current SQLite MVP store and its transitional JSON-flavor schema.
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
 5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `view.rs`, and `app.rs`.
 6. **History boundary:** read `src/history.rs`; it is the only app-layer facade that couples store mutations to refreshed GUI snapshots.
 7. **Resident workflows:** read `src/capture.rs` for polling/policy and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
-8. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
-9. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` now loads dependencies and starts the focused modules; it does not contain workflow logic.
+8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
+9. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
+10. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` now loads dependencies and starts the focused modules; it does not contain workflow logic.
 
-The SOLID/DRY rule of thumb is simple: data types are shared, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, and `main.rs` only composes the pieces.
+The SOLID/DRY rule of thumb is simple: data and serializable status contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, and `main.rs` only composes the pieces.
 
 ## Design direction
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
 
-The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The tray/menu-bar now uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
+The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The popup and tray show the same typed capture-health state (`Capture active`, starting, unavailable, read issue, or history-write issue), while redacted command notices report copy/paste/delete/clear/autostart outcomes without exposing clip content. The tray/menu-bar uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
@@ -214,6 +215,8 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
 7. **Pin** an item to keep it at the top and exempt it from eviction; **delete** removes it from history.
 8. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, toggle start-at-login, or quit.
 9. **Press Esc** (or click away) to dismiss the popup without pasting.
+
+The popup status line and the first disabled tray-menu row show whether capture is active, paused, starting, unavailable, or retrying a clipboard/history failure. Command failures and copy-only fallback appear as dismissible notices; these messages never include clipboard payloads.
 
 The hotkey is rebindable in settings, with conflict detection at bind time. The popup opens near the cursor and is clamped to the work area. Pasting back is fully keyboard-driven: open, filter, navigate, paste, all without the mouse.
 

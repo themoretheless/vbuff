@@ -9,3 +9,6 @@ description = "Plain data model shared across vbuff crates."
 serde.workspace = true
 ulid.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

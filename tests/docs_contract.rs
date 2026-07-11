@@ -79,19 +79,25 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("## Read the project in small pieces"));
     assert!(readme.contains("## Design direction"));
     assert!(readme.contains("`AppCommand` is the one command vocabulary"));
+    assert!(readme.contains("typed capture-health state"));
+    assert!(readme.contains("read `src/diagnostics.rs`"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
     assert!(architecture.contains("| `src/capture.rs` |"));
     assert!(architecture.contains("| `src/paste.rs` |"));
+    assert!(architecture.contains("the narrow `Diagnostics` publisher"));
+    assert!(architecture.contains("`crates/vbuff-types/src/status.rs`"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
     assert!(recommendation.contains("The SOLID/DRY product rule"));
+    assert!(recommendation.contains("one typed capture-health vocabulary"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
     assert!(plan.contains("Current baseline before the formal M7 crate extraction"));
+    assert!(plan.contains("Serializable status contracts live in `vbuff-types`"));
 }
 
 #[test]

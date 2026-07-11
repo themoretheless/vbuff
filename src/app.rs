@@ -12,11 +12,13 @@ use eframe::App as _;
 use global_hotkey::GlobalHotKeyEvent;
 use vbuff_gui::{PopupApp, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend};
+use vbuff_types::NoticeLevel;
 
 #[cfg(feature = "tray")]
 use crate::autostart;
 use crate::commands::AppCommand;
 use crate::config::Config;
+use crate::diagnostics::Diagnostics;
 use crate::history::History;
 use crate::paste::{PasteCoordinator, PasteOutcome};
 #[cfg(feature = "tray")]
@@ -28,6 +30,7 @@ const PASTE_REPAINT_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) fn run(
     history: History,
     shared: SharedState,
+    diagnostics: Diagnostics,
     paused: Arc<AtomicBool>,
     config: Config,
     mut hotkey_backend: GlobalHotkeyBackend,
@@ -46,7 +49,7 @@ pub(crate) fn run(
         ..Default::default()
     };
 
-    let mut runtime = Runtime::new(history, shared, paused, config);
+    let mut runtime = Runtime::new(history, shared, diagnostics, paused, config);
     let result = eframe::run_simple_native("vbuff", native_options, move |ctx, frame| {
         runtime.update(ctx, frame);
     });
@@ -63,6 +66,7 @@ pub(crate) fn run(
 struct Runtime {
     history: History,
     shared: SharedState,
+    diagnostics: Diagnostics,
     paused: Arc<AtomicBool>,
     #[cfg(feature = "tray")]
     config: Config,
@@ -76,7 +80,13 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(history: History, shared: SharedState, paused: Arc<AtomicBool>, config: Config) -> Self {
+    fn new(
+        history: History,
+        shared: SharedState,
+        diagnostics: Diagnostics,
+        paused: Arc<AtomicBool>,
+        config: Config,
+    ) -> Self {
         #[cfg(not(feature = "tray"))]
         let _ = config;
 
@@ -84,6 +94,7 @@ impl Runtime {
             history,
             popup: PopupApp::new(Arc::clone(&shared)),
             shared,
+            diagnostics,
             paused,
             #[cfg(feature = "tray")]
             config,
@@ -160,7 +171,12 @@ impl Runtime {
             return Vec::new();
         };
         if let Ok(state) = self.shared.lock() {
-            tray.sync_state(state.paused, state.clips.len(), self.config.launch_at_login);
+            tray.sync_state(
+                state.paused,
+                state.capture_health,
+                state.clips.len(),
+                self.config.launch_at_login,
+            );
         }
         tray.poll()
     }
@@ -180,36 +196,49 @@ impl Runtime {
             AppCommand::Paste(id) => self.start_paste(id, ctx),
             #[cfg(feature = "tray")]
             AppCommand::CopyLatest => match self.history.latest() {
-                Ok(Some(clip)) => {
-                    if let Err(error) = self.paste.copy(&clip.flavors) {
+                Ok(Some(clip)) => match self.paste.copy(&clip.flavors) {
+                    Ok(()) => self.notice(NoticeLevel::Info, "Latest clip copied"),
+                    Err(error) => {
+                        self.notice(NoticeLevel::Error, "Couldn't copy the latest clip");
                         tracing::warn!("copy latest failed: {error}");
                     }
+                },
+                Ok(None) => self.notice(NoticeLevel::Warning, "Clipboard history is empty"),
+                Err(error) => {
+                    self.notice(NoticeLevel::Error, "Couldn't read clipboard history");
+                    tracing::warn!("reading latest clip failed: {error}");
                 }
-                Ok(None) => {}
-                Err(error) => tracing::warn!("reading latest clip failed: {error}"),
             },
             AppCommand::SetPinned(id, pinned) => {
                 if let Err(error) = self.history.set_pinned(id, pinned) {
+                    self.notice(NoticeLevel::Error, "Couldn't update the pinned state");
                     tracing::warn!("updating pin failed: {error}");
                 }
             }
-            AppCommand::Delete(id) => {
-                if let Err(error) = self.history.delete(id) {
+            AppCommand::Delete(id) => match self.history.delete(id) {
+                Ok(()) => self.notice(NoticeLevel::Info, "Clip deleted"),
+                Err(error) => {
+                    self.notice(NoticeLevel::Error, "Couldn't delete the clip");
                     tracing::warn!("deleting clip failed: {error}");
                 }
-            }
+            },
             #[cfg(feature = "tray")]
             AppCommand::RequestClearHistory => {
                 self.popup.request_clear_history_confirmation(ctx);
             }
-            AppCommand::ClearHistory => {
-                if let Err(error) = self.history.clear_history() {
+            AppCommand::ClearHistory => match self.history.clear_history() {
+                Ok(()) => {
+                    self.notice(NoticeLevel::Info, "History cleared; pinned clips kept");
+                }
+                Err(error) => {
+                    self.notice(NoticeLevel::Error, "Couldn't clear clipboard history");
                     tracing::warn!("clearing history failed: {error}");
                 }
-            }
+            },
             AppCommand::TogglePause => self.toggle_pause(),
             #[cfg(feature = "tray")]
             AppCommand::ToggleAutostart => self.toggle_autostart(),
+            AppCommand::DismissNotice => self.clear_notice(),
             AppCommand::Hide => {}
             #[cfg(feature = "tray")]
             AppCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -230,13 +259,20 @@ impl Runtime {
             Ok(outcome) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 if outcome == PasteOutcome::CopiedOnly {
+                    self.notice(
+                        NoticeLevel::Warning,
+                        "Automatic paste unavailable; clip copied",
+                    );
                     tracing::warn!("clip copied; automatic paste is unavailable");
+                } else {
+                    self.clear_notice();
                 }
                 ctx.request_repaint_after(PASTE_REPAINT_INTERVAL);
             }
             Err(error) => {
                 // Keep the popup visible: sending a paste after a failed write
                 // could paste unrelated clipboard contents into the target app.
+                self.notice(NoticeLevel::Error, "Couldn't stage the selected clip");
                 tracing::warn!("selected clip was not staged for paste: {error}");
             }
         }
@@ -247,6 +283,10 @@ impl Runtime {
         if let Some(result) = self.paste.poll(now)
             && let Err(error) = result
         {
+            self.notice(
+                NoticeLevel::Error,
+                "Automatic paste failed; the clip remains copied",
+            );
             tracing::warn!("paste-back failed: {error}");
         }
         if self.paste.wait_duration(now).is_some() {
@@ -270,11 +310,35 @@ impl Runtime {
             Ok(()) => {
                 self.config.launch_at_login = desired;
                 if let Err(error) = self.config.save() {
+                    self.notice(
+                        NoticeLevel::Warning,
+                        "Login startup changed, but the setting wasn't saved",
+                    );
                     tracing::warn!("saving launch-at-login config failed: {error}");
+                } else {
+                    self.notice(
+                        NoticeLevel::Info,
+                        if desired {
+                            "Start at login enabled"
+                        } else {
+                            "Start at login disabled"
+                        },
+                    );
                 }
                 tracing::info!(launch_at_login = desired, "launch-at-login toggled");
             }
-            Err(error) => tracing::warn!("launch-at-login toggle failed: {error}"),
+            Err(error) => {
+                self.notice(NoticeLevel::Error, "Couldn't change login startup");
+                tracing::warn!("launch-at-login toggle failed: {error}");
+            }
         }
+    }
+
+    fn notice(&self, level: NoticeLevel, message: &'static str) {
+        self.diagnostics.notice(level, message);
+    }
+
+    fn clear_notice(&self) {
+        self.diagnostics.clear_notice();
     }
 }

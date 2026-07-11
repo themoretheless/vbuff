@@ -18,6 +18,7 @@ pub(crate) enum Icon {
     Pin { filled: bool },
     Pause,
     Resume,
+    Close,
 }
 
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -52,10 +53,16 @@ pub(crate) fn icon_button(
         Icon::Pin { filled } => draw_pin(ui, center, stroke, filled),
         Icon::Pause => draw_pause(ui, center, stroke),
         Icon::Resume => draw_resume(ui, center, visuals.fg_stroke.color),
+        Icon::Close => draw_close(ui, center, stroke),
     }
 
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), tooltip));
     response.on_hover_text(tooltip)
+}
+
+pub(crate) fn status_dot(ui: &mut Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
 fn draw_delete(ui: &Ui, center: Pos2, stroke: Stroke) {
@@ -121,4 +128,21 @@ fn draw_resume(ui: &Ui, center: Pos2, color: Color32) {
         color,
         Stroke::NONE,
     ));
+}
+
+fn draw_close(ui: &Ui, center: Pos2, stroke: Stroke) {
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-4.0, -4.0),
+            center + egui::vec2(4.0, 4.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(4.0, -4.0),
+            center + egui::vec2(-4.0, 4.0),
+        ],
+        stroke,
+    );
 }

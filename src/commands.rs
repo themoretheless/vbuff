@@ -18,6 +18,7 @@ pub(crate) enum AppCommand {
     TogglePause,
     #[cfg(feature = "tray")]
     ToggleAutostart,
+    DismissNotice,
     Hide,
     #[cfg(feature = "tray")]
     Quit,
@@ -31,6 +32,7 @@ impl From<UiAction> for AppCommand {
             UiAction::Delete(id) => Self::Delete(id),
             UiAction::ClearHistory => Self::ClearHistory,
             UiAction::TogglePause => Self::TogglePause,
+            UiAction::DismissNotice => Self::DismissNotice,
             UiAction::Hide => Self::Hide,
         }
     }
@@ -45,6 +47,14 @@ mod tests {
         assert_eq!(
             AppCommand::from(UiAction::ClearHistory),
             AppCommand::ClearHistory
+        );
+    }
+
+    #[test]
+    fn notice_dismissal_stays_a_high_level_command() {
+        assert_eq!(
+            AppCommand::from(UiAction::DismissNotice),
+            AppCommand::DismissNotice
         );
     }
 }

@@ -2,12 +2,14 @@
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+use vbuff_types::CaptureHealth;
 
 use crate::commands::AppCommand;
 
 /// Owns the menu-bar icon, menu items, and event-id mapping.
 pub(crate) struct Tray {
     _icon: TrayIcon,
+    status: MenuItem,
     show_id: MenuId,
     copy_latest_id: MenuId,
     clear_history_id: MenuId,
@@ -23,6 +25,7 @@ pub(crate) struct Tray {
 impl Tray {
     pub(crate) fn new() -> anyhow::Result<Self> {
         let menu = Menu::new();
+        let status = MenuItem::new("Capture starting", false, None);
         let show = MenuItem::new("Show vbuff", true, None);
         let copy_latest = MenuItem::new("Copy latest clip", false, None);
         let clear_history = MenuItem::new("Clear history...", false, None);
@@ -30,6 +33,8 @@ impl Tray {
         let autostart = MenuItem::new("Start at login", true, None);
         let quit = MenuItem::new("Quit vbuff", true, None);
 
+        menu.append(&status)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&show)?;
         menu.append(&copy_latest)?;
         menu.append(&clear_history)?;
@@ -49,6 +54,7 @@ impl Tray {
 
         Ok(Self {
             _icon: icon,
+            status,
             show_id: show.id().clone(),
             copy_latest_id: copy_latest.id().clone(),
             clear_history_id: clear_history.id().clone(),
@@ -62,7 +68,14 @@ impl Tray {
         })
     }
 
-    pub(crate) fn sync_state(&self, paused: bool, clip_count: usize, launch_at_login: bool) {
+    pub(crate) fn sync_state(
+        &self,
+        paused: bool,
+        health: CaptureHealth,
+        clip_count: usize,
+        launch_at_login: bool,
+    ) {
+        self.status.set_text(capture_status_text(paused, health));
         self.pause.set_text(if paused {
             "Resume capture"
         } else {
@@ -101,6 +114,14 @@ impl Tray {
             }
         }
         commands
+    }
+}
+
+fn capture_status_text(paused: bool, health: CaptureHealth) -> String {
+    if paused {
+        "Capture paused".to_owned()
+    } else {
+        health.label().to_owned()
     }
 }
 
@@ -172,5 +193,17 @@ mod tests {
         assert_eq!(rgba.len(), 32 * 32 * 4);
         assert!((100..300).contains(&opaque));
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn paused_status_overrides_underlying_capture_health() {
+        assert_eq!(
+            capture_status_text(true, CaptureHealth::StorageError),
+            "Capture paused"
+        );
+        assert_eq!(
+            capture_status_text(false, CaptureHealth::StorageError),
+            "History write issue"
+        );
     }
 }

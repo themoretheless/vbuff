@@ -9,6 +9,7 @@ mod autostart;
 mod capture;
 mod commands;
 mod config;
+mod diagnostics;
 mod history;
 mod paste;
 #[cfg(feature = "tray")]
@@ -23,6 +24,7 @@ use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
 
 use config::Config;
+use diagnostics::Diagnostics;
 use history::History;
 
 /// How many clips to keep loaded in the GUI snapshot.
@@ -44,16 +46,17 @@ fn main() -> anyhow::Result<()> {
         .enforce_cap(config.max_history)
         .context("enforcing history cap")?;
     let recent = store.load_recent(GUI_LIMIT).context("loading history")?;
-    let shared: SharedState = Arc::new(Mutex::new(AppState {
-        clips: recent,
-        paused: false,
-        show_requested: false,
-        revision: 0,
-    }));
+    let shared: SharedState = Arc::new(Mutex::new(AppState::with_clips(recent)));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
+    let diagnostics = Diagnostics::new(Arc::clone(&shared));
     let paused = Arc::new(AtomicBool::new(false));
 
-    let _capture_thread = capture::spawn(history.clone(), Arc::clone(&paused), config.clone());
+    let _capture_thread = capture::spawn(
+        history.clone(),
+        diagnostics.clone(),
+        Arc::clone(&paused),
+        config.clone(),
+    );
 
     let mut hotkey_backend = GlobalHotkeyBackend::new().context("creating hotkey backend")?;
     let combo = parse_combo(&config.hotkey)
@@ -66,7 +69,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    app::run(history, shared, paused, config, hotkey_backend, hotkey_id)
+    app::run(
+        history,
+        shared,
+        diagnostics,
+        paused,
+        config,
+        hotkey_backend,
+        hotkey_id,
+    )
 }
 
 fn init_tracing() {

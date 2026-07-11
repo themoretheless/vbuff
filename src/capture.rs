@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use vbuff_core::{content_hash_from_flavors, detect_kind};
 use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend};
-use vbuff_types::{Clip, ClipId, ClipMeta};
+use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta};
 
 use crate::config::Config;
+use crate::diagnostics::Diagnostics;
 use crate::history::History;
 
 /// The pure, inexpensive rules that run before a clip reaches storage.
@@ -57,9 +58,36 @@ impl CapturePolicy {
     }
 }
 
+/// Keeps storage failures dominant until a later write proves recovery.
+#[derive(Default)]
+struct CaptureHealthState {
+    storage_degraded: bool,
+}
+
+impl CaptureHealthState {
+    fn read_succeeded(&self) -> Option<CaptureHealth> {
+        (!self.storage_degraded).then_some(CaptureHealth::Watching)
+    }
+
+    fn read_failed(&self) -> Option<CaptureHealth> {
+        (!self.storage_degraded).then_some(CaptureHealth::ClipboardReadError)
+    }
+
+    fn store_succeeded(&mut self) -> CaptureHealth {
+        self.storage_degraded = false;
+        CaptureHealth::Watching
+    }
+
+    fn store_failed(&mut self) -> CaptureHealth {
+        self.storage_degraded = true;
+        CaptureHealth::StorageError
+    }
+}
+
 /// Start the one background capture worker used by the single-process MVP.
 pub(crate) fn spawn(
     history: History,
+    diagnostics: Diagnostics,
     paused: Arc<AtomicBool>,
     config: Config,
 ) -> std::thread::JoinHandle<()> {
@@ -67,14 +95,17 @@ pub(crate) fn spawn(
         let mut clipboard = match ArboardClipboard::new() {
             Ok(clipboard) => clipboard,
             Err(error) => {
+                diagnostics.capture_health(CaptureHealth::ClipboardUnavailable);
                 tracing::error!("clipboard backend unavailable: {error}");
                 return;
             }
         };
 
+        diagnostics.capture_health(CaptureHealth::Watching);
         let policy = CapturePolicy::from(&config);
         let interval = Duration::from_millis(config.poll_interval_ms.max(50));
         let mut last_hash: Option<[u8; 32]> = None;
+        let mut health_state = CaptureHealthState::default();
 
         loop {
             std::thread::sleep(interval);
@@ -84,8 +115,23 @@ pub(crate) fn spawn(
             }
 
             let captured = match clipboard.read() {
-                Ok(captured) if !captured.is_empty() => captured,
-                Ok(_) | Err(_) => continue,
+                Ok(captured) => {
+                    if let Some(health) = health_state.read_succeeded() {
+                        diagnostics.capture_health(health);
+                    }
+                    if captured.is_empty() {
+                        continue;
+                    }
+                    captured
+                }
+                Err(error) => {
+                    if let Some(health) = health_state.read_failed()
+                        && diagnostics.capture_health(health)
+                    {
+                        tracing::warn!("clipboard read failed; retrying: {error}");
+                    }
+                    continue;
+                }
             };
             let hash = content_hash_from_flavors(&captured.flavors);
             if last_hash == Some(hash) {
@@ -99,11 +145,16 @@ pub(crate) fn spawn(
 
             let clip = build_clip(captured, hash);
             match history.insert(&clip, config.max_history) {
-                Ok(()) => last_hash = Some(hash),
+                Ok(()) => {
+                    last_hash = Some(hash);
+                    diagnostics.capture_health(health_state.store_succeeded());
+                }
                 Err(error) => {
                     // Keep the previous hash so the same clipboard is retried on
                     // the next poll instead of being silently lost.
-                    tracing::warn!("capture insert failed: {error}");
+                    if diagnostics.capture_health(health_state.store_failed()) {
+                        tracing::warn!("capture insert failed; retrying: {error}");
+                    }
                 }
             }
         }
@@ -162,5 +213,16 @@ mod tests {
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));
         assert_eq!(clip.content_hash, hash);
+    }
+
+    #[test]
+    fn storage_failure_stays_visible_until_a_successful_write() {
+        let mut state = CaptureHealthState::default();
+
+        assert_eq!(state.store_failed(), CaptureHealth::StorageError);
+        assert_eq!(state.read_succeeded(), None);
+        assert_eq!(state.read_failed(), None);
+        assert_eq!(state.store_succeeded(), CaptureHealth::Watching);
+        assert_eq!(state.read_succeeded(), Some(CaptureHealth::Watching));
     }
 }

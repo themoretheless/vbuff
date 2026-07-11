@@ -199,6 +199,7 @@ The crate tree above is the target workspace. Inside the **current single-proces
 | `src/history.rs` | Store mutation plus GUI snapshot publication |
 | `src/paste.rs` | Clipboard staging and delayed paste-back sequencing |
 | `src/commands.rs` | Canonical `AppCommand` vocabulary for popup, tray, and hotkey |
+| `src/diagnostics.rs` | Redacted publication of capture health and command outcomes |
 | `src/tray.rs` | Menu-bar icon, menu state, and menu-event mapping |
 | `src/autostart.rs` | Per-OS launch-at-login registration |
 | `src/config.rs` | TOML configuration and defaults |
@@ -209,7 +210,7 @@ The implementation should remain learnable as a set of small, single-purpose sli
 
 | Slice | Owns | Does not own | First files to read |
 |---|---|---|---|
-| **Types** | Serializable clip data, flavor bodies, ids, content-kind labels | SQL, UI state, OS calls, business rules | `crates/vbuff-types/src/lib.rs` |
+| **Types** | Serializable clip data, flavor bodies, ids, content-kind labels, runtime status/notice contracts | SQL, UI state, OS calls, business rules | `crates/vbuff-types/src/lib.rs`, `status.rs` |
 | **Core** | Pure dedup, classification, search ranking, eviction, capture-policy decisions | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs` |
 | **Store** | SQLite schema, migrations, transactions, durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs` |
 | **Platform** | Clipboard, hotkey, paste, tray capabilities behind traits | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs` |
@@ -219,7 +220,7 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | **Capture supervisor** | Poll, read flavors, evaluate the cheap gate, retry failed persistence | Rendering, SQL details, paste injection | `src/capture.rs` |
 | **Paste coordinator** | Write selected flavors before scheduling delayed paste injection | Searching, storage schema, row rendering | `src/paste.rs` |
 | **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, autostart, and `Quit` semantics | UI widget styling, OS-specific event delivery | `src/commands.rs`, dispatched by `src/app.rs` |
-| **Diagnostics** | Redacted logs, health state, capability badges, doctor checks | Clip payload storage, transform behavior | target extraction from tracing/status code |
+| **Diagnostics** | Typed `CaptureHealth`, redacted command notices, popup/tray status; target adds heartbeat, capability badges, and doctor checks | Clip payload storage, transform behavior | `crates/vbuff-types/src/status.rs`, `src/diagnostics.rs`, `src/capture.rs`, `src/app.rs`, `src/tray.rs` |
 
 SOLID rules for future edits:
 
@@ -237,7 +238,8 @@ Current extraction status:
 3. **Done:** `PasteCoordinator` owns clipboard staging and timing; paste injection is impossible when clipboard staging fails.
 4. **Done:** `History` is the small app-layer writer/snapshot API, so capture and commands do not manipulate the store mutex directly.
 5. **Done:** `vbuff-gui::design` owns stable dimensions, spacing, and font-independent icon buttons; the menu-bar icon is isolated in `src/tray.rs`.
-6. **Next:** extract capture health and command outcomes into observable state, then move the same modules into `vbuff-daemon`/`vbuff-ipc` at M7 without changing their contracts.
+6. **Done:** serializable capture-health/notice contracts live below the GUI in `vbuff-types`; the narrow `Diagnostics` publisher carries worker health and redacted command outcomes to popup/tray without coupling capture policy to rendering.
+7. **Next:** add a capture heartbeat/watchdog and single-instance handoff, then move the same modules into `vbuff-daemon`/`vbuff-ipc` at M7 without changing their contracts.
 
 ### Core data model
 
