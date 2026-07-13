@@ -34,4 +34,12 @@ mod tests {
         let back = flavors_from_json(&json).unwrap();
         assert_eq!(flavors, back);
     }
+
+    #[test]
+    fn reads_v1_flavors_without_receipt_fields() {
+        let json = r#"[{"mime":"text/plain","body":{"Inline":[104,105]}}]"#;
+        let flavors = flavors_from_json(json).unwrap();
+
+        assert_eq!(flavors, vec![Flavor::inline("text/plain", b"hi".to_vec())]);
+    }
 }

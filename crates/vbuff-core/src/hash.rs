@@ -42,23 +42,19 @@ pub fn content_hash(flavors: &[CanonicalFlavor<'_>]) -> [u8; 32] {
 /// `blob_ref` digest bytes instead (the blob ref is itself a content hash, so
 /// this remains stable for identical content).
 pub fn content_hash_from_flavors(flavors: &[Flavor]) -> [u8; 32] {
-    // Materialize the byte views we need to borrow.
-    let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(flavors.len());
-    for f in flavors {
-        let bytes = match &f.body {
-            Body::Inline(b) => b.clone(),
-            Body::Spilled { blob_ref, .. } => blob_ref.as_bytes().to_vec(),
+    let mut order = flavors.iter().collect::<Vec<_>>();
+    order.sort_by(|left, right| left.mime.cmp(&right.mime));
+    let mut hasher = blake3::Hasher::new();
+    for flavor in order {
+        let bytes = match &flavor.body {
+            Body::Inline(bytes) => bytes.as_slice(),
+            Body::Spilled { blob_ref, .. } => blob_ref.as_bytes(),
         };
-        owned.push((f.mime.clone(), bytes));
+        hasher.update(flavor.mime.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
-    let canon: Vec<CanonicalFlavor<'_>> = owned
-        .iter()
-        .map(|(mime, bytes)| CanonicalFlavor {
-            mime: mime.as_str(),
-            bytes: bytes.as_slice(),
-        })
-        .collect();
-    content_hash(&canon)
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(test)]

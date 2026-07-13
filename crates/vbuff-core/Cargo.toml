@@ -9,6 +9,8 @@ description = "Pure clipboard-history logic: hashing, dedup, eviction, search, c
 vbuff-types.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
+regex.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 ulid.workspace = true

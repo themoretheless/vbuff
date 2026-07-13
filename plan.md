@@ -12,11 +12,11 @@ The product wedge, restated so every milestone can be checked against it: vbuff 
 
 `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-daemon`, `vbuff-gui`, `vbuff-ipc`, `vbuff-sync`, `vbuff-cli`, and the root `src/main.rs` binary.
 
-The shippable MVP is a deliberate **single-process subset** of that workspace. The MVP links and runs only:
+The shippable MVP is a deliberate **single-process subset** of that workspace. The target MVP links and runs:
 
 - `vbuff-types` (plain data: `Clip`, `Flavor`, `ContentKind`, `ClipMeta`, ids)
 - `vbuff-core` (engine: dedup, eviction, retention, capture-gate policy, search, classify)
-- `vbuff-store` (SQLite + SQLCipher + FTS5, migrations, blob CAS, WAL, at-rest crypto)
+- `vbuff-store` (currently bundled SQLite schema v4 + FTS5 + migrations + blob CAS + WAL; SQLCipher and OS-keystore integration are still required)
 - `vbuff-platform` (the four backend traits + per-OS impls + `MockBackend`)
 - `vbuff-gui` (eframe popup + settings viewports, the egui hot path)
 - the root binary (`src/main.rs`): single-instance guard, role dispatch, wiring
@@ -26,7 +26,7 @@ The later crates are explicitly deferred:
 - `vbuff-daemon` - the MVP wires the watcher/store/core/GUI directly inside the root binary on background threads; a dedicated daemon-orchestration crate that owns a tokio runtime, supervised threads, IPC server, and sync sockets is extracted later (M7). The capture watcher still runs on its own dedicated thread in the MVP; what is deferred is the *crate boundary* and the tokio-based service host, not background capture itself.
 - `vbuff-ipc` - the framed control-socket protocol and client/server; deferred to M7. The MVP still needs a single-instance guard (bind-or-forward) but its forwarded intent is minimal (just "show popup"), not the full IPC verb surface.
 - `vbuff-cli` - the `vbuff` verb surface (`list`/`get`/`copy`/`add`/`search`/`delete`, `--json`, completions); deferred to M8. It is a pure IPC client, so it cannot exist before `vbuff-ipc`.
-- `vbuff-sync` - mDNS discovery, Noise/TLS transport, pairing, replication; deferred to M9 (v1) and M11 (v2 transports).
+- `vbuff-sync` runtime integration - the crate now contains tested CRDT/HLC, envelope, membership, policy, anti-entropy, recovery, receipt, capability, and padding foundations. Discovery, authenticated transport, pairing UI, durable replication, and app wiring remain deferred to M9 (v1) and M11 (v2 transports).
 
 This means: in MVP, the root binary is both daemon and GUI host in one process, exactly as `architecture.md` describes ("the GUI runs inside the daemon process on the main thread, while capture/store/sync run on background threads"). The "daemon" is a *role*, not yet a separate crate. The crate split into `vbuff-daemon`/`vbuff-ipc` is a refactor we perform once the single-process loop is proven, precisely so the CLI and sync have something to talk to.
 
@@ -66,7 +66,19 @@ The expanded 600-idea backlog is reference material, not an implicit scope incre
 
 The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 
-Current baseline before the formal M7 crate extraction: the single-process root is already divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`, alongside the minimal `ShowPopup`/`Ping` startup protocol; capture and commands publish through `Diagnostics`, while popup/tray only consume the resulting typed health and redacted notices. A pause-aware capture heartbeat surfaces `Stalled`, and bind-or-forward runs before database/hotkey initialization with liveness, OS-released owner-lock serialization, and stale-endpoint recovery. Preserve those ownership boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, the full IPC verb surface, and moves the modules behind daemon/IPC contracts instead of recombining their responsibilities in `main.rs`.
+Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `heartbeat`, `maintenance`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, content-free notices, expiry/local/incomplete state, and saved/skipped/lost totals. Hotkey, tray, and second-instance messages wake egui directly, while capture/maintenance enforce rolling budgets. Store schema v4 owns FTS5, facets, fingerprints, keyset sessions, CAS, migration verification, expiry, and audits. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, the full IPC verb surface, and moves stable modules behind daemon/IPC contracts.
+
+### Batch execution overlay
+
+The 600-item list is now executed in sequential batches of 50 without rewriting milestone scope. Each batch must classify every item as runtime, foundation, adapted, native-required, or rejected; complete three review passes; synchronize the four top-level documents; and pass formatting, strict clippy, tests, feature-variant checks, and whitespace review before commit/push.
+
+| Batch | State | Evidence / next gate |
+|---|---|---|
+| 001-050 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-001-050.md) |
+| 051-100 | Next | Native/security portion of the engineering backlog; do not enable sync transport before local privacy gates |
+| 101-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
+
+Batch completion does not override milestone acceptance. For example, item 035 can have a tested membership/SAS/rekey foundation while M9 remains open until pairing, authenticated transport, persistence, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite the broader schema v4 work already landed.
 
 ---
 

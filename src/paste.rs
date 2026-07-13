@@ -1,10 +1,13 @@
 //! Clipboard write and delayed paste-back coordination.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
+use vbuff_core::capture::SelfWriteLedger;
+use vbuff_core::content_hash_from_flavors;
 use vbuff_platform::{ArboardClipboard, ClipboardBackend, EnigoPaste, PasteBackend};
-use vbuff_types::Flavor;
+use vbuff_types::{CaptureLineage, ClipId, Flavor};
 
 const PASTE_DELAY: Duration = Duration::from_millis(120);
 
@@ -20,10 +23,11 @@ pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = EnigoPaste> {
     clipboard: Option<C>,
     paste: Option<P>,
     pending_at: Option<Instant>,
+    self_writes: Arc<Mutex<SelfWriteLedger>>,
 }
 
 impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
-    pub(crate) fn system() -> Self {
+    pub(crate) fn system(self_writes: Arc<Mutex<SelfWriteLedger>>) -> Self {
         let clipboard = ArboardClipboard::new().map_err(|error| {
             tracing::warn!("clipboard writer unavailable: {error}");
             error
@@ -33,16 +37,30 @@ impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
             error
         });
 
-        Self::with_backends(clipboard.ok(), paste.ok())
+        Self::with_backends_and_ledger(clipboard.ok(), paste.ok(), self_writes)
     }
 }
 
 impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
+    #[cfg(test)]
     fn with_backends(clipboard: Option<C>, paste: Option<P>) -> Self {
+        Self::with_backends_and_ledger(
+            clipboard,
+            paste,
+            Arc::new(Mutex::new(SelfWriteLedger::default())),
+        )
+    }
+
+    fn with_backends_and_ledger(
+        clipboard: Option<C>,
+        paste: Option<P>,
+        self_writes: Arc<Mutex<SelfWriteLedger>>,
+    ) -> Self {
         Self {
             clipboard,
             paste,
             pending_at: None,
+            self_writes,
         }
     }
 
@@ -52,11 +70,23 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         // guarantees that a failed replacement write cannot leave an older
         // keystroke armed against stale clipboard contents.
         self.pending_at = None;
+        let hash = content_hash_from_flavors(flavors);
+        let nonce = ClipId::new().to_string_repr();
+        let lineage = CaptureLineage {
+            origin_device: None,
+            write_nonce: Some(nonce.clone()),
+        };
+        let mut ledger = self
+            .self_writes
+            .lock()
+            .map_err(|_| anyhow!("self-write ledger mutex poisoned"))?;
         self.clipboard
             .as_mut()
             .ok_or_else(|| anyhow!("clipboard writer unavailable"))?
-            .write(flavors)
-            .context("writing selected clip to clipboard")
+            .write_tagged(flavors, &lineage)
+            .context("writing selected clip to clipboard")?;
+        ledger.register(hash, nonce, Instant::now());
+        Ok(())
     }
 
     /// Write first, then schedule paste-back. A failed write never sends paste.
@@ -120,6 +150,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn clear(&mut self) -> PlatformResult<()> {
+            Ok(())
         }
     }
 

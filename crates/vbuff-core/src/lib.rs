@@ -8,10 +8,15 @@
 //! * [`filter`] - case-insensitive search + ranking (pinned first, then recency).
 //! * [`eviction`] - retention policy (cap N, never evict pinned).
 
+pub mod bloom;
+pub mod capture;
 pub mod classify;
 pub mod eviction;
+pub mod facets;
 pub mod filter;
+pub mod fingerprint;
 pub mod hash;
+pub mod observability;
 
 pub use classify::detect_kind;
 pub use eviction::{EvictionPolicy, evict};

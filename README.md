@@ -2,7 +2,7 @@
 
 **One clipboard, every machine. Never lost, never leaked.**
 
-A fast, private, cross-platform clipboard manager written in Rust. vbuff captures every clipboard change into a durable, searchable, encrypted local history, summons a keyboard-driven popup with a global hotkey, and pastes the chosen clip straight back into the app you were just using. Local-first and private by default, with opt-in peer-to-peer sync planned for later phases.
+A fast, private, cross-platform clipboard manager written in Rust. The current build captures text and images into a durable, searchable local SQLite history, summons a keyboard-driven popup with a global hotkey, and pastes the chosen clip back into the app you were using. SQLCipher at-rest encryption and live peer-to-peer transport remain release gates, so this repository does not yet claim encrypted local storage or working cross-device sync.
 
 ---
 
@@ -10,13 +10,13 @@ A fast, private, cross-platform clipboard manager written in Rust. vbuff capture
 
 Clipboard managers are a mature but deeply fragmented category, and no single product covers the things that matter at once. The best tool on each platform is usually *only* on that platform: **Ditto** is the de facto free manager on Windows but is Windows-only and local-only; **Paste** is beautifully polished and syncs across Apple devices but is macOS/iOS-only and subscription-only; **CopyQ** genuinely spans macOS, Windows and Linux but wears a dated, scripting-heavy UI and has no real sync; **CrossPaste** reaches every platform and syncs privately but only over the LAN and without the polish. A person who works across macOS, Windows and Linux cannot carry one mental model, one keybinding scheme, or one private history across all three.
 
-That is the four-corner gap vbuff is built to close: **be truly cross-platform (macOS + Windows + Linux), genuinely polished, privately synced, and approachable, all at the same time.** Every competitor wins at most two of those corners; vbuff aims to occupy all four. The non-negotiable foundation is privacy: a clipboard manager sees every password, OTP, API key and private message that transits the clipboard, so vbuff defaults to local-only, encrypts at rest, honors OS "do not store" hints before a single byte touches disk, and treats "do not capture" as a first-class, fail-closed code path. Cross-device sync, when it arrives, is opt-in and end-to-end encrypted, never a vendor backend that can read your clips or be shut down.
+That is the four-corner gap vbuff is built to close: **be truly cross-platform (macOS + Windows + Linux), genuinely polished, privately synced, and approachable, all at the same time.** Every competitor wins at most two of those corners; vbuff aims to occupy all four. The non-negotiable target is privacy: local-only by default, encrypted at rest, OS "do not store" hints evaluated before persistence, and every rejection routed through one fail-closed gate. The current fallback backend cannot yet observe all native privacy hints, and the current SQLite file is not encrypted; both limitations are tracked explicitly rather than hidden behind the target language.
 
 ---
 
-## Platform support
+## Target platform support
 
-vbuff is one codebase with native, per-OS backends behind common Rust traits. The popup, search and storage are identical everywhere; only the clipboard, hotkey, paste-back and tray plumbing differ per platform.
+vbuff is designed as one codebase with native, per-OS backends behind common Rust traits. The table below is the target backend matrix. Today the executable uses the `arboard` fallback for text/raw-RGBA clipboard access on all platforms; it does not yet enumerate every flavor, provide native generation/provenance, or expose concealed markers.
 
 | Platform | Clipboard capture | Global hotkey | Paste-back | Notes |
 |---|---|---|---|---|
@@ -31,9 +31,9 @@ Source-app attribution and per-app exclusion rely on knowing the foreground app,
 
 ---
 
-## Feature highlights
+## Product target
 
-Curated from the project's feature catalog (the strongest MVP and v1 items, not the full 640). Items beyond the MVP are marked with their target phase.
+Curated from the project's feature catalog (the strongest MVP and v1 items, not the full 640). This section describes the intended product; the authoritative current implementation is listed under **Status** and in the batch ledger below.
 
 ### Capture everything, byte-for-byte
 
@@ -75,7 +75,7 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 
 ### Private and trustworthy by construction
 
-- **Encrypted at rest** with the key held in the OS secret store, not beside the database.
+- **Target:** encrypted at rest with the key held in the OS secret store, not beside the database.
 - **Honors OS concealed/secure markers** and password-field hints, skips designated apps, supports regex/keyword exclusion rules and built-in secret detection.
 - **Local by default, zero telemetry, no network calls** out of the box.
 - Auto-clear-on-timer, wipe-on-demand, and shorter retention for sensitive clips.
@@ -85,13 +85,13 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 
 ## Target privacy and security
 
-vbuff is designed around a single hard rule: **fail closed.** Every uncertainty in "should we capture this?" should resolve to *do not capture*, and the decision must run before any byte touches durable storage. The current repository has the first pieces of that model (pause, app exclusion, whitespace skipping, dedup, local SQLite history); the full target adds OS concealed/transient hints, a default secret-tool deny-list, regex/keyword rules, built-in secret detectors, encrypted-at-rest storage with the key in the OS secret store, secure delete, and opt-in end-to-end encrypted sync. vbuff defends against stolen disks, other unprivileged local users and on-the-wire interception once those target controls land; it does not claim to defend against a root/admin attacker, a debugger attached to its own process, or a kernel-level attacker on the same machine.
+vbuff is designed around a single hard rule: **fail closed.** Every uncertainty in "should we capture this?" should resolve to *do not capture*, and the decision must run before durable persistence. The current repository now has one ordered gate, source rules, sensitive/local-only metadata, masked sensitive rows, OTP TTL, byte-free skip recovery, self-write suppression, content-free loss accounting, Unix owner-only paths, SQLite secure deletion, WAL truncation, and redacted diagnostics. Native concealed/transient hints, a broader secret-detector corpus, SQLCipher with OS-keystore keys, cross-platform residue verification, and live opt-in E2E sync are still required before the full privacy claim is earned. The threat model never claims protection from root/admin, an attached debugger, or a kernel attacker.
 
 ---
 
 ## Status
 
-vbuff is in active early development. The repository already contains a Cargo workspace with `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and a root single-process binary. The current executable polls the clipboard through `arboard`, captures text/images, stores history in a compact `rusqlite` schema, opens an `egui` popup through a global hotkey, and writes the selected clip back before invoking an `enigo` paste keystroke. It also owns a minimal single-instance endpoint: a duplicate launch forwards `ShowPopup` to the resident process and exits, stale endpoints are recovered once, and a capture heartbeat makes a stalled worker visible. Native all-flavor clipboard backends, SQLCipher encryption, full per-OS parity, the formal daemon/IPC split, CLI, and sync remain target work tracked in [architecture.md](architecture.md) and [plan.md](plan.md).
+vbuff is in active early development. The current executable uses `arboard`, `global-hotkey`, `egui`, and `enigo` for the resident copy -> store -> popup -> paste loop. SQLite schema v4 now includes adaptive prose/code FTS5 search, indexed facets and fingerprints, keyset sessions, transactional CAS refcounts, sharded blob spill, verified migration preflight/rollback, expiry, and rolling content audits. Capture adds adaptive cadence, startup self-test, source-policy contracts, generation/loss accounting, watchdogs, resource budgets, redacted metrics, and an external heartbeat. A new `vbuff-sync` crate contains tested CRDT, HLC, key-wrap, sealed-envelope, membership, policy, Merkle, recovery, receipt, capability, and padding foundations, but no discovery, authenticated network transport, pairing UI, or runtime replication. Native all-flavor backends, SQLCipher, full per-OS parity, daemon/IPC extraction, CLI, and live sync remain target work.
 
 ---
 
@@ -102,17 +102,17 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | Crate | Role | In MVP? |
 |---|---|---|
 | `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
-| `vbuff-core` | Current pure logic: dedup, eviction, classification, substring search; target adds redaction rules, transforms, snippet expansion | Yes (partial) |
-| `vbuff-store` | Current bundled SQLite JSON-flavor store; target adds SQLCipher, FTS5, migrations, blob spill, at-rest crypto | Yes (partial) |
+| `vbuff-core` | Pure dedup/eviction/classification plus capture policy, integrity, coalescing, ledgers, scheduling, Bloom, facets, fingerprints, and redacted observability | Yes (partial) |
+| `vbuff-store` | Bundled SQLite schema v4, FTS5, migrations, sharded CAS, fingerprints/facets, expiry, and audits; SQLCipher remains a release gate | Yes (partial) |
 | `vbuff-platform` | Current trait layer plus `arboard` / `global-hotkey` / `enigo` adapters; target adds native per-OS clipboard, hotkey, paste and tray impls | Yes (partial) |
 | `vbuff-gui` | Current `eframe` popup; target adds deeper settings viewports, richer badges, accessibility depth | Yes (partial) |
 | *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, paste timing, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
 | `vbuff-ipc` | Full framed control protocol over Unix socket / Windows named pipe; the root app currently carries only `ShowPopup`/`Ping` bootstrap framing | Later |
-| `vbuff-sync` | mDNS discovery, Noise/TLS transport, pairing, LAN P2P replication | Later |
+| `vbuff-sync` | Current protocol/crypto foundation; target adds mDNS, authenticated transport, pairing UX, persistence, and replication | Foundation only |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
-The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. The current MVP store is **SQLite** via bundled `rusqlite`; target work adds SQLCipher, FTS5, and an out-of-row content-addressable blob store. Dedup already uses **BLAKE3**. See [architecture.md](architecture.md) for the full design, data model and crate dependency table.
+The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. The current store is bundled **SQLite** via `rusqlite`, with FTS5 and an out-of-row content-addressable blob store already active; SQLCipher and OS-keystore keying remain target work. Dedup uses **BLAKE3**. See [architecture.md](architecture.md) for the full target design and current cut lines.
 
 ---
 
@@ -122,15 +122,16 @@ The repo is intentionally split so you can understand it without loading the who
 
 1. **Data shapes and wire contracts:** start with `crates/vbuff-types/src/lib.rs`, then `status.rs` and `ipc.rs` (`Clip`, flavors, ids, `CaptureHealth`, redacted notices, and the minimal startup intents).
 2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, and eviction. This crate should stay OS-free and GUI-free.
-3. **Persistence:** read `crates/vbuff-store/src/lib.rs` for the current SQLite MVP store and its transitional JSON-flavor schema.
+3. **Persistence:** read `crates/vbuff-store/src/lib.rs`, then `search.rs`, `migration.rs`, and `cas.rs` for schema/query ownership, verified upgrades, and blob lifecycle.
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
 5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `view.rs`, and `app.rs`.
 6. **History boundary:** read `src/history.rs`; it is the only app-layer facade that couples store mutations to refreshed GUI snapshots.
-7. **Resident workflows:** read `src/capture.rs` for polling, policy, heartbeat/watchdog supervision, and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
+7. **Resident workflows:** read `crates/vbuff-core/src/capture/` for pure decisions, then `src/capture.rs` for runtime supervision and `src/paste.rs` for clipboard-write-before-delayed-paste sequencing.
 8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
 9. **Startup handoff:** read `src/single_instance/mod.rs` for framing/ownership, then `unix.rs` or `windows_fallback.rs` for one transport; this slice owns bind-or-forward, liveness, stale recovery, and cleanup.
 10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
-11. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `main.rs` loads dependencies and starts the focused modules; it does not contain workflow logic.
+11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). It is intentionally not linked into the resident runtime yet.
+12. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `app.rs` owns event-driven hotkey/tray/second-instance wakeups; `main.rs` only constructs and starts focused services. A duplicate launch forwards `ShowPopup` to the running instance.
 
 The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, single-instance transport stays isolated, and `main.rs` only composes the pieces.
 
@@ -138,13 +139,27 @@ The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contract
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
 
-The current design baseline is implemented rather than aspirational: one token module controls popup dimensions, row height, spacing, thumbnail size, and icon-button size; rows do not resize when pin/delete controls appear; emoji actions were replaced with font-independent native icons, accessibility labels, and tooltips; empty/search-empty states are distinct; and delete/clear actions require explicit confirmation (the latter says pinned clips are preserved). The popup and tray show the same typed capture-health state (`Capture active`, starting, stalled, unavailable, read issue, or history-write issue), while redacted command notices report copy/paste/delete/clear/autostart outcomes without exposing clip content. The tray/menu-bar uses a recognizable clipboard/check glyph, the same command wording as the popup, and routes destructive clearing through the popup confirmation.
+The current design baseline is implemented rather than aspirational: one token module controls stable popup and row dimensions; familiar row actions are icon buttons with labels/tooltips; empty/search-empty states are distinct; and delete/clear require explicit confirmation. Popup and tray share one typed capture-health state and vocabulary, while content-free notices report command outcomes. The popup masks sensitive content, distinguishes incomplete, local-only, and expiring clips, keeps large saved/skipped/lost totals compact, bounds thumbnail decoding, and offers a time-bounded deliberate recovery when the current clipboard was skipped by privacy policy. Hotkey, tray, and second-instance events wake the UI directly instead of forcing a 100 ms idle poll; a visible popup refreshes at one hertz rather than every frame.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
 - **Density:** compact and comfortable modes should share one layout system instead of ad hoc spacing.
 - **Accessibility:** focus rings, high contrast, screen-reader labels, reduced motion, and pointer-free navigation are part of the core design, not a later cleanup.
 - **Trust:** privacy state should be visible at decision points. A sensitive row should look protected and understandable, not alarming or hidden behind mystery UI.
+
+---
+
+## Implementation batches
+
+The 600-point review is executed in batches of 50. Each batch gets an item-by-item disposition, three review passes, workspace tests, strict clippy, documentation synchronization, and its own commit before the next range starts.
+
+| Batch | State | Evidence |
+|---|---|---|
+| 001-050 | Implemented/reviewed at runtime or foundation level; native and transport dependencies remain explicit | [Batch 001-050 ledger](docs/implementation-batch-001-050.md) |
+| 051-100 | Next | Engineering/security backlog in [architecture.md](architecture.md) |
+| 101-600 | Queued in sequential groups of 50 | Canonical range map below |
+
+"Foundation" is not a synonym for shipped: the `vbuff-sync` algorithms compile and are tested, but the app still has no live sync transport; provenance and generation contracts exist, but `arboard` cannot populate native metadata. The ledger is the source of truth for those distinctions.
 
 ---
 
@@ -262,6 +277,7 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [architecture.md](architecture.md) - full system design: process model, the four backend traits, data model, storage and search, security and threat model, crate dependency table, roadmap and risks.
 - [plan.md](plan.md) - phased implementation plan and milestones.
 - [recommendation.md](recommendation.md) - prioritized product and engineering recommendations.
+- [docs/implementation-batch-001-050.md](docs/implementation-batch-001-050.md) - item-by-item implementation status, review corrections, and acceptance gate for the first batch.
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape and the four-corner gap.
 - [docs/competitor-extras.md](docs/competitor-extras.md) - 122 additional/advanced competitor features and their suggested priority.
 - [docs/features-top-500.md](docs/features-top-500.md) - the 640-feature catalog with priority tiers.

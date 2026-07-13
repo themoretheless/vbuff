@@ -19,7 +19,8 @@ pub mod traits;
 
 pub use error::PlatformError;
 pub use traits::{
-    CapturedClipboard, ClipboardBackend, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
+    CapturedClipboard, ClipboardBackend, ClipboardSelection, HotkeyBackend, KeyCombo, Modifier,
+    PasteBackend,
 };
 
 pub use clipboard::ArboardClipboard;

@@ -4,13 +4,14 @@
 //! persistence, paste timing, tray rendering, and popup rendering live in their
 //! own modules.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::App as _;
 use global_hotkey::GlobalHotKeyEvent;
+use vbuff_core::capture::SelfWriteLedger;
 use vbuff_gui::{PopupApp, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend};
 use vbuff_types::{ClientIntent, NoticeLevel};
@@ -24,8 +25,10 @@ use crate::history::History;
 use crate::paste::{PasteCoordinator, PasteOutcome};
 #[cfg(feature = "tray")]
 use crate::tray::Tray;
+#[cfg(feature = "tray")]
+use tray_icon::menu::MenuEvent;
 
-const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+const SUPERVISORY_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
 const PASTE_REPAINT_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Resident services consumed by the eframe event loop.
@@ -36,6 +39,7 @@ pub(crate) struct AppServices {
     instance_intents: Receiver<ClientIntent>,
     paused: Arc<AtomicBool>,
     config: Config,
+    self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
 }
 
 impl AppServices {
@@ -46,6 +50,7 @@ impl AppServices {
         instance_intents: Receiver<ClientIntent>,
         paused: Arc<AtomicBool>,
         config: Config,
+        self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
     ) -> Self {
         Self {
             history,
@@ -54,6 +59,7 @@ impl AppServices {
             instance_intents,
             paused,
             config,
+            self_writes,
         }
     }
 }
@@ -63,6 +69,24 @@ pub(crate) fn run(
     mut hotkey_backend: GlobalHotkeyBackend,
     hotkey_id: Option<u32>,
 ) -> anyhow::Result<()> {
+    let event_waker = Arc::new(Mutex::new(None::<egui::Context>));
+    let (hotkey_sender, hotkey_events) = channel();
+    let hotkey_waker = Arc::clone(&event_waker);
+    GlobalHotKeyEvent::set_event_handler(Some(move |event| {
+        let _ = hotkey_sender.send(event);
+        request_event_repaint(&hotkey_waker);
+    }));
+    #[cfg(feature = "tray")]
+    let menu_events = {
+        let (menu_sender, menu_events) = channel();
+        let menu_waker = Arc::clone(&event_waker);
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = menu_sender.send(event);
+            request_event_repaint(&menu_waker);
+        }));
+        menu_events
+    };
+
     let viewport = egui::ViewportBuilder::default()
         .with_title("vbuff")
         .with_inner_size(vbuff_gui::popup_size())
@@ -76,7 +100,13 @@ pub(crate) fn run(
         ..Default::default()
     };
 
-    let mut runtime = Runtime::new(services);
+    let mut runtime = Runtime::new(
+        services,
+        event_waker,
+        hotkey_events,
+        #[cfg(feature = "tray")]
+        menu_events,
+    );
     let result = eframe::run_simple_native("vbuff", native_options, move |ctx, frame| {
         runtime.update(ctx, frame);
     });
@@ -90,35 +120,62 @@ pub(crate) fn run(
     result.map_err(|error| anyhow::anyhow!("eframe error: {error}"))
 }
 
+fn request_event_repaint(target: &Arc<Mutex<Option<egui::Context>>>) {
+    if let Ok(target) = target.lock()
+        && let Some(ctx) = target.as_ref()
+    {
+        ctx.request_repaint();
+    }
+}
+
 struct Runtime {
     history: History,
     shared: SharedState,
     diagnostics: Diagnostics,
     instance_intents: Receiver<ClientIntent>,
+    hotkey_events: Receiver<GlobalHotKeyEvent>,
+    event_waker: Arc<Mutex<Option<egui::Context>>>,
     paused: Arc<AtomicBool>,
     #[cfg(feature = "tray")]
     config: Config,
     popup: PopupApp,
     paste: PasteCoordinator,
-    ticker_started: bool,
     #[cfg(feature = "tray")]
     tray: Option<Tray>,
+    #[cfg(feature = "tray")]
+    menu_events: Receiver<MenuEvent>,
     #[cfg(feature = "tray")]
     tray_attempted: bool,
 }
 
 impl Runtime {
-    fn new(services: AppServices) -> Self {
+    fn new(
+        services: AppServices,
+        event_waker: Arc<Mutex<Option<egui::Context>>>,
+        hotkey_events: Receiver<GlobalHotKeyEvent>,
+        #[cfg(feature = "tray")] menu_events: Receiver<MenuEvent>,
+    ) -> Self {
         let AppServices {
             history,
             shared,
             diagnostics,
-            instance_intents,
+            instance_intents: upstream_instance_intents,
             paused,
             config,
+            self_writes,
         } = services;
         #[cfg(not(feature = "tray"))]
         let _ = config;
+        let (intent_sender, instance_intents) = channel();
+        let intent_waker = Arc::clone(&event_waker);
+        std::thread::spawn(move || {
+            while let Ok(intent) = upstream_instance_intents.recv() {
+                if intent_sender.send(intent).is_err() {
+                    break;
+                }
+                request_event_repaint(&intent_waker);
+            }
+        });
 
         Self {
             history,
@@ -126,22 +183,27 @@ impl Runtime {
             shared,
             diagnostics,
             instance_intents,
+            hotkey_events,
+            event_waker,
             paused,
             #[cfg(feature = "tray")]
             config,
-            paste: PasteCoordinator::system(),
-            ticker_started: false,
+            paste: PasteCoordinator::system(self_writes),
             #[cfg(feature = "tray")]
             tray: None,
+            #[cfg(feature = "tray")]
+            menu_events,
             #[cfg(feature = "tray")]
             tray_attempted: false,
         }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.ensure_ticker(ctx);
+        if let Ok(mut target) = self.event_waker.lock() {
+            *target = Some(ctx.clone());
+        }
         self.ensure_tray();
-        ctx.request_repaint_after(IDLE_REPAINT_INTERVAL);
+        ctx.request_repaint_after(SUPERVISORY_REPAINT_INTERVAL);
 
         while let Ok(intent) = self.instance_intents.try_recv() {
             match intent {
@@ -150,7 +212,7 @@ impl Runtime {
             }
         }
 
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+        while let Ok(event) = self.hotkey_events.try_recv() {
             if event.state == global_hotkey::HotKeyState::Pressed {
                 self.handle(AppCommand::Show, ctx);
             }
@@ -172,20 +234,6 @@ impl Runtime {
         }
 
         self.poll_pending_paste(ctx);
-    }
-
-    fn ensure_ticker(&mut self, ctx: &egui::Context) {
-        if self.ticker_started {
-            return;
-        }
-        self.ticker_started = true;
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(IDLE_REPAINT_INTERVAL);
-                ctx.request_repaint();
-            }
-        });
     }
 
     #[cfg(feature = "tray")]
@@ -216,7 +264,13 @@ impl Runtime {
                 self.config.launch_at_login,
             );
         }
-        tray.poll()
+        let mut commands = Vec::new();
+        while let Ok(event) = self.menu_events.try_recv() {
+            if let Some(command) = tray.command_for(&event) {
+                commands.push(command);
+            }
+        }
+        commands
     }
 
     #[cfg(not(feature = "tray"))]
@@ -274,6 +328,16 @@ impl Runtime {
                 }
             },
             AppCommand::TogglePause => self.toggle_pause(),
+            AppCommand::RecoverSkipped => {
+                if self.diagnostics.request_skipped_recovery() {
+                    self.notice(NoticeLevel::Info, "Keeping the current clipboard locally");
+                } else {
+                    self.notice(
+                        NoticeLevel::Warning,
+                        "The skipped clipboard is no longer current",
+                    );
+                }
+            }
             #[cfg(feature = "tray")]
             AppCommand::ToggleAutostart => self.toggle_autostart(),
             AppCommand::DismissNotice => self.clear_notice(),

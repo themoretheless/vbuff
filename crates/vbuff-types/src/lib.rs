@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 pub use ipc::{ClientIntent, ServerResponse};
-pub use status::{CaptureHealth, CommandNotice, NoticeLevel};
+pub use status::{CaptureHealth, CaptureSessionStats, CommandNotice, NoticeLevel};
 
 /// A ULID-based identifier for a clip.
 ///
@@ -70,7 +70,9 @@ impl fmt::Debug for ClipId {
 }
 
 /// The detected primary content kind of a clip, used for icons and filtering.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum ContentKind {
     /// Plain unstructured text.
     Text,
@@ -125,6 +127,64 @@ impl ContentKind {
     }
 }
 
+/// Screen-space rectangle associated with the copied selection, when known.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Source context captured at the same instant as the clipboard generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureProvenance {
+    pub app_id: Option<String>,
+    pub window_title: Option<String>,
+    pub document_path: Option<String>,
+    pub source_url: Option<String>,
+    pub selection_rect: Option<SelectionRect>,
+}
+
+/// Monotonic identity supplied by a native clipboard backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureGeneration {
+    pub epoch: u64,
+    pub sequence: u64,
+}
+
+/// Origin information used to suppress local and cross-tool clipboard echoes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureLineage {
+    pub origin_device: Option<String>,
+    pub write_nonce: Option<String>,
+}
+
+/// Whether the bytes came directly from the source or were synthesized later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlavorOrigin {
+    #[default]
+    Source,
+    OsSynthesized,
+    VbuffDerived,
+}
+
+/// Outcome of realizing a promised/delayed clipboard representation.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FlavorRealization {
+    #[default]
+    Realized,
+    Deferred,
+    Failed,
+    Truncated,
+}
+
 /// The payload of a single flavor.
 ///
 /// Small payloads are stored `Inline`; large payloads are `Spilled` to an
@@ -176,6 +236,15 @@ pub struct Flavor {
     pub mime: String,
     /// The payload bytes (inline or spilled).
     pub body: Body,
+    /// Where the representation came from.
+    #[serde(default)]
+    pub origin: FlavorOrigin,
+    /// Whether all promised bytes were materialized successfully.
+    #[serde(default)]
+    pub realization: FlavorRealization,
+    /// Optional per-flavor BLAKE3 digest computed at the capture boundary.
+    #[serde(default)]
+    pub integrity_hash: Option<[u8; 32]>,
 }
 
 impl Flavor {
@@ -184,17 +253,45 @@ impl Flavor {
         Flavor {
             mime: mime.into(),
             body: Body::Inline(bytes),
+            origin: FlavorOrigin::Source,
+            realization: FlavorRealization::Realized,
+            integrity_hash: None,
         }
+    }
+
+    /// Construct a representation derived by vbuff from canonical bytes.
+    pub fn derived(mime: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            origin: FlavorOrigin::VbuffDerived,
+            ..Self::inline(mime, bytes)
+        }
+    }
+
+    /// True only when all promised bytes were read successfully.
+    pub fn is_realized(&self) -> bool {
+        self.realization == FlavorRealization::Realized
     }
 
     /// True if this flavor is a `text/*` flavor.
     pub fn is_text(&self) -> bool {
-        self.mime.starts_with("text/") || self.mime == "text"
+        let mime = self.mime_essence();
+        mime.eq_ignore_ascii_case("text")
+            || mime
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
+    }
+
+    /// True for the canonical plain-text representation, with optional MIME parameters.
+    pub fn is_plain_text(&self) -> bool {
+        let mime = self.mime_essence();
+        mime.eq_ignore_ascii_case("text/plain") || mime.eq_ignore_ascii_case("text")
     }
 
     /// True if this flavor is an `image/*` flavor.
     pub fn is_image(&self) -> bool {
-        self.mime.starts_with("image/")
+        self.mime_essence()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
     }
 
     /// Interpret the inline bytes as UTF-8 text, if possible.
@@ -202,6 +299,10 @@ impl Flavor {
         self.body
             .inline_bytes()
             .and_then(|b| std::str::from_utf8(b).ok())
+    }
+
+    fn mime_essence(&self) -> &str {
+        self.mime.split(';').next().unwrap_or(&self.mime).trim()
     }
 }
 
@@ -216,18 +317,50 @@ pub struct ClipMeta {
     pub source_app: Option<String>,
     /// Detected primary content kind.
     pub kind: ContentKind,
+    /// Rich source context, when the platform can provide it.
+    #[serde(default)]
+    pub provenance: CaptureProvenance,
+    /// Native clipboard generation identity, when available.
+    #[serde(default)]
+    pub generation: Option<CaptureGeneration>,
+    /// Write lineage used for echo suppression and future sync provenance.
+    #[serde(default)]
+    pub lineage: CaptureLineage,
+    /// Hard expiry for ephemeral captures such as one-time codes.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Sensitive clips receive masked presentation and stricter retention.
+    #[serde(default)]
+    pub sensitive: bool,
+    /// False means the clip must never enter a sync envelope.
+    #[serde(default = "default_true")]
+    pub sync_eligible: bool,
 }
 
 impl ClipMeta {
     /// Build metadata stamped at the current time for the given kind/size.
     pub fn now(kind: ContentKind, byte_size: u64, source_app: Option<String>) -> Self {
+        let provenance = CaptureProvenance {
+            app_id: source_app.clone(),
+            ..CaptureProvenance::default()
+        };
         ClipMeta {
             created_at: Utc::now(),
             byte_size,
             source_app,
             kind,
+            provenance,
+            generation: None,
+            lineage: CaptureLineage::default(),
+            expires_at: None,
+            sensitive: false,
+            sync_eligible: true,
         }
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// One logical copy event, holding every simultaneous flavor.
@@ -320,6 +453,16 @@ mod tests {
             favorite: false,
         };
         assert_eq!(clip.preview(100), "hello world");
+    }
+
+    #[test]
+    fn mime_helpers_ignore_case_and_parameters() {
+        let text = Flavor::inline(" TEXT/PLAIN; charset=utf-8 ", b"hello".to_vec());
+        let image = Flavor::inline("IMAGE/PNG", vec![1, 2, 3]);
+
+        assert!(text.is_text());
+        assert!(text.is_plain_text());
+        assert!(image.is_image());
     }
 
     #[test]

@@ -1,21 +1,38 @@
 //! SQLite-backed persistence for vbuff's clip history.
 //!
-//! The MVP schema is deliberately compact: a single `clips` table whose
-//! `flavors` column holds the flavor set as a JSON blob. This keeps reads to a
-//! single row fetch and avoids a join on the hot path; the full normalized
-//! `item`/`flavor` split from the architecture can be migrated to later.
+//! The hot clip row remains compact, while focused side tables own search
+//! facets, embeddings, capture metrics, audits, and CAS reference counts.
 //!
 //! The database lives at `dirs::data_dir()/vbuff/history.db`, runs in WAL mode,
 //! and is opened by a single owner. Inserts are dedup-aware: re-copying
 //! identical content bumps the existing row to the top instead of inserting a
 //! duplicate.
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, params};
-use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use serde::{Deserialize, Serialize};
+use vbuff_core::bloom::BloomFilter;
+use vbuff_core::capture::CaptureOutcome;
+use vbuff_core::facets::extract_facets;
+use vbuff_core::fingerprint::{
+    EmbeddingProvider, LocalFeatureEmbedding, QuantizedEmbedding, fingerprint_bands,
+    hamming_distance, simhash64,
+};
+use vbuff_types::{
+    CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta, ContentKind,
+    Flavor,
+};
 
+mod cas;
 mod error;
+mod image_fingerprint;
+mod migration;
+mod search;
 mod serde_clip;
 
 pub use error::StoreError;
@@ -24,11 +41,68 @@ pub use error::StoreError;
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// The current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchCursor {
+    pub pinned: bool,
+    pub updated_at: i64,
+    pub seq: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchPage {
+    pub clips: Vec<Clip>,
+    pub next_cursor: Option<SearchCursor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchSession {
+    query: String,
+    cursor: Option<SearchCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentAuditReport {
+    pub checked: usize,
+    pub repaired: usize,
+    pub quarantined: usize,
+}
+
+#[derive(Serialize)]
+struct QuarantineRecord {
+    id: String,
+    kind: ContentKind,
+    byte_size: u64,
+    sensitive: bool,
+}
+
+impl SearchSession {
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            cursor: None,
+        }
+    }
+
+    pub fn next_page(&mut self, store: &Store, limit: usize) -> Result<SearchPage> {
+        let page = store.search_page(&self.query, self.cursor, limit)?;
+        self.cursor = page.next_cursor;
+        Ok(page)
+    }
+
+    pub fn reset(&mut self, query: impl Into<String>) {
+        self.query = query.into();
+        self.cursor = None;
+    }
+}
 
 /// A handle to the clip-history database.
 pub struct Store {
     conn: Connection,
+    cas: Option<cas::CasStore>,
+    dedup_filter: RefCell<BloomFilter>,
+    search_planner: RefCell<search::SearchPlanner>,
 }
 
 impl Store {
@@ -36,16 +110,45 @@ impl Store {
     /// `<data_dir>/vbuff/history.db`.
     pub fn open_default() -> Result<Self> {
         let path = default_db_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
-        }
         Self::open(&path)
     }
 
     /// Open (creating if necessary) the store at a specific path.
     pub fn open(path: &Path) -> Result<Self> {
+        prepare_private_database_path(path)?;
+        let migration = migration::MigrationGuard::prepare(path, SCHEMA_VERSION)?;
+        if let Some(guard) = &migration {
+            let dry_connection = Connection::open(guard.dry_run_path())?;
+            let dry_store = Self::from_connection_with_cas(dry_connection, None)?;
+            guard.verify_dry_run(&dry_store.conn)?;
+            drop(dry_store);
+            guard.finish_dry_run()?;
+        }
         let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        harden_file_permissions(path)?;
+        let cas_root = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("blobs");
+        match Self::from_connection_with_cas(conn, Some(cas::CasStore::new(cas_root)?)) {
+            Ok(store) => {
+                harden_database_files(path)?;
+                if let Some(guard) = &migration
+                    && let Err(error) = guard.verify_live(&store.conn)
+                {
+                    drop(store);
+                    guard.rollback()?;
+                    return Err(error);
+                }
+                Ok(store)
+            }
+            Err(error) => {
+                if let Some(guard) = &migration {
+                    guard.rollback()?;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Open an in-memory store (useful for tests).
@@ -55,21 +158,39 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
+        Self::from_connection_with_cas(conn, None)
+    }
+
+    fn from_connection_with_cas(conn: Connection, cas: Option<cas::CasStore>) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let mut store = Store { conn };
+        conn.pragma_update(None, "secure_delete", "ON")?;
+        let mut store = Store {
+            conn,
+            cas,
+            dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
+            search_planner: RefCell::new(search::SearchPlanner::default()),
+        };
         store.migrate()?;
+        store.backfill_fingerprints(32)?;
+        store.rebuild_dedup_filter()?;
+        store.gc_blobs()?;
         Ok(store)
     }
 
     /// Apply forward-only migrations based on `user_version`.
     fn migrate(&mut self) -> Result<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let transaction = self.conn.transaction()?;
+        Self::apply_migrations(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_migrations(conn: &Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
-            self.conn.execute_batch(
+            conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS clips (
                     seq          INTEGER PRIMARY KEY AUTOINCREMENT, -- definitive recency tiebreaker
@@ -82,6 +203,19 @@ impl Store {
                     byte_size    INTEGER NOT NULL,
                     source_app   TEXT,
                     preview      TEXT NOT NULL DEFAULT '',-- cached search/preview text
+                    item_text    TEXT NOT NULL DEFAULT '',-- bounded full-text projection
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    expires_at   INTEGER,
+                    simhash      INTEGER,
+                    simhash_b0   INTEGER,
+                    simhash_b1   INTEGER,
+                    simhash_b2   INTEGER,
+                    simhash_b3   INTEGER,
+                    dhash        INTEGER,
+                    dhash_b0     INTEGER,
+                    dhash_b1     INTEGER,
+                    dhash_b2     INTEGER,
+                    dhash_b3     INTEGER,
                     pinned       INTEGER NOT NULL DEFAULT 0,
                     favorite     INTEGER NOT NULL DEFAULT 0
                 );
@@ -90,10 +224,314 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS idx_clips_pinned ON clips(updated_at DESC) WHERE pinned = 1;
                 "#,
             )?;
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        if version == 1 {
+            conn.execute(
+                "ALTER TABLE clips ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+            conn.execute("ALTER TABLE clips ADD COLUMN expires_at INTEGER", [])?;
+        }
+        if version == 1 || version == 2 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE clips ADD COLUMN simhash INTEGER;
+                ALTER TABLE clips ADD COLUMN simhash_b0 INTEGER;
+                ALTER TABLE clips ADD COLUMN simhash_b1 INTEGER;
+                ALTER TABLE clips ADD COLUMN simhash_b2 INTEGER;
+                ALTER TABLE clips ADD COLUMN simhash_b3 INTEGER;
+                ALTER TABLE clips ADD COLUMN dhash INTEGER;
+                ALTER TABLE clips ADD COLUMN dhash_b0 INTEGER;
+                ALTER TABLE clips ADD COLUMN dhash_b1 INTEGER;
+                ALTER TABLE clips ADD COLUMN dhash_b2 INTEGER;
+                ALTER TABLE clips ADD COLUMN dhash_b3 INTEGER;
+                ALTER TABLE clips ADD COLUMN item_text TEXT NOT NULL DEFAULT '';
+                "#,
+            )?;
+        }
+        if version == 3 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE blob_refs RENAME TO blob_refs_v3;
+                CREATE TABLE blob_refs (
+                    hash TEXT NOT NULL,
+                    kind INTEGER NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    refcount INTEGER NOT NULL CHECK(refcount >= 0),
+                    PRIMARY KEY (hash, kind)
+                ) WITHOUT ROWID;
+                INSERT INTO blob_refs(hash, kind, byte_size, refcount)
+                    SELECT json_extract(value, '$.body.Spilled.blob_ref'), c.kind,
+                           MAX(json_extract(value, '$.body.Spilled.byte_size')), COUNT(*)
+                    FROM clips AS c, json_each(c.flavors)
+                    WHERE json_type(value, '$.body.Spilled') = 'object'
+                    GROUP BY json_extract(value, '$.body.Spilled.blob_ref'), c.kind;
+                DROP TABLE blob_refs_v3;
+                "#,
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS clips_blob_ai;
+            DROP TRIGGER IF EXISTS clips_blob_ad;
+            DROP TRIGGER IF EXISTS clips_blob_au;
+            "#,
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS capture_metrics (
+                metric TEXT PRIMARY KEY,
+                count  INTEGER NOT NULL CHECK(count >= 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS clip_facets (
+                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL,
+                PRIMARY KEY (clip_id, key, value)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_clip_facets_lookup
+                ON clip_facets(key, value, clip_id);
+
+            CREATE TABLE IF NOT EXISTS clip_embeddings (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                dimensions INTEGER NOT NULL,
+                scale REAL NOT NULL,
+                vector BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS blob_refs (
+                hash TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL,
+                refcount INTEGER NOT NULL CHECK(refcount >= 0),
+                PRIMARY KEY (hash, kind)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS maintenance_state (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('fts_dirty', 0);
+
+            CREATE TABLE IF NOT EXISTS content_audit (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                checked_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS quarantined_clips (
+                id TEXT PRIMARY KEY,
+                quarantined_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_clips_simhash ON clips(simhash);
+            CREATE INDEX IF NOT EXISTS idx_clips_simhash_b0 ON clips(simhash_b0);
+            CREATE INDEX IF NOT EXISTS idx_clips_simhash_b1 ON clips(simhash_b1);
+            CREATE INDEX IF NOT EXISTS idx_clips_simhash_b2 ON clips(simhash_b2);
+            CREATE INDEX IF NOT EXISTS idx_clips_simhash_b3 ON clips(simhash_b3);
+            CREATE INDEX IF NOT EXISTS idx_clips_dhash ON clips(dhash);
+            CREATE INDEX IF NOT EXISTS idx_clips_dhash_b0 ON clips(dhash_b0);
+            CREATE INDEX IF NOT EXISTS idx_clips_dhash_b1 ON clips(dhash_b1);
+            CREATE INDEX IF NOT EXISTS idx_clips_dhash_b2 ON clips(dhash_b2);
+            CREATE INDEX IF NOT EXISTS idx_clips_dhash_b3 ON clips(dhash_b3);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS clip_fts_prose
+                USING fts5(item_text, tokenize='unicode61 remove_diacritics 2');
+            CREATE VIRTUAL TABLE IF NOT EXISTS clip_fts_code
+                USING fts5(item_text, tokenize='trigram');
+
+            CREATE TRIGGER IF NOT EXISTS clips_fts_ai AFTER INSERT ON clips BEGIN
+                INSERT INTO clip_fts_prose(rowid, item_text) VALUES (new.seq, new.item_text);
+                INSERT INTO clip_fts_code(rowid, item_text)
+                    SELECT new.seq, new.item_text WHERE new.kind = 7;
+                INSERT INTO maintenance_state(key, value) VALUES ('fts_dirty', 1)
+                    ON CONFLICT(key) DO UPDATE SET value = value + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_fts_ad AFTER DELETE ON clips BEGIN
+                DELETE FROM clip_fts_prose WHERE rowid = old.seq;
+                DELETE FROM clip_fts_code WHERE rowid = old.seq;
+                INSERT INTO maintenance_state(key, value) VALUES ('fts_dirty', 1)
+                    ON CONFLICT(key) DO UPDATE SET value = value + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_fts_au
+                AFTER UPDATE OF seq, item_text, kind ON clips BEGIN
+                DELETE FROM clip_fts_prose WHERE rowid = old.seq;
+                DELETE FROM clip_fts_code WHERE rowid = old.seq;
+                INSERT INTO clip_fts_prose(rowid, item_text) VALUES (new.seq, new.item_text);
+                INSERT INTO clip_fts_code(rowid, item_text)
+                    SELECT new.seq, new.item_text WHERE new.kind = 7;
+                INSERT INTO maintenance_state(key, value) VALUES ('fts_dirty', 1)
+                    ON CONFLICT(key) DO UPDATE SET value = value + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS clips_blob_ai AFTER INSERT ON clips BEGIN
+                INSERT INTO blob_refs(hash, kind, byte_size, refcount)
+                SELECT json_extract(value, '$.body.Spilled.blob_ref'), new.kind,
+                       MAX(json_extract(value, '$.body.Spilled.byte_size')), COUNT(*)
+                FROM json_each(new.flavors)
+                WHERE json_type(value, '$.body.Spilled') = 'object'
+                GROUP BY json_extract(value, '$.body.Spilled.blob_ref')
+                ON CONFLICT(hash, kind) DO UPDATE
+                    SET refcount = refcount + excluded.refcount;
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_blob_ad AFTER DELETE ON clips BEGIN
+                UPDATE blob_refs
+                SET refcount = refcount - (
+                    SELECT COUNT(*) FROM json_each(old.flavors)
+                    WHERE json_type(value, '$.body.Spilled') = 'object'
+                      AND json_extract(value, '$.body.Spilled.blob_ref') = blob_refs.hash
+                )
+                WHERE kind = old.kind AND hash IN (
+                    SELECT json_extract(value, '$.body.Spilled.blob_ref')
+                    FROM json_each(old.flavors)
+                    WHERE json_type(value, '$.body.Spilled') = 'object'
+                );
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_blob_au AFTER UPDATE OF flavors ON clips BEGIN
+                UPDATE blob_refs
+                SET refcount = refcount - (
+                    SELECT COUNT(*) FROM json_each(old.flavors)
+                    WHERE json_type(value, '$.body.Spilled') = 'object'
+                      AND json_extract(value, '$.body.Spilled.blob_ref') = blob_refs.hash
+                )
+                WHERE kind = old.kind AND hash IN (
+                    SELECT json_extract(value, '$.body.Spilled.blob_ref')
+                    FROM json_each(old.flavors)
+                    WHERE json_type(value, '$.body.Spilled') = 'object'
+                );
+                INSERT INTO blob_refs(hash, kind, byte_size, refcount)
+                SELECT json_extract(value, '$.body.Spilled.blob_ref'), new.kind,
+                       MAX(json_extract(value, '$.body.Spilled.byte_size')), COUNT(*)
+                FROM json_each(new.flavors)
+                WHERE json_type(value, '$.body.Spilled') = 'object'
+                GROUP BY json_extract(value, '$.body.Spilled.blob_ref')
+                ON CONFLICT(hash, kind) DO UPDATE
+                    SET refcount = refcount + excluded.refcount;
+            END;
+            "#,
+        )?;
+        conn.execute(
+            "UPDATE clips SET item_text = preview WHERE item_text = ''",
+            [],
+        )?;
+        let fts_in_sync: bool = conn.query_row(
+            r#"
+            SELECT (SELECT COUNT(*) FROM clip_fts_prose) = (SELECT COUNT(*) FROM clips)
+               AND (SELECT COUNT(*) FROM clip_fts_code) =
+                   (SELECT COUNT(*) FROM clips WHERE kind = 7)
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        if !fts_in_sync {
+            conn.execute_batch(
+                r#"
+                DELETE FROM clip_fts_prose;
+                DELETE FROM clip_fts_code;
+                INSERT INTO clip_fts_prose(rowid, item_text)
+                    SELECT seq, item_text FROM clips;
+                INSERT INTO clip_fts_code(rowid, item_text)
+                    SELECT seq, item_text FROM clips WHERE kind = 7;
+                "#,
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            INSERT INTO clip_fts_prose(clip_fts_prose, rank) VALUES('automerge', 4);
+            INSERT INTO clip_fts_code(clip_fts_code, rank) VALUES('automerge', 4);
+            "#,
+        )?;
+        if version < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
+    }
+
+    fn rebuild_dedup_filter(&self) -> Result<()> {
+        let count: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get::<_, i64>(0))?
+            as usize;
+        let mut filter = BloomFilter::with_capacity(count.max(1_024), 10);
+        let mut statement = self.conn.prepare("SELECT content_hash FROM clips")?;
+        let hashes = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for hash in hashes {
+            filter.insert(&hash?);
+        }
+        *self.dedup_filter.borrow_mut() = filter;
+        Ok(())
+    }
+
+    /// Backfill a bounded number of fingerprints for rows from older schemas.
+    pub fn backfill_fingerprints(&self, limit: usize) -> Result<usize> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, kind, item_text, flavors
+            FROM clips
+            WHERE (simhash IS NULL AND kind != 3 AND item_text != '')
+               OR (dhash IS NULL AND kind = 3)
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let pending = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let transaction = self.conn.unchecked_transaction()?;
+        let count = pending.len();
+        for (id, kind, item_text, flavors_json) in pending {
+            let simhash = (kind != kind_to_int(ContentKind::Image)).then(|| simhash64(&item_text));
+            let dhash = if kind == kind_to_int(ContentKind::Image) {
+                let flavors = serde_clip::flavors_from_json(&flavors_json)?;
+                let byte_size = flavors.iter().map(|flavor| flavor.body.byte_size()).sum();
+                let clip = Clip {
+                    id: ClipId::parse(&id)
+                        .map_err(|_| StoreError::Corrupt("bad ulid in db".into()))?,
+                    flavors,
+                    content_hash: [0; 32],
+                    meta: ClipMeta::now(ContentKind::Image, byte_size, None),
+                    pinned: false,
+                    favorite: false,
+                };
+                image_fingerprint::clip_dhash(&clip)
+            } else {
+                None
+            };
+            let simhash_bands = simhash.map(fingerprint_bands);
+            let dhash_bands = dhash.map(fingerprint_bands);
+            transaction.execute(
+                r#"
+                UPDATE clips SET
+                    simhash = ?1, simhash_b0 = ?2, simhash_b1 = ?3,
+                    simhash_b2 = ?4, simhash_b3 = ?5,
+                    dhash = ?6, dhash_b0 = ?7, dhash_b1 = ?8,
+                    dhash_b2 = ?9, dhash_b3 = ?10
+                WHERE id = ?11
+                "#,
+                params![
+                    simhash.map(|value| value as i64),
+                    simhash_bands.map(|bands| i64::from(bands[0])),
+                    simhash_bands.map(|bands| i64::from(bands[1])),
+                    simhash_bands.map(|bands| i64::from(bands[2])),
+                    simhash_bands.map(|bands| i64::from(bands[3])),
+                    dhash.map(|value| value as i64),
+                    dhash_bands.map(|bands| i64::from(bands[0])),
+                    dhash_bands.map(|bands| i64::from(bands[1])),
+                    dhash_bands.map(|bands| i64::from(bands[2])),
+                    dhash_bands.map(|bands| i64::from(bands[3])),
+                    id,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(count)
     }
 
     /// Insert a clip, deduplicating by content hash.
@@ -102,39 +540,77 @@ impl Store {
     /// is bumped to now (moving it to the top) and its existing [`ClipId`] is
     /// returned. Otherwise the new clip is inserted and its id returned.
     pub fn insert(&self, clip: &Clip) -> Result<ClipId> {
+        self.purge_expired()?;
         let now = now_millis();
+        let metadata_json = serde_json::to_string(&StoredMetadata::from(&clip.meta))?;
+        let expires_at = clip.meta.expires_at.map(|value| value.timestamp_millis());
+        let preview = clip.preview(512);
+        let item_text = searchable_projection(clip, 1_048_576);
+        let simhash = clip.primary_text().map(simhash64);
+        let simhash_bands = simhash.map(fingerprint_bands);
+        let dhash = image_fingerprint::clip_dhash(clip);
+        let dhash_bands = dhash.map(fingerprint_bands);
+        let facets = clip
+            .primary_text()
+            .map(|text| extract_facets(text, clip.meta.kind, clip.meta.sensitive))
+            .unwrap_or_default();
+        let might_exist = self
+            .dedup_filter
+            .borrow()
+            .might_contain(clip.content_hash.as_slice());
+        let transaction = self.conn.unchecked_transaction()?;
 
         // Dedup: does this content already exist?
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM clips WHERE content_hash = ?1",
-                params![clip.content_hash.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let existing: Option<String> = if might_exist {
+            transaction
+                .query_row(
+                    "SELECT id FROM clips WHERE content_hash = ?1",
+                    params![clip.content_hash.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
 
         if let Some(id_str) = existing {
             // Bump both updated_at and seq so the deduped clip floats to the top
             // even when several inserts share the same millisecond.
-            self.conn.execute(
-                "UPDATE clips SET updated_at = ?1, seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM clips) WHERE id = ?2",
-                params![now, id_str],
+            transaction.execute(
+                r#"
+                UPDATE clips
+                SET updated_at = ?1,
+                    seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM clips),
+                    metadata_json = ?2,
+                    expires_at = ?3,
+                    source_app = ?4
+                WHERE id = ?5
+                "#,
+                params![now, metadata_json, expires_at, clip.meta.source_app, id_str],
             )?;
+            transaction.commit()?;
             return ClipId::parse(&id_str)
                 .map_err(|_| StoreError::Corrupt("bad ulid in db".into()));
         }
 
-        let flavors_json = serde_clip::flavors_to_json(&clip.flavors)?;
+        let mut stored_flavors = clip.flavors.clone();
+        if !clip.meta.sensitive
+            && let Some(cas) = &self.cas
+        {
+            cas.spill_flavors(&mut stored_flavors, clip.meta.kind)?;
+        }
+        let flavors_json = serde_clip::flavors_to_json(&stored_flavors)?;
         let created = clip.meta.created_at.timestamp_millis();
-        let preview = clip.preview(512);
 
-        self.conn.execute(
+        transaction.execute(
             r#"
             INSERT INTO clips
                 (id, content_hash, flavors, kind, created_at, updated_at,
-                 byte_size, source_app, preview, pinned, favorite)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 byte_size, source_app, preview, item_text, metadata_json, expires_at,
+                 simhash, simhash_b0, simhash_b1, simhash_b2, simhash_b3,
+                 dhash, dhash_b0, dhash_b1, dhash_b2, dhash_b3, pinned, favorite)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             "#,
             params![
                 clip.id.to_string_repr(),
@@ -146,10 +622,33 @@ impl Store {
                 clip.meta.byte_size as i64,
                 clip.meta.source_app,
                 preview,
+                item_text,
+                metadata_json,
+                expires_at,
+                simhash.map(|value| value as i64),
+                simhash_bands.map(|bands| i64::from(bands[0])),
+                simhash_bands.map(|bands| i64::from(bands[1])),
+                simhash_bands.map(|bands| i64::from(bands[2])),
+                simhash_bands.map(|bands| i64::from(bands[3])),
+                dhash.map(|value| value as i64),
+                dhash_bands.map(|bands| i64::from(bands[0])),
+                dhash_bands.map(|bands| i64::from(bands[1])),
+                dhash_bands.map(|bands| i64::from(bands[2])),
+                dhash_bands.map(|bands| i64::from(bands[3])),
                 clip.pinned as i64,
                 clip.favorite as i64,
             ],
         )?;
+        for facet in facets {
+            transaction.execute(
+                "INSERT OR IGNORE INTO clip_facets(clip_id, key, value) VALUES (?1, ?2, ?3)",
+                params![clip.id.to_string_repr(), facet.key, facet.value],
+            )?;
+        }
+        transaction.commit()?;
+        self.dedup_filter
+            .borrow_mut()
+            .insert(clip.content_hash.as_slice());
         Ok(clip.id)
     }
 
@@ -158,14 +657,17 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, pinned, favorite
+                   byte_size, source_app, metadata_json, pinned, favorite
             FROM clips
+            WHERE expires_at IS NULL OR expires_at > ?1
             ORDER BY pinned DESC, updated_at DESC, seq DESC
-            LIMIT ?1
+            LIMIT ?2
             "#,
         )?;
-        let rows = stmt.query_map(params![limit as i64], row_to_clip)?;
-        collect_clips(rows)
+        let rows = stmt.query_map(params![now_millis(), limit as i64], row_to_clip)?;
+        let mut clips = collect_clips(rows)?;
+        self.hydrate_clips(&mut clips)?;
+        Ok(clips)
     }
 
     /// Load the most recent clips (alias used at startup to hydrate the GUI).
@@ -173,27 +675,429 @@ impl Store {
         self.list(limit)
     }
 
-    /// Search clips by a case-insensitive substring over the cached preview.
-    ///
-    /// Ranking is left to `vbuff-core::search` on the caller side; this method
-    /// just narrows the candidate set with SQL `LIKE`.
+    /// Search with an adaptive LIKE/FTS5 tier and structured facet filters.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
-        if query.trim().is_empty() {
-            return self.list(limit);
+        Ok(self.search_page(query, None, limit)?.clips)
+    }
+
+    pub fn search_page(
+        &self,
+        query: &str,
+        cursor: Option<SearchCursor>,
+        limit: usize,
+    ) -> Result<SearchPage> {
+        if limit == 0 {
+            return Ok(SearchPage {
+                clips: Vec::new(),
+                next_cursor: None,
+            });
         }
-        let pattern = format!("%{}%", escape_like(query));
-        let mut stmt = self.conn.prepare(
+        let parsed = search::parse_query(query);
+        let row_count = self.count()?;
+        let use_fts = !parsed.text.is_empty()
+            && self
+                .search_planner
+                .borrow()
+                .use_fts(row_count, &parsed.text);
+        let started = Instant::now();
+        let mut sql = String::from(
+            r#"
+            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
+                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
+            FROM clips c
+            WHERE (c.expires_at IS NULL OR c.expires_at > ?)
+            "#,
+        );
+        let mut values = vec![Value::Integer(now_millis())];
+
+        if !parsed.text.is_empty() {
+            if use_fts {
+                let literal = search::fts_literal(&parsed.text);
+                sql.push_str(
+                    r#"
+                    AND c.seq IN (
+                        SELECT rowid FROM clip_fts_prose WHERE clip_fts_prose MATCH ?
+                        UNION
+                        SELECT rowid FROM clip_fts_code WHERE clip_fts_code MATCH ?
+                    )
+                    "#,
+                );
+                values.push(Value::Text(literal.clone()));
+                values.push(Value::Text(literal));
+            } else {
+                let pattern = format!("%{}%", escape_like(&parsed.text));
+                sql.push_str(
+                    " AND (c.item_text LIKE ? ESCAPE '\\' OR c.source_app LIKE ? ESCAPE '\\')",
+                );
+                values.push(Value::Text(pattern.clone()));
+                values.push(Value::Text(pattern));
+            }
+        }
+        for (key, value) in parsed.facets {
+            sql.push_str(
+                r#"
+                AND EXISTS (
+                    SELECT 1 FROM clip_facets f
+                    WHERE f.clip_id = c.id AND f.key = ? AND f.value = ?
+                )
+                "#,
+            );
+            values.push(Value::Text(key));
+            values.push(Value::Text(value));
+        }
+        if let Some(cursor) = cursor {
+            sql.push_str(
+                " AND (c.pinned < ? OR (c.pinned = ? AND (c.updated_at < ? OR (c.updated_at = ? AND c.seq < ?))))",
+            );
+            values.push(Value::Integer(cursor.pinned as i64));
+            values.push(Value::Integer(cursor.pinned as i64));
+            values.push(Value::Integer(cursor.updated_at));
+            values.push(Value::Integer(cursor.updated_at));
+            values.push(Value::Integer(cursor.seq));
+        }
+        sql.push_str(" ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC LIMIT ?");
+        values.push(Value::Integer(limit as i64));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row_to_clip(row)?,
+                SearchCursor {
+                    pinned: row.get::<_, i64>(9)? != 0,
+                    updated_at: row.get(5)?,
+                    seq: row.get(11)?,
+                },
+            ))
+        })?;
+        let mut clips = Vec::new();
+        let mut last_cursor = None;
+        for row in rows {
+            let (raw, row_cursor) = row?;
+            clips.push(raw_to_clip(raw)?);
+            last_cursor = Some(row_cursor);
+        }
+        self.hydrate_clips(&mut clips)?;
+        if !use_fts && !parsed.text.is_empty() {
+            self.search_planner
+                .borrow_mut()
+                .record_like(started.elapsed());
+        }
+        let next_cursor = (clips.len() == limit).then_some(last_cursor).flatten();
+        Ok(SearchPage { clips, next_cursor })
+    }
+
+    pub fn find_near_text(&self, text: &str, max_distance: u32, limit: usize) -> Result<Vec<Clip>> {
+        self.find_near_fingerprint("simhash", simhash64(text), max_distance, limit)
+    }
+
+    pub fn find_near_image(
+        &self,
+        fingerprint: u64,
+        max_distance: u32,
+        limit: usize,
+    ) -> Result<Vec<Clip>> {
+        self.find_near_fingerprint("dhash", fingerprint, max_distance, limit)
+    }
+
+    fn find_near_fingerprint(
+        &self,
+        column: &str,
+        fingerprint: u64,
+        max_distance: u32,
+        limit: usize,
+    ) -> Result<Vec<Clip>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bands = fingerprint_bands(fingerprint);
+        // Four equal 16-bit bands are a complete candidate filter only for
+        // distances below four. At larger distances, scan the fingerprint
+        // column so one changed bit per band cannot become a false negative.
+        let band_filter = if max_distance < 4 {
+            format!(
+                "AND ({column}_b0 = ? OR {column}_b1 = ? OR {column}_b2 = ? OR {column}_b3 = ?)"
+            )
+        } else {
+            String::new()
+        };
+        let sql = format!(
             r#"
             SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, pinned, favorite
+                   byte_size, source_app, metadata_json, pinned, favorite, {column}
             FROM clips
-            WHERE preview LIKE ?1 ESCAPE '\' OR source_app LIKE ?1 ESCAPE '\'
-            ORDER BY pinned DESC, updated_at DESC, seq DESC
-            LIMIT ?2
+            WHERE {column} IS NOT NULL
+              {band_filter}
+            ORDER BY updated_at DESC, seq DESC
+            "#
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let values = if max_distance < 4 {
+            bands
+                .into_iter()
+                .map(|band| Value::Integer(i64::from(band)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+            Ok((row_to_clip(row)?, row.get::<_, i64>(11)? as u64))
+        })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let (raw, candidate) = row?;
+            if hamming_distance(fingerprint, candidate) <= max_distance {
+                let mut clip = raw_to_clip(raw)?;
+                self.hydrate_clip(&mut clip)?;
+                matches.push(clip);
+                if matches.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    fn hydrate_clips(&self, clips: &mut [Clip]) -> Result<()> {
+        for clip in clips {
+            self.hydrate_clip(clip)?;
+        }
+        Ok(())
+    }
+
+    fn hydrate_clip(&self, clip: &mut Clip) -> Result<()> {
+        if let Some(cas) = &self.cas {
+            cas.hydrate_flavors(&mut clip.flavors, clip.meta.kind)?;
+        }
+        Ok(())
+    }
+
+    /// Lazily build compact local feature vectors during an idle window.
+    pub fn backfill_embeddings(&self, limit: usize) -> Result<usize> {
+        let provider = LocalFeatureEmbedding;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT c.id, c.item_text
+            FROM clips c
+            LEFT JOIN clip_embeddings e ON e.clip_id = c.id
+            WHERE e.clip_id IS NULL
+              AND c.item_text != ''
+              AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
+            LIMIT ?1
             "#,
         )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], row_to_clip)?;
-        collect_clips(rows)
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let pending = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let transaction = self.conn.unchecked_transaction()?;
+        for (id, text) in &pending {
+            let embedding = provider.embed(text);
+            let bytes = embedding
+                .values
+                .iter()
+                .map(|value| *value as u8)
+                .collect::<Vec<_>>();
+            transaction.execute(
+                r#"
+                INSERT OR REPLACE INTO clip_embeddings(clip_id, dimensions, scale, vector)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![id, embedding.values.len() as i64, embedding.scale, bytes],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(pending.len())
+    }
+
+    /// Hybrid local similarity search: narrow lexically, then rerank at most
+    /// 512 candidates with compact feature vectors.
+    pub fn local_similarity_search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
+        let output_limit = limit.min(512);
+        if output_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let provider = LocalFeatureEmbedding;
+        let query_embedding = provider.embed(query);
+        let candidate_limit = output_limit.saturating_mul(8).min(512).max(output_limit);
+        let mut candidates = self.search(query, candidate_limit)?;
+        if candidates.is_empty() {
+            candidates = self.list(candidate_limit)?;
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT dimensions, scale, vector FROM clip_embeddings WHERE clip_id = ?1")?;
+        let mut scored = candidates
+            .into_iter()
+            .map(|clip| {
+                let embedding = statement
+                    .query_row(params![clip.id.to_string_repr()], |row| {
+                        let dimensions = row.get::<_, i64>(0)? as usize;
+                        let scale = row.get::<_, f32>(1)?;
+                        let bytes = row.get::<_, Vec<u8>>(2)?;
+                        if dimensions != bytes.len() {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        Ok(QuantizedEmbedding {
+                            scale,
+                            values: bytes.into_iter().map(|byte| byte as i8).collect(),
+                        })
+                    })
+                    .optional()?;
+                let score = embedding
+                    .as_ref()
+                    .and_then(|embedding| query_embedding.cosine_similarity(embedding))
+                    .unwrap_or(f32::NEG_INFINITY);
+                Ok::<_, StoreError>((clip, score))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+        scored.truncate(output_limit);
+        Ok(scored.into_iter().map(|(clip, _)| clip).collect())
+    }
+
+    /// Run bounded FTS maintenance only after meaningful write churn.
+    pub fn maintain_search_index(&self, dirty_threshold: u64) -> Result<bool> {
+        let dirty: i64 = self.conn.query_row(
+            "SELECT value FROM maintenance_state WHERE key = 'fts_dirty'",
+            [],
+            |row| row.get(0),
+        )?;
+        if dirty < dirty_threshold.min(i64::MAX as u64) as i64 {
+            return Ok(false);
+        }
+        self.conn.execute_batch(
+            r#"
+            INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('optimize');
+            INSERT INTO clip_fts_code(clip_fts_code) VALUES('optimize');
+            INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('integrity-check');
+            INSERT INTO clip_fts_code(clip_fts_code) VALUES('integrity-check');
+            UPDATE maintenance_state SET value = 0 WHERE key = 'fts_dirty';
+            "#,
+        )?;
+        Ok(true)
+    }
+
+    /// Remove CAS files whose transactional refcount reached zero or which a
+    /// crash stranded before the corresponding database commit.
+    pub fn gc_blobs(&self) -> Result<usize> {
+        let Some(cas) = &self.cas else {
+            return Ok(0);
+        };
+        let mut statement = self
+            .conn
+            .prepare("SELECT hash, kind FROM blob_refs WHERE refcount = 0")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let dead = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (blob_ref, kind) in &dead {
+            cas.remove(kind_from_int(*kind), blob_ref)?;
+        }
+        self.conn
+            .execute("DELETE FROM blob_refs WHERE refcount = 0", [])?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT hash, kind FROM blob_refs WHERE refcount > 0")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                kind_from_int(row.get::<_, i64>(1)?),
+                row.get::<_, String>(0)?,
+            ))
+        })?;
+        let live = rows.collect::<rusqlite::Result<HashSet<_>>>()?;
+        drop(statement);
+        let orphans = cas.remove_orphans(&live)?;
+        Ok(dead.len() + orphans)
+    }
+
+    /// Recompute a rolling sample and repair or quarantine hash mismatches.
+    pub fn audit_content_hashes(&self, limit: usize) -> Result<ContentAuditReport> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
+                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            FROM clips c
+            LEFT JOIN content_audit a ON a.clip_id = c.id
+            ORDER BY COALESCE(a.checked_at, 0) ASC, c.seq ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], row_to_clip)?;
+        let mut candidates = collect_clips(rows)?;
+        drop(statement);
+        self.hydrate_clips(&mut candidates)?;
+
+        let mut report = ContentAuditReport::default();
+        let transaction = self.conn.unchecked_transaction()?;
+        for clip in candidates {
+            report.checked += 1;
+            let actual = vbuff_core::content_hash_from_flavors(&clip.flavors);
+            if actual == clip.content_hash {
+                transaction.execute(
+                    r#"
+                    INSERT INTO content_audit(clip_id, checked_at) VALUES (?1, ?2)
+                    ON CONFLICT(clip_id) DO UPDATE SET checked_at = excluded.checked_at
+                    "#,
+                    params![clip.id.to_string_repr(), now_millis()],
+                )?;
+                continue;
+            }
+
+            let conflict: Option<String> = transaction
+                .query_row(
+                    "SELECT id FROM clips WHERE content_hash = ?1 AND id != ?2",
+                    params![actual.as_slice(), clip.id.to_string_repr()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(conflict_id) = conflict {
+                let row_json = serde_json::to_string(&QuarantineRecord {
+                    id: clip.id.to_string_repr(),
+                    kind: clip.meta.kind,
+                    byte_size: clip.meta.byte_size,
+                    sensitive: clip.meta.sensitive,
+                })?;
+                transaction.execute(
+                    r#"
+                    INSERT OR REPLACE INTO quarantined_clips
+                        (id, quarantined_at, reason, row_json)
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        clip.id.to_string_repr(),
+                        now_millis(),
+                        format!("content hash conflicts with {conflict_id}"),
+                        row_json,
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM clips WHERE id = ?1",
+                    params![clip.id.to_string_repr()],
+                )?;
+                report.quarantined += 1;
+            } else {
+                transaction.execute(
+                    "UPDATE clips SET content_hash = ?1 WHERE id = ?2",
+                    params![actual.as_slice(), clip.id.to_string_repr()],
+                )?;
+                transaction.execute(
+                    r#"
+                    INSERT INTO content_audit(clip_id, checked_at) VALUES (?1, ?2)
+                    ON CONFLICT(clip_id) DO UPDATE SET checked_at = excluded.checked_at
+                    "#,
+                    params![clip.id.to_string_repr(), now_millis()],
+                )?;
+                self.dedup_filter.borrow_mut().insert(actual.as_slice());
+                report.repaired += 1;
+            }
+        }
+        transaction.commit()?;
+        if report.quarantined > 0 {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(report)
     }
 
     /// Set (or clear) the pinned flag on a clip.
@@ -216,32 +1120,88 @@ impl Store {
 
     /// Delete a single clip by id.
     pub fn delete(&self, id: ClipId) -> Result<()> {
-        self.conn.execute(
+        let deleted = self.conn.execute(
             "DELETE FROM clips WHERE id = ?1",
             params![id.to_string_repr()],
         )?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
         Ok(())
     }
 
     /// Delete every non-pinned clip. Pinned clips are preserved.
     pub fn clear(&self) -> Result<()> {
-        self.conn
+        let deleted = self
+            .conn
             .execute("DELETE FROM clips WHERE pinned = 0", [])?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
         Ok(())
     }
 
     /// Delete every clip, including pinned ones.
     pub fn clear_all(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM clips", [])?;
+        let deleted = self.conn.execute("DELETE FROM clips", [])?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
         Ok(())
     }
 
     /// Total number of stored clips.
     pub fn count(&self) -> Result<usize> {
+        self.purge_expired()?;
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
         Ok(n as usize)
+    }
+
+    /// Delete clips whose hard privacy TTL elapsed, including pinned rows.
+    pub fn purge_expired(&self) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM clips WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now_millis()],
+        )?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Persist one capture-path outcome without retaining clipboard content.
+    pub fn record_capture_outcome(&self, outcome: CaptureOutcome, count: u64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO capture_metrics(metric, count) VALUES (?1, ?2)
+            ON CONFLICT(metric) DO UPDATE SET count =
+                CASE
+                    WHEN capture_metrics.count >= 9223372036854775807 - excluded.count
+                    THEN 9223372036854775807
+                    ELSE capture_metrics.count + excluded.count
+                END
+            "#,
+            params![outcome.metric_key(), count.min(i64::MAX as u64) as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Return the durable, content-free capture accounting ledger.
+    pub fn capture_metrics(&self) -> Result<BTreeMap<String, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT metric, count FROM capture_metrics ORDER BY metric")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut metrics = BTreeMap::new();
+        for row in rows {
+            let (metric, count) = row?;
+            metrics.insert(metric, count);
+        }
+        Ok(metrics)
     }
 
     /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
@@ -264,7 +1224,22 @@ impl Store {
             "#,
             params![overflow as i64],
         )?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
         Ok(deleted)
+    }
+
+    fn scrub_deleted_pages(&self) -> Result<()> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            return Err(StoreError::Maintenance(
+                "WAL truncate checkpoint was busy after deletion".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +1283,52 @@ fn dirs_next_data_dir() -> Option<PathBuf> {
     }
 }
 
+fn prepare_private_database_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
+        harden_directory_permissions(parent)?;
+    }
+    if path.exists() {
+        harden_file_permissions(path)?;
+    }
+    Ok(())
+}
+
+fn harden_database_files(path: &Path) -> Result<()> {
+    harden_file_permissions(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
+        if sidecar.exists() {
+            harden_file_permissions(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(StoreError::Io)
+}
+
+#[cfg(not(unix))]
+fn harden_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(StoreError::Io)
+}
+
+#[cfg(not(unix))]
+fn harden_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn collect_clips(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawRow>>,
 ) -> Result<Vec<Clip>> {
@@ -327,6 +1348,7 @@ struct RawRow {
     created_at: i64,
     byte_size: i64,
     source_app: Option<String>,
+    metadata_json: String,
     pinned: bool,
     favorite: bool,
 }
@@ -341,8 +1363,9 @@ fn row_to_clip(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         // index 5 (updated_at) is used for ordering only.
         byte_size: row.get(6)?,
         source_app: row.get(7)?,
-        pinned: row.get::<_, i64>(8)? != 0,
-        favorite: row.get::<_, i64>(9)? != 0,
+        metadata_json: row.get(8)?,
+        pinned: row.get::<_, i64>(9)? != 0,
+        favorite: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -357,12 +1380,14 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
     }
     let created_at =
         chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
-    let meta = ClipMeta {
-        created_at,
-        byte_size: raw.byte_size as u64,
-        source_app: raw.source_app,
-        kind: kind_from_int(raw.kind),
-    };
+    let stored_meta: StoredMetadata = serde_json::from_str(&raw.metadata_json)?;
+    let mut meta = ClipMeta::now(
+        kind_from_int(raw.kind),
+        raw.byte_size as u64,
+        raw.source_app,
+    );
+    meta.created_at = created_at;
+    stored_meta.apply_to(&mut meta);
     Ok(Clip {
         id,
         flavors,
@@ -373,8 +1398,65 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
     })
 }
 
+/// Metadata added after the v1 schema. Core query columns stay normalized,
+/// while optional capture context can evolve without a migration per field.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct StoredMetadata {
+    provenance: CaptureProvenance,
+    generation: Option<CaptureGeneration>,
+    lineage: CaptureLineage,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    sensitive: bool,
+    sync_eligible: Option<bool>,
+}
+
+impl From<&ClipMeta> for StoredMetadata {
+    fn from(meta: &ClipMeta) -> Self {
+        Self {
+            provenance: meta.provenance.clone(),
+            generation: meta.generation,
+            lineage: meta.lineage.clone(),
+            expires_at: meta.expires_at,
+            sensitive: meta.sensitive,
+            sync_eligible: Some(meta.sync_eligible),
+        }
+    }
+}
+
+impl StoredMetadata {
+    fn apply_to(self, meta: &mut ClipMeta) {
+        meta.provenance = self.provenance;
+        meta.generation = self.generation;
+        meta.lineage = self.lineage;
+        meta.expires_at = self.expires_at;
+        meta.sensitive = self.sensitive;
+        meta.sync_eligible = self.sync_eligible.unwrap_or(true);
+    }
+}
+
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn searchable_projection(clip: &Clip, max_bytes: usize) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = clip.primary_text() {
+        parts.push(text);
+    }
+    if let Some(source_app) = clip.meta.source_app.as_deref() {
+        parts.push(source_app);
+    }
+    parts.push(clip.meta.kind.label());
+    let mut projection = parts.join("\n");
+    if projection.len() > max_bytes {
+        let mut boundary = max_bytes.min(projection.len());
+        while !projection.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        projection.truncate(boundary);
+    }
+    projection
 }
 
 /// Escape `%`, `_`, and `\` for a SQL `LIKE` pattern using `\` as the escape.
@@ -423,8 +1505,12 @@ fn kind_from_int(v: i64) -> ContentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+    use vbuff_core::capture::{CaptureOutcome, DropReason};
     use vbuff_core::content_hash_from_flavors;
-    use vbuff_types::{ClipMeta, ContentKind, Flavor};
+    use vbuff_types::{
+        Body, CaptureGeneration, CaptureLineage, CaptureProvenance, ClipMeta, ContentKind, Flavor,
+    };
 
     fn make_clip(text: &str) -> Clip {
         let flavors = vec![Flavor::inline("text/plain", text.as_bytes().to_vec())];
@@ -512,5 +1598,452 @@ mod tests {
         assert_eq!(store.count().unwrap(), 3);
         // Pinned survived.
         assert!(store.list(10).unwrap().iter().any(|c| c.pinned));
+    }
+
+    #[test]
+    fn extended_metadata_and_expiry_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("123456");
+        clip.meta.provenance = CaptureProvenance {
+            app_id: Some("browser.app".into()),
+            window_title: Some("Verification".into()),
+            source_url: Some("https://login.example.test".into()),
+            ..Default::default()
+        };
+        clip.meta.generation = Some(CaptureGeneration {
+            epoch: 4,
+            sequence: 9,
+        });
+        clip.meta.lineage = CaptureLineage {
+            origin_device: Some("laptop".into()),
+            write_nonce: Some("nonce".into()),
+        };
+        clip.meta.sensitive = true;
+        clip.meta.sync_eligible = false;
+        clip.meta.expires_at = Some(chrono::Utc::now() + Duration::minutes(1));
+
+        store.insert(&clip).unwrap();
+        let loaded = store.list(1).unwrap().pop().unwrap();
+        assert_eq!(loaded.meta.provenance, clip.meta.provenance);
+        assert_eq!(loaded.meta.generation, clip.meta.generation);
+        assert_eq!(loaded.meta.lineage, clip.meta.lineage);
+        assert!(loaded.meta.sensitive);
+        assert!(!loaded.meta.sync_eligible);
+        assert_eq!(loaded.meta.expires_at, clip.meta.expires_at);
+    }
+
+    #[test]
+    fn expired_clip_is_never_returned_or_counted() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("654321");
+        clip.meta.expires_at = Some(chrono::Utc::now() - Duration::seconds(1));
+        store.insert(&clip).unwrap();
+
+        assert!(store.list(10).unwrap().is_empty());
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn capture_metrics_accumulate_without_content() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_capture_outcome(CaptureOutcome::Captured, 2)
+            .unwrap();
+        store
+            .record_capture_outcome(CaptureOutcome::Dropped(DropReason::GenerationGap), 3)
+            .unwrap();
+
+        assert_eq!(
+            store.capture_metrics().unwrap(),
+            BTreeMap::from([("captured".into(), 2), ("dropped:generation_gap".into(), 3),])
+        );
+    }
+
+    #[test]
+    fn migrates_v1_schema_without_losing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE clips (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                content_hash BLOB NOT NULL,
+                flavors TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL,
+                source_app TEXT,
+                preview TEXT NOT NULL DEFAULT '',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                favorite INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        store.insert(&make_clip("after migration")).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(store.capture_metrics().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_every_schema_step() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE clips (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                content_hash BLOB NOT NULL,
+                flavors TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL,
+                source_app TEXT,
+                preview TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                expires_at INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                favorite INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE VIEW clip_facets AS SELECT 1 AS blocked;
+            PRAGMA user_version = 2;
+            "#,
+        )
+        .unwrap();
+        let mut store = Store {
+            conn,
+            cas: None,
+            dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
+            search_planner: RefCell::new(search::SearchPlanner::default()),
+        };
+
+        assert!(store.migrate().is_err());
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let simhash_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clips') WHERE name = 'simhash')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert!(!simhash_exists);
+    }
+
+    #[test]
+    fn v4_migration_rebuilds_cross_kind_blob_refcounts_from_flavors() {
+        let mut store = Store::open_in_memory().unwrap();
+        let blob_ref = "ab".repeat(32);
+        for (index, kind) in [ContentKind::Text, ContentKind::Image]
+            .into_iter()
+            .enumerate()
+        {
+            let mut clip = make_clip(&format!("blob {index}"));
+            clip.content_hash = [index as u8 + 1; 32];
+            clip.flavors = vec![Flavor {
+                mime: "application/octet-stream".into(),
+                body: Body::Spilled {
+                    blob_ref: blob_ref.clone(),
+                    byte_size: 42,
+                },
+                origin: Default::default(),
+                realization: Default::default(),
+                integrity_hash: None,
+            }];
+            clip.meta.kind = kind;
+            clip.meta.byte_size = 42;
+            store.insert(&clip).unwrap();
+        }
+        store
+            .conn
+            .execute_batch(
+                r#"
+                DROP TRIGGER clips_blob_ai;
+                DROP TRIGGER clips_blob_ad;
+                DROP TRIGGER clips_blob_au;
+                DROP TABLE blob_refs;
+                CREATE TABLE blob_refs (
+                    hash TEXT PRIMARY KEY,
+                    kind INTEGER NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    refcount INTEGER NOT NULL
+                );
+                INSERT INTO blob_refs VALUES ('stale', 0, 1, 99);
+                PRAGMA user_version = 3;
+                "#,
+            )
+            .unwrap();
+
+        store.migrate().unwrap();
+
+        let mut statement = store
+            .conn
+            .prepare("SELECT hash, kind, refcount FROM blob_refs ORDER BY kind")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![(blob_ref.clone(), 0, 1), (blob_ref, 3, 1)]);
+    }
+
+    #[test]
+    fn adaptive_fts_finds_code_identifier_fragments() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("ordinary prose {index}")))
+                .unwrap();
+        }
+        let mut code = make_clip("fn getUserById(id: u64) -> User");
+        code.meta.kind = ContentKind::Code;
+        store.insert(&code).unwrap();
+
+        let hits = store.search("UserBy", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].primary_text(), code.primary_text());
+    }
+
+    #[test]
+    fn structured_facets_filter_without_regex_scans() {
+        let store = Store::open_in_memory().unwrap();
+        let mut url = make_clip("https://docs.rs/rusqlite/latest/rusqlite/");
+        url.meta.kind = ContentKind::Url;
+        store.insert(&url).unwrap();
+        store.insert(&make_clip("https://example.com")).unwrap();
+
+        let hits = store.search("host:docs.rs", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].primary_text(), url.primary_text());
+    }
+
+    #[test]
+    fn indexed_simhash_returns_exact_and_near_candidates() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("the quick brown fox jumps over the lazy dog");
+        store.insert(&clip).unwrap();
+
+        let hits = store
+            .find_near_text("the quick brown fox jumps over the lazy dog", 0, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, clip.id);
+    }
+
+    #[test]
+    fn fingerprint_backfill_is_bounded_for_fast_startup() {
+        let store = Store::open_in_memory().unwrap();
+        for text in ["first old row", "second old row", "third old row"] {
+            store.insert(&make_clip(text)).unwrap();
+        }
+        store
+            .conn
+            .execute(
+                r#"
+                UPDATE clips SET simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
+                                 simhash_b2 = NULL, simhash_b3 = NULL
+                "#,
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(store.backfill_fingerprints(1).unwrap(), 1);
+        let pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM clips WHERE simhash IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2);
+    }
+
+    #[test]
+    fn near_fingerprint_falls_back_when_every_band_differs() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("four changed bands");
+        store.insert(&clip).unwrap();
+        let candidate = 0x0001_0001_0001_0001_u64;
+        let bands = fingerprint_bands(candidate);
+        store
+            .conn
+            .execute(
+                r#"
+                UPDATE clips SET simhash = ?1, simhash_b0 = ?2, simhash_b1 = ?3,
+                                 simhash_b2 = ?4, simhash_b3 = ?5
+                WHERE id = ?6
+                "#,
+                params![
+                    candidate as i64,
+                    i64::from(bands[0]),
+                    i64::from(bands[1]),
+                    i64::from(bands[2]),
+                    i64::from(bands[3]),
+                    clip.id.to_string_repr(),
+                ],
+            )
+            .unwrap();
+
+        let hits = store.find_near_fingerprint("simhash", 0, 4, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, clip.id);
+        assert!(
+            store
+                .find_near_fingerprint("simhash", 0, 4, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_embeddings_are_lazy_and_rerank_candidates() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_clip("rust sqlite clipboard search"))
+            .unwrap();
+        store
+            .insert(&make_clip("banana tropical fruit recipe"))
+            .unwrap();
+        assert_eq!(store.backfill_embeddings(10).unwrap(), 2);
+        assert_eq!(store.backfill_embeddings(10).unwrap(), 0);
+
+        let hits = store.local_similarity_search("rust clipboard", 1).unwrap();
+        assert_eq!(hits[0].primary_text(), Some("rust sqlite clipboard search"));
+        assert_eq!(
+            store
+                .local_similarity_search("rust clipboard", usize::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fts_maintenance_runs_only_after_dirty_threshold() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("dirty index")).unwrap();
+        assert!(store.maintain_search_index(1).unwrap());
+        assert!(!store.maintain_search_index(1).unwrap());
+    }
+
+    #[test]
+    fn keyset_session_pages_without_duplicates_across_pinned_boundary() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let clip = make_clip(&format!("pageable {index}"));
+            ids.push(store.insert(&clip).unwrap());
+        }
+        store.set_pinned(ids[0], true).unwrap();
+
+        let mut session = SearchSession::new("pageable");
+        let mut seen = Vec::new();
+        loop {
+            let page = session.next_page(&store, 2).unwrap();
+            seen.extend(page.clips.into_iter().map(|clip| clip.id));
+            if page.next_cursor.is_none() {
+                break;
+            }
+        }
+        seen.sort_by_key(ClipId::to_string_repr);
+        seen.dedup();
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn rolling_audit_repairs_unique_hash_mismatch() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("repair my hash");
+        store.insert(&clip).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET content_hash = ?1 WHERE id = ?2",
+                params![[99_u8; 32].as_slice(), clip.id.to_string_repr()],
+            )
+            .unwrap();
+
+        let report = store.audit_content_hashes(10).unwrap();
+        assert_eq!(report.repaired, 1);
+        assert_eq!(store.list(1).unwrap()[0].content_hash, clip.content_hash);
+    }
+
+    #[test]
+    fn rolling_audit_quarantines_a_hash_collision_row() {
+        let store = Store::open_in_memory().unwrap();
+        let canonical = make_clip("canonical bytes");
+        let corrupted = make_clip("different bytes");
+        store.insert(&canonical).unwrap();
+        store.insert(&corrupted).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET flavors = ?1 WHERE id = ?2",
+                params![
+                    serde_clip::flavors_to_json(&canonical.flavors).unwrap(),
+                    corrupted.id.to_string_repr(),
+                ],
+            )
+            .unwrap();
+
+        let report = store.audit_content_hashes(10).unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(store.count().unwrap(), 1);
+        let (quarantined, record): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), MIN(row_json) FROM quarantined_clips",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["id"], corrupted.id.to_string_repr());
+        assert!(record.get("flavors").is_none());
+        assert!(record.get("content_hash").is_none());
+    }
+
+    #[test]
+    fn capture_metrics_saturate_at_sqlite_integer_max() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO capture_metrics(metric, count) VALUES ('captured', ?1)",
+                [i64::MAX - 1],
+            )
+            .unwrap();
+
+        store
+            .record_capture_outcome(CaptureOutcome::Captured, 10)
+            .unwrap();
+
+        assert_eq!(
+            store.capture_metrics().unwrap()["captured"],
+            i64::MAX as u64
+        );
     }
 }
