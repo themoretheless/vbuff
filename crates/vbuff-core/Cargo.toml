@@ -11,6 +11,9 @@ blake3.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 url.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 ulid.workspace = true

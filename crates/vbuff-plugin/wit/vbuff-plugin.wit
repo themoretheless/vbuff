@@ -1,0 +1,46 @@
+package vbuff:plugin@0.1.0;
+
+interface host {
+  enum capability {
+    read-clip-content,
+    write-derived-clip,
+    subscribe-events,
+    network,
+    file-read,
+    file-write,
+    process-spawn,
+  }
+
+  check-capability: func(requested: capability) -> bool;
+  check-network-host: func(host: string) -> bool;
+  check-file-path: func(path: string, write: bool) -> bool;
+  check-process-command: func(command: string) -> bool;
+}
+
+interface transforms {
+  enum value-kind {
+    text,
+    url,
+    json,
+    bytes,
+  }
+
+  record value {
+    kind: value-kind,
+    mime: string,
+    bytes: list<u8>,
+  }
+
+  variant transform-error {
+    invalid-input(string),
+    denied(string),
+    failed(string),
+  }
+
+  transform: func(input: value) -> result<value, transform-error>;
+}
+
+world plugin {
+  import host;
+  export transforms;
+}

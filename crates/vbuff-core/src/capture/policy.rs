@@ -4,6 +4,8 @@ use regex::Regex;
 use url::Url;
 use vbuff_types::{CaptureProvenance, Flavor};
 
+use crate::secret::detect_secrets;
+
 /// Clipboard source being evaluated by the capture gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SelectionSource {
@@ -201,6 +203,8 @@ pub struct CapturePolicy {
     pub excluded_apps: Vec<String>,
     pub rules: Vec<CaptureRule>,
     pub otp_ttl: Duration,
+    pub detect_secrets: bool,
+    pub secret_ttl: Duration,
 }
 
 impl Default for CapturePolicy {
@@ -210,6 +214,8 @@ impl Default for CapturePolicy {
             excluded_apps: Vec::new(),
             rules: Vec::new(),
             otp_ttl: Duration::from_secs(90),
+            detect_secrets: true,
+            secret_ttl: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -253,17 +259,53 @@ impl CapturePolicy {
             return CaptureDecision::Skip(DropReason::SourceRule);
         }
 
-        let text = input.flavors.iter().find_map(Flavor::as_text);
-        if self.skip_whitespace_only && text.is_some_and(|value| value.trim().is_empty()) {
+        let has_non_text = input
+            .flavors
+            .iter()
+            .any(|flavor| flavor.is_realized() && !flavor.is_text());
+        let has_text = input
+            .flavors
+            .iter()
+            .any(|flavor| flavor.is_realized() && flavor.as_text().is_some());
+        let all_text_whitespace = input
+            .flavors
+            .iter()
+            .filter(|flavor| flavor.is_realized())
+            .filter_map(Flavor::as_text)
+            .all(|value| value.trim().is_empty());
+        if self.skip_whitespace_only && has_text && !has_non_text && all_text_whitespace {
             return CaptureDecision::Skip(DropReason::WhitespaceOnly);
         }
 
-        let otp = text.is_some_and(is_probable_otp);
+        let otp = input
+            .flavors
+            .iter()
+            .filter(|flavor| flavor.is_realized())
+            .filter_map(Flavor::as_text)
+            .any(is_probable_otp);
+        let secret = self.detect_secrets
+            && input
+                .flavors
+                .iter()
+                .filter(|flavor| flavor.is_realized())
+                .filter_map(Flavor::as_text)
+                .any(|value| {
+                    detect_secrets(value)
+                        .iter()
+                        .any(|finding| finding.confidence >= 0.9)
+                });
+        let forced_sensitive = action == CaptureAction::CaptureSensitive;
         CaptureDecision::Capture {
             action,
-            sensitive: otp || action == CaptureAction::CaptureSensitive,
-            sync_eligible: !otp && action != CaptureAction::CaptureSensitive,
-            expires_after: otp.then_some(self.otp_ttl),
+            sensitive: otp || secret || forced_sensitive,
+            sync_eligible: !otp && !secret && !forced_sensitive,
+            expires_after: if otp {
+                Some(self.otp_ttl)
+            } else if secret {
+                Some(self.secret_ttl)
+            } else {
+                None
+            },
         }
     }
 }
@@ -314,6 +356,53 @@ mod tests {
                 expires_after: Some(Duration::from_secs(90)),
             }
         );
+    }
+
+    #[test]
+    fn structural_secret_is_ephemeral_sensitive_and_never_synced() {
+        let flavors = [Flavor::inline(
+            "text/plain",
+            b"ghp_abcdefghijklmnopqrstuvwxyz123456".to_vec(),
+        )];
+        let provenance = CaptureProvenance::default();
+        assert_eq!(
+            CapturePolicy::default().decide(input(&flavors, &provenance)),
+            CaptureDecision::Capture {
+                action: CaptureAction::Capture,
+                sensitive: true,
+                sync_eligible: false,
+                expires_after: Some(Duration::from_secs(10 * 60)),
+            }
+        );
+    }
+
+    #[test]
+    fn every_text_flavor_is_scanned_and_non_text_prevents_whitespace_drop() {
+        let provenance = CaptureProvenance::default();
+        let secret_second = [
+            Flavor::inline("text/plain", b"ordinary".to_vec()),
+            Flavor::inline(
+                "text/x-token",
+                b"ghp_abcdefghijklmnopqrstuvwxyz123456".to_vec(),
+            ),
+        ];
+        assert!(matches!(
+            CapturePolicy::default().decide(input(&secret_second, &provenance)),
+            CaptureDecision::Capture {
+                sensitive: true,
+                sync_eligible: false,
+                ..
+            }
+        ));
+
+        let image_with_empty_text = [
+            Flavor::inline("text/plain", b"  ".to_vec()),
+            Flavor::inline("image/png", vec![1, 2, 3]),
+        ];
+        assert!(matches!(
+            CapturePolicy::default().decide(input(&image_with_empty_text, &provenance)),
+            CaptureDecision::Capture { .. }
+        ));
     }
 
     #[test]

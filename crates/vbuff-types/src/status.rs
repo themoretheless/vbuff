@@ -62,6 +62,36 @@ pub struct CaptureSessionStats {
     pub lost: u64,
 }
 
+/// Coarse security state suitable for compact UI and IPC surfaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityPostureLevel {
+    Protected,
+    #[default]
+    Partial,
+    Blocked,
+}
+
+impl SecurityPostureLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Protected => "Security protected",
+            Self::Partial => "Security partial",
+            Self::Blocked => "Security blocked",
+        }
+    }
+}
+
+/// Content-free summary derived from the platform's detailed capability report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityPostureSummary {
+    pub level: SecurityPostureLevel,
+    pub active: u16,
+    pub degraded: u16,
+    pub unavailable: u16,
+    pub strict_mode: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +119,19 @@ mod tests {
             serde_json::from_str::<CommandNotice>(&notice_json).unwrap(),
             notice
         );
+
+        let posture = SecurityPostureSummary {
+            level: SecurityPostureLevel::Blocked,
+            active: 2,
+            degraded: 1,
+            unavailable: 3,
+            strict_mode: true,
+        };
+        let posture_json = serde_json::to_string(&posture).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SecurityPostureSummary>(&posture_json).unwrap(),
+            posture
+        );
+        assert_eq!(posture.level.label(), "Security blocked");
     }
 }

@@ -25,6 +25,10 @@ pub enum StoreError {
     #[error("corrupt store row: {0}")]
     Corrupt(String),
 
+    /// A transactional mutation referred to a clip that does not exist.
+    #[error("clip not found: {0}")]
+    ClipNotFound(String),
+
     /// A migration preflight, verification, or rollback failed.
     #[error("migration error: {0}")]
     Migration(String),

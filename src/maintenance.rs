@@ -4,22 +4,39 @@ use std::time::Duration;
 
 use vbuff_core::capture::{BudgetObservation, SubsystemBudget};
 
+use crate::config::Config;
 use crate::diagnostics::Diagnostics;
 use crate::history::History;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-pub(crate) fn spawn(history: History, diagnostics: Diagnostics) -> std::thread::JoinHandle<()> {
+pub(crate) fn spawn(
+    history: History,
+    diagnostics: Diagnostics,
+    config: Config,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut interval = MAINTENANCE_INTERVAL;
+        let mut published_hot_limit = usize::MAX;
         let mut budget =
             SubsystemBudget::new(Duration::from_secs(15 * 60), Duration::from_secs(2), 15);
         loop {
             std::thread::sleep(interval);
+            let memory = crate::memory_pressure::response(&config);
+            if memory.hot_history_limit != published_hot_limit
+                && history
+                    .refresh_for_memory(memory.hot_history_limit)
+                    .unwrap_or(false)
+            {
+                published_hot_limit = memory.hot_history_limit;
+            }
             let cpu_started = cpu_time::ThreadTime::now();
             let wall_started = std::time::Instant::now();
-            let result = history.maintain_idle();
+            let result = history.maintain_idle(
+                !memory.defer_background_work,
+                Duration::from_secs(config.secret_ttl_seconds.max(1)),
+            );
             diagnostics.latency("store_maintenance", wall_started.elapsed());
             let observation = budget.record(std::time::Instant::now(), cpu_started.elapsed(), 1);
             if observation == BudgetObservation::WithinBudget {
@@ -42,6 +59,7 @@ pub(crate) fn spawn(history: History, diagnostics: Diagnostics) -> std::thread::
                         || summary.embeddings > 0
                         || summary.repaired > 0
                         || summary.quarantined > 0
+                        || summary.reclassified_sensitive > 0
                         || summary.expired > 0
                         || summary.blobs_collected > 0 =>
                 {
@@ -51,6 +69,7 @@ pub(crate) fn spawn(history: History, diagnostics: Diagnostics) -> std::thread::
                         audited = summary.audited,
                         repaired = summary.repaired,
                         quarantined = summary.quarantined,
+                        reclassified_sensitive = summary.reclassified_sensitive,
                         expired = summary.expired,
                         blobs_collected = summary.blobs_collected,
                         fts_optimized = summary.fts_optimized,

@@ -21,6 +21,10 @@ pub enum PlatformError {
     #[error("invalid hotkey combo: {0}")]
     BadCombo(String),
 
+    /// A platform security operation was unavailable or rejected.
+    #[error("platform security error: {0}")]
+    Security(String),
+
     /// The clipboard held no readable content.
     #[error("clipboard empty")]
     Empty,

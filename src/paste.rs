@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, anyhow};
 use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::content_hash_from_flavors;
-use vbuff_platform::{ArboardClipboard, ClipboardBackend, EnigoPaste, PasteBackend};
+use vbuff_platform::{
+    ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, EnigoPaste,
+    PasteBackend,
+};
 use vbuff_types::{CaptureLineage, ClipId, Flavor};
 
 const PASTE_DELAY: Duration = Duration::from_millis(120);
@@ -80,11 +83,19 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
             .self_writes
             .lock()
             .map_err(|_| anyhow!("self-write ledger mutex poisoned"))?;
-        self.clipboard
+        let receipt = self
+            .clipboard
             .as_mut()
             .ok_or_else(|| anyhow!("clipboard writer unavailable"))?
-            .write_tagged(flavors, &lineage)
+            .write_tagged_with_retention(
+                flavors,
+                &lineage,
+                ClipboardRetention::ExcludeFromSystemHistory,
+            )
             .context("writing selected clip to clipboard")?;
+        if receipt == ClipboardWriteReceipt::RetentionHintUnsupported {
+            tracing::debug!("OS clipboard-history exclusion hint is unavailable");
+        }
         ledger.register(hash, nonce, Instant::now());
         Ok(())
     }

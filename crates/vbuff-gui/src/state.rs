@@ -3,7 +3,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vbuff_types::{CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel};
+use vbuff_types::{
+    CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel,
+    SecurityPostureSummary,
+};
 
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
 /// background capture thread can push new clips while the GUI reads them.
@@ -17,6 +20,8 @@ pub struct AppState {
     pub capture_health: CaptureHealth,
     /// Content-free accounting for this resident-process session.
     pub capture_stats: CaptureSessionStats,
+    /// Capability-honest security state derived by the platform layer.
+    pub security_posture: SecurityPostureSummary,
     /// A recent privacy skip may be explicitly re-read from the live clipboard.
     pub recoverable_skip_until: Option<Instant>,
     /// Latest redacted command result, dismissible from the popup.
@@ -132,6 +137,10 @@ mod tests {
         let state = AppState::with_clips(Vec::new());
 
         assert_eq!(state.capture_health, CaptureHealth::Starting);
+        assert_eq!(
+            state.security_posture.level,
+            vbuff_types::SecurityPostureLevel::Partial
+        );
         assert!(state.notice.is_none());
         assert!(!state.paused);
     }

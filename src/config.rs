@@ -27,6 +27,22 @@ pub struct Config {
     pub source_rules: Vec<SourceRuleConfig>,
     /// Skip capturing empty/whitespace-only text copies.
     pub skip_whitespace_only: bool,
+    /// Classify well-known credentials and tokens as short-lived sensitive clips.
+    pub detect_secrets: bool,
+    /// Retention window for structurally detected secrets.
+    pub secret_ttl_seconds: u64,
+    /// Full-payload threshold after which capture sheds to a text preview.
+    pub capture_soft_limit_bytes: usize,
+    /// Absolute per-capture admission cap.
+    pub capture_hard_limit_bytes: usize,
+    /// Maximum bytes retained by a shed text preview.
+    pub capture_preview_bytes: usize,
+    /// Resident-memory level that defers background indexing.
+    pub memory_soft_limit_mb: usize,
+    /// Resident-memory level that aggressively restricts large captures.
+    pub memory_hard_limit_mb: usize,
+    /// Refuse capture while any required security capability is unavailable.
+    pub strict_security_mode: bool,
     /// Register vbuff to launch when the user logs in.
     pub launch_at_login: bool,
 }
@@ -41,6 +57,14 @@ impl Default for Config {
             excluded_apps: Vec::new(),
             source_rules: Vec::new(),
             skip_whitespace_only: true,
+            detect_secrets: true,
+            secret_ttl_seconds: 10 * 60,
+            capture_soft_limit_bytes: 16 * 1024 * 1024,
+            capture_hard_limit_bytes: 128 * 1024 * 1024,
+            capture_preview_bytes: 256 * 1024,
+            memory_soft_limit_mb: 512,
+            memory_hard_limit_mb: 1_024,
+            strict_security_mode: false,
             launch_at_login: false,
         }
     }
@@ -91,6 +115,16 @@ impl Config {
             let cfg = Config::default();
             cfg.save()?;
             Ok(cfg)
+        }
+    }
+
+    /// Load existing policy for read-only diagnostics without creating a file.
+    pub fn load_for_inspection() -> anyhow::Result<Config> {
+        let path = config_path()?;
+        if path.exists() {
+            Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+        } else {
+            Ok(Config::default())
         }
     }
 

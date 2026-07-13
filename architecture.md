@@ -1,6 +1,6 @@
 # vbuff - Architecture & System Design
 
-vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v4 search/CAS/migration hardening, and a tested sync-protocol foundation, but still uses `arboard`, stores the SQLite database without SQLCipher, and has no live sync transport. Current-versus-target status is tracked in [the batch 001-050 ledger](docs/implementation-batch-001-050.md).
+vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v4 search/CAS/migration hardening, tiered capture recovery, byte/RSS pressure policy, secret clawback, doctor/strict posture, and tested sync/IPC/plugin foundations, but still uses `arboard`, stores the SQLite database without SQLCipher, and has no live sync transport or plugin runtime. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md) and [batch 051-100](docs/implementation-batch-051-100.md) ledgers.
 
 ---
 
@@ -182,6 +182,7 @@ vbuff/
 │   ├── vbuff-daemon/          # wires watcher↔store↔core↔sync↔IPC; owns background threads/runtime.
 │   ├── vbuff-gui/             # eframe app: popup + settings viewports. Depends on core+store+platform.
 │   ├── vbuff-ipc/             # framed protocol (serde) over UDS/named-pipe; client + server.
+│   ├── vbuff-plugin/          # WIT, manifests, typed transforms, adapters, recognizers, signed bundles.
 │   ├── vbuff-sync/            # mDNS discovery, Noise/TLS transport, pairing, replication (LAN P2P).
 │   └── vbuff-cli/             # `vbuff` verbs; pure IPC client. shell completions, --json.
 └── src/main.rs                # the single binary: role dispatch (daemon vs forward vs cli verb).
@@ -206,9 +207,13 @@ The crate tree above is the target workspace. Inside the **current single-proces
 | `src/config.rs` | TOML configuration and defaults |
 | `src/heartbeat.rs` | Atomic external liveness publication for supervisors |
 | `src/maintenance.rs` | Capture-friendly expiry, embeddings, audit, FTS, and CAS maintenance |
+| `src/doctor.rs` | Content-free human/JSON startup, store, and security health report |
+| `src/memory_pressure.rs` | RSS classification and maintenance/capture pressure response |
 | `src/runtime_metrics.rs` | Bounded content-free metrics and crash snapshots |
 | `src/logging.rs` | Structured tracing formatter with field-name redaction |
 | `crates/vbuff-sync/` | Protocol/crypto foundation only; no discovery or runtime transport yet |
+| `crates/vbuff-ipc/` | Versioned/scoped control contracts only; no daemon listener/dispatcher yet |
+| `crates/vbuff-plugin/` | Capability/typed-plugin contracts only; no Wasmtime component host yet |
 
 ### SOLID/DRY decomposition and small reading slices
 
@@ -217,9 +222,9 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | Slice | Owns | Does not own | First files to read |
 |---|---|---|---|
 | **Types** | Serializable clip data, flavor bodies, ids, content-kind labels, runtime status/notice contracts, minimal startup intents/responses | SQL, UI state, OS calls, business rules | `crates/vbuff-types/src/lib.rs`, `status.rs`, `ipc.rs` |
-| **Core** | Pure dedup, classification, search ranking, eviction, capture policy, coalescing, integrity, ledgers, scheduling, facets, and fingerprints | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs`, then `capture/` |
-| **Store** | SQLite schema, migrations, transactions, FTS/facets/fingerprints, CAS, audits, and durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs`, then `search.rs`, `migration.rs`, `cas.rs` |
-| **Platform** | Clipboard, hotkey, paste, tray capabilities behind traits | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs` |
+| **Core** | Pure dedup, classification, search ranking, eviction, capture policy, coalescing, integrity, backpressure, supervision, secret detection, history tiers, and security-audit algorithms | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs`, then `capture/`, `reliability.rs`, `secret.rs` |
+| **Store** | SQLite schema, migrations, transactions, FTS/facets/fingerprints, CAS, audits, clawback, doctor facts, and durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs`, then `search.rs`, `migration.rs`, `cas.rs` |
+| **Platform** | Clipboard/hotkey/paste traits plus capability, security, lifecycle, Wayland/Windows decision contracts | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs`, then `capabilities.rs`, `security.rs`, `lifecycle.rs` |
 | **GUI state** | Query text, selection, view visibility, queued UI actions | Clipboard reads/writes, DB mutations | `crates/vbuff-gui/src/state.rs` |
 | **GUI view** | Search box, rows, badges, thumbnails, keyboard navigation | Capture loop, retention, config parsing | `crates/vbuff-gui/src/app.rs`, `view.rs` |
 | **History facade** | Serialize store mutations and publish bounded GUI snapshots | SQL schema, capture decisions, widget layout | `src/history.rs` |
@@ -227,8 +232,10 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | **Paste coordinator** | Write selected flavors before scheduling delayed paste injection | Searching, storage schema, row rendering | `src/paste.rs` |
 | **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, autostart, and `Quit` semantics | UI widget styling, OS-specific event delivery | `src/commands.rs`, dispatched by `src/app.rs` |
 | **Startup handoff** | One resident process, length-prefixed startup intents, liveness probes, stale endpoint recovery | Clipboard history verbs, CLI API, GUI rendering | `crates/vbuff-types/src/ipc.rs`, `src/single_instance/mod.rs`, then one transport file |
-| **Diagnostics** | Typed `CaptureHealth`, heartbeat/stalled detection, redacted command notices, popup/tray status; target adds capability badges and doctor checks | Clip payload storage, transform behavior | `crates/vbuff-types/src/status.rs`, `src/diagnostics.rs`, `src/capture.rs`, `src/app.rs`, `src/tray.rs` |
-| **Sync foundation** | CRDT/HLC merge rules, key wrapping, sealed envelopes, membership, policy/lanes, Merkle reconciliation, recovery, receipts, capabilities, and wire padding | Network discovery, sockets, pairing screens, runtime replication | `crates/vbuff-sync/src/lib.rs`, then one concern module at a time |
+| **Diagnostics** | Typed `CaptureHealth`, security summary, heartbeat/stalled detection, redacted notices, popup/tray status, and doctor report | Clip payload storage, transform behavior | `crates/vbuff-types/src/status.rs`, `src/diagnostics.rs`, `src/doctor.rs`, `src/capture.rs`, `src/app.rs`, `src/tray.rs` |
+| **IPC foundation** | Version/capability negotiation, event filters, dry-run, scoped tokens, and bounded batch contracts | Socket ownership, authentication transport, command execution | `crates/vbuff-ipc/src/lib.rs`, then one concern module at a time |
+| **Plugin foundation** | WIT identity, manifests/grants, typed pipelines, adapters, recognizers, signed bundles, and lockfile | Wasmtime execution, ambient OS access, installation UI | `crates/vbuff-plugin/src/lib.rs`, then one concern module at a time |
+| **Sync foundation** | CRDT/HLC merge rules, key wrapping, per-collection vault keys, sealed envelopes, membership, policy/lanes, Merkle reconciliation, recovery, receipts, capabilities, and wire padding | Network discovery, sockets, pairing screens, runtime replication | `crates/vbuff-sync/src/lib.rs`, then one concern module at a time |
 
 SOLID rules for future edits:
 
@@ -252,7 +259,9 @@ Current extraction status:
 9. **Done:** schema v4 owns FTS5 prose/code indexes, structured facets, SimHash/dHash, keyset search, Bloom-assisted dedup, transactional refcounted CAS, verified migration preflight/rollback, expiry, and rolling content audits whose quarantine records never retain flavor bytes.
 10. **Done:** hotkey, tray, and second-instance events wake egui directly; a five-second supervisory repaint replaces the former 100 ms resident poll, while the visible popup uses a one-second refresh for expiry and capture state instead of repainting every frame.
 11. **Foundation:** `vbuff-sync` now has tested protocol/crypto building blocks, while transport, persistence, pairing UI, and runtime integration remain M9 work.
-12. **Next:** give native backends generation/provenance/concealed/all-flavor capture plus re-subscribe/restart hooks, replace the Windows bootstrap fallback with the canonical named pipe, and move stable contracts into `vbuff-daemon`/`vbuff-ipc` at M7.
+12. **Done:** tiered capture supervision, byte-aware backpressure, RSS-aware maintenance, secret detection/clawback, doctor output, process hardening, strict posture, FTS health, and atomic store batches are active in the current root runtime.
+13. **Foundation:** `vbuff-ipc` and `vbuff-plugin` own tested bounded contracts, but no daemon listener, local HTTP server, Wasmtime host, or third-party plugin execution is enabled.
+14. **Next:** give native backends generation/provenance/concealed/all-flavor capture plus in-place hook re-subscribe, replace the Windows bootstrap fallback with the canonical named pipe, and move stable contracts into `vbuff-daemon` at M7.
 
 The current startup transport is deliberately smaller than the target IPC service. macOS/Linux use an owner-only Unix domain socket; Windows uses authenticated loopback plus owner-local metadata until the named-pipe backend lands. Both carry only `ShowPopup` and `Ping`, use bounded length-prefixed JSON frames, and keep clipboard data outside the bootstrap channel.
 
@@ -1112,6 +1121,7 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [plan.md](plan.md) - phased implementation plan
 - [recommendation.md](recommendation.md) - prioritized product & engineering recommendations
 - [docs/implementation-batch-001-050.md](docs/implementation-batch-001-050.md) - execution status and review evidence for engineering backlog items 1-50
+- [docs/implementation-batch-051-100.md](docs/implementation-batch-051-100.md) - execution status and review evidence for engineering backlog items 51-100
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - user-facing, sync, integration, and operations ideas 198-300
@@ -1131,7 +1141,7 @@ The numbered backlog remains the canonical statement of intent; implementation s
 | Range | Execution state | Canonical evidence |
 |---|---|---|
 | 1-50 | First implementation/review batch complete at the runtime, foundation, adapted, or explicit native-required level | [Batch 001-050 ledger](docs/implementation-batch-001-050.md) |
-| 51-100 | Next engineering batch | Items below in this file |
+| 51-100 | Second implementation/review batch complete with native and runtime dependencies kept explicit | [Batch 051-100 ledger](docs/implementation-batch-051-100.md) |
 | 101-600 | Queued in groups of 50 | Shared range map below |
 
 The architectural cut line is strict: a pure algorithm can be complete as a foundation without being a shipped feature. In particular, native provenance/generation/realization work is not complete through `arboard`, and sync is not a user feature until authenticated transport, persistence, pairing UX, and replication are wired.

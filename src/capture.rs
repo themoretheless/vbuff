@@ -13,8 +13,14 @@ use vbuff_core::capture::{
     annotate_integrity, prune_redundant_flavors, verify_integrity,
 };
 use vbuff_core::observability::RedactedClipFields;
+use vbuff_core::reliability::{
+    Admission, ByteBackpressure, CaptureForensicEvent, CaptureForensicRing, CaptureSupervisor,
+    RecoveryAction, SupervisorObservation, shed_to_text_preview,
+};
 use vbuff_core::{content_hash_from_flavors, detect_kind};
-use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardSelection};
+use vbuff_platform::{
+    ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
+};
 use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta};
 
 use crate::config::{Config, SourceRuleAction};
@@ -23,6 +29,14 @@ use crate::history::History;
 
 const MIN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
 const SKIP_RECOVERY_WINDOW_MS: u64 = 30_000;
+const MAX_CONSECUTIVE_READ_FAILURES: u8 = 5;
+const SHED_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerExit {
+    BackendUnavailable,
+    RepeatedReadFailure,
+}
 
 /// Keeps storage failures dominant until a later write proves recovery.
 #[derive(Default)]
@@ -95,14 +109,60 @@ pub(crate) fn spawn(
     );
 
     std::thread::spawn(move || {
-        let panic_diagnostics = diagnostics.clone();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            run_worker(history, diagnostics, paused, config, heartbeat, self_writes)
-        }));
-        running.store(false, Ordering::Release);
-        if result.is_err() {
-            panic_diagnostics.capture_health(CaptureHealth::Stalled);
-            tracing::error!("capture worker panicked; watchdog marked it stalled");
+        let supervisor = Arc::new(Mutex::new(CaptureSupervisor::default()));
+        loop {
+            let result = catch_unwind(AssertUnwindSafe({
+                let history = history.clone();
+                let diagnostics = diagnostics.clone();
+                let paused = Arc::clone(&paused);
+                let config = config.clone();
+                let heartbeat = Arc::clone(&heartbeat);
+                let self_writes = Arc::clone(&self_writes);
+                let supervisor = Arc::clone(&supervisor);
+                move || {
+                    run_worker(
+                        history,
+                        diagnostics,
+                        paused,
+                        config,
+                        heartbeat,
+                        self_writes,
+                        supervisor,
+                    )
+                }
+            }));
+            let observation = match result {
+                Ok(WorkerExit::BackendUnavailable | WorkerExit::RepeatedReadFailure) => {
+                    SupervisorObservation::SubscriptionLost
+                }
+                Err(_) => {
+                    tracing::error!("capture worker panicked; supervisor will restart it");
+                    SupervisorObservation::BackendFailed
+                }
+            };
+            let action = supervisor
+                .lock()
+                .map(|mut supervisor| supervisor.observe(observation))
+                .unwrap_or(RecoveryAction::EnterDegradedMode {
+                    retry_after: Duration::from_secs(30),
+                });
+            let delay = match action {
+                RecoveryAction::None => Duration::ZERO,
+                RecoveryAction::Resubscribe => {
+                    diagnostics.capture_health(CaptureHealth::ClipboardReadError);
+                    Duration::from_millis(250)
+                }
+                RecoveryAction::RestartBackend => {
+                    diagnostics.capture_health(CaptureHealth::Stalled);
+                    Duration::from_secs(1)
+                }
+                RecoveryAction::EnterDegradedMode { retry_after } => {
+                    diagnostics.capture_health(CaptureHealth::ClipboardUnavailable);
+                    retry_after
+                }
+            };
+            tracing::warn!(?action, ?delay, "capture backend recovery scheduled");
+            sleep_with_heartbeat(delay, &heartbeat);
         }
     })
 }
@@ -114,14 +174,15 @@ fn run_worker(
     config: Config,
     heartbeat: Arc<Heartbeat>,
     self_writes: Arc<Mutex<SelfWriteLedger>>,
-) {
+    supervisor: Arc<Mutex<CaptureSupervisor>>,
+) -> WorkerExit {
     heartbeat.beat();
     let mut clipboard = match ArboardClipboard::new() {
         Ok(clipboard) => clipboard,
         Err(error) => {
             diagnostics.capture_health(CaptureHealth::ClipboardUnavailable);
             tracing::error!("clipboard backend unavailable: {error}");
-            return;
+            return WorkerExit::BackendUnavailable;
         }
     };
 
@@ -144,6 +205,15 @@ fn run_worker(
     let mut generation_tracker = GenerationTracker::default();
     let mut loss_ledger = CaptureLossLedger::default();
     let mut skipped = SkippedCaptureRing::new(8);
+    let mut forensic = CaptureForensicRing::new(64);
+    let mut backpressure = ByteBackpressure::new(
+        config.capture_soft_limit_bytes,
+        config.capture_hard_limit_bytes,
+        1,
+        config.capture_preview_bytes,
+    );
+    let mut consecutive_read_failures = 0_u8;
+    let mut last_shed: Option<([u8; 32], Instant)> = None;
     let budget = Arc::new(Mutex::new(SubsystemBudget::new(
         Duration::from_secs(60),
         Duration::from_millis(120),
@@ -173,6 +243,10 @@ fn run_worker(
 
         let mut captured = match clipboard.read() {
             Ok(captured) => {
+                consecutive_read_failures = 0;
+                if let Ok(mut supervisor) = supervisor.lock() {
+                    supervisor.observe(SupervisorObservation::RecoverySucceeded);
+                }
                 if let Some(health) = health_state.read_succeeded() {
                     diagnostics.capture_health(health);
                 }
@@ -183,17 +257,46 @@ fn run_worker(
                 captured
             }
             Err(error) => {
+                consecutive_read_failures = consecutive_read_failures.saturating_add(1);
                 if let Some(health) = health_state.read_failed()
                     && diagnostics.capture_health(health)
                 {
                     tracing::warn!("clipboard read failed; retrying: {error}");
                 }
                 observe_scheduler(&mut scheduler, &diagnostics, PollObservation::MissRisk);
+                if consecutive_read_failures >= MAX_CONSECUTIVE_READ_FAILURES {
+                    tracing::warn!(
+                        consecutive_read_failures,
+                        "capture backend exceeded read-failure threshold"
+                    );
+                    return WorkerExit::RepeatedReadFailure;
+                }
                 continue;
             }
         };
+        forensic.push(CaptureForensicEvent {
+            observed_at: Instant::now(),
+            generation: captured.generation.map(|generation| generation.sequence),
+            flavor_count: captured.flavors.len().min(usize::from(u16::MAX)) as u16,
+            total_bytes: captured
+                .flavors
+                .iter()
+                .map(|flavor| flavor.body.byte_size())
+                .fold(0_u64, u64::saturating_add),
+            owner_changed: !captured.coherent_generation,
+            coherent: captured.coherent_generation,
+        });
         annotate_integrity(&mut captured.flavors);
         if !verify_integrity(&captured.flavors).is_empty() {
+            if let Some(event) = forensic.entries().last() {
+                tracing::warn!(
+                    generation = event.generation,
+                    flavor_count = event.flavor_count,
+                    total_bytes = event.total_bytes,
+                    owner_changed = event.owner_changed,
+                    "content-free torn-read evidence retained"
+                );
+            }
             record_drop(
                 &history,
                 &diagnostics,
@@ -223,6 +326,10 @@ fn run_worker(
             });
 
         if last_hash == Some(observed_hash) && !explicit_recovery {
+            observe_scheduler(&mut scheduler, &diagnostics, PollObservation::Stable);
+            continue;
+        }
+        if !explicit_recovery && shed_retry_suppressed(&mut last_shed, observed_hash, observed_at) {
             observe_scheduler(&mut scheduler, &diagnostics, PollObservation::Stable);
             continue;
         }
@@ -342,6 +449,69 @@ fn run_worker(
             continue;
         }
 
+        let memory_response = crate::memory_pressure::response(&config);
+        let pressure_hard_limit = memory_response
+            .reject_large_capture_bytes
+            .unwrap_or(config.capture_hard_limit_bytes)
+            .min(config.capture_hard_limit_bytes);
+        let pressure_soft_limit = if memory_response.defer_background_work {
+            config
+                .capture_soft_limit_bytes
+                .min(pressure_hard_limit / 2)
+                .max(1)
+        } else {
+            config.capture_soft_limit_bytes
+        };
+        let _ = backpressure.update_limits(
+            pressure_soft_limit,
+            pressure_hard_limit,
+            config.capture_preview_bytes,
+        );
+        let payload_bytes = captured
+            .flavors
+            .iter()
+            .map(|flavor| flavor.body.byte_size())
+            .fold(0_u64, u64::saturating_add);
+        let payload_bytes = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
+        let admission = backpressure.admit(payload_bytes);
+        let accounted_bytes = match admission {
+            Admission::Full => payload_bytes,
+            Admission::Preview { max_bytes } => {
+                let Some(preview) = shed_to_text_preview(&captured.flavors, max_bytes) else {
+                    backpressure.release(max_bytes);
+                    last_shed = Some((observed_hash, observed_at));
+                    record_drop(
+                        &history,
+                        &diagnostics,
+                        &mut loss_ledger,
+                        DropReason::Backpressure,
+                        1,
+                    );
+                    continue;
+                };
+                captured.flavors = preview;
+                record_drop(
+                    &history,
+                    &diagnostics,
+                    &mut loss_ledger,
+                    DropReason::TruncatedFlavor,
+                    1,
+                );
+                max_bytes
+            }
+            Admission::Shed => {
+                last_shed = Some((observed_hash, observed_at));
+                record_drop(
+                    &history,
+                    &diagnostics,
+                    &mut loss_ledger,
+                    DropReason::Backpressure,
+                    1,
+                );
+                continue;
+            }
+        };
+
         let stored_hash = content_hash_from_flavors(&captured.flavors);
         let clip = build_clip(
             captured,
@@ -367,6 +537,7 @@ fn run_worker(
         diagnostics.write_queue_depth(0);
         match insert_result {
             Ok(()) => {
+                last_shed = None;
                 diagnostics.clear_skipped_recovery();
                 last_hash = Some(observed_hash);
                 loss_ledger.captured();
@@ -391,7 +562,22 @@ fn run_worker(
                 );
             }
         }
+        backpressure.release(accounted_bytes);
     }
+}
+
+fn shed_retry_suppressed(
+    last_shed: &mut Option<([u8; 32], Instant)>,
+    observed_hash: [u8; 32],
+    now: Instant,
+) -> bool {
+    let suppressed = last_shed.is_some_and(|(hash, shed_at)| {
+        hash == observed_hash && now.saturating_duration_since(shed_at) < SHED_RETRY_INTERVAL
+    });
+    if !suppressed {
+        *last_shed = None;
+    }
+    suppressed
 }
 
 struct CaptureBudgetGuard {
@@ -472,7 +658,13 @@ fn capture_self_test(
     };
     let mut state = SelfTestState::start(probe_hash);
 
-    let probe_ok = clipboard.write_tagged(&probe, &lineage).is_ok()
+    let probe_ok = clipboard
+        .write_tagged_with_retention(
+            &probe,
+            &lineage,
+            ClipboardRetention::ExcludeFromSystemHistory,
+        )
+        .is_ok()
         && clipboard.read().is_ok_and(|observed| {
             let observed_hash = content_hash_from_flavors(&observed.flavors);
             let suppressed = self_writes
@@ -499,7 +691,11 @@ fn capture_self_test(
             write_nonce: Some(restore_nonce.clone()),
         };
         let restored = clipboard
-            .write_tagged(&original.flavors, &restore_lineage)
+            .write_tagged_with_retention(
+                &original.flavors,
+                &restore_lineage,
+                ClipboardRetention::ExcludeFromSystemHistory,
+            )
             .is_ok();
         if restored {
             let restore_hash = content_hash_from_flavors(&original.flavors);
@@ -544,6 +740,8 @@ fn capture_policy(config: &Config) -> CapturePolicy {
         .collect();
     CapturePolicy {
         skip_whitespace_only: config.skip_whitespace_only,
+        detect_secrets: config.detect_secrets,
+        secret_ttl: Duration::from_secs(config.secret_ttl_seconds.max(1)),
         excluded_apps: config
             .excluded_apps
             .iter()
@@ -584,6 +782,21 @@ fn record_drop(
 fn watchdog_timeout(config: &Config) -> Duration {
     let poll_budget = Duration::from_millis(config.poll_interval_ms.max(50).saturating_mul(8));
     poll_budget.max(MIN_WATCHDOG_TIMEOUT)
+}
+
+fn sleep_with_heartbeat(delay: Duration, heartbeat: &Heartbeat) {
+    let deadline = Instant::now()
+        .checked_add(delay)
+        .unwrap_or_else(Instant::now);
+    while Instant::now() < deadline {
+        heartbeat.beat();
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(500)),
+        );
+    }
+    heartbeat.beat();
 }
 
 fn spawn_watchdog(
@@ -809,6 +1022,23 @@ mod tests {
 
         assert_eq!(watchdog_timeout(&fast), Duration::from_secs(5));
         assert_eq!(watchdog_timeout(&slow), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn repeated_shed_is_throttled_but_retried_after_the_window() {
+        let now = Instant::now();
+        let hash = [7; 32];
+        let mut last_shed = Some((hash, now));
+        assert!(shed_retry_suppressed(
+            &mut last_shed,
+            hash,
+            now + Duration::from_secs(4)
+        ));
+        assert!(!shed_retry_suppressed(
+            &mut last_shed,
+            hash,
+            now + Duration::from_secs(5)
+        ));
     }
 
     #[test]

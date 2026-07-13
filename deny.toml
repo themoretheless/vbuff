@@ -1,0 +1,48 @@
+[graph]
+all-features = true
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+unmaintained = "workspace"
+unsound = "all"
+ignore = [
+  { id = "RUSTSEC-2024-0429", reason = "tray-icon's current Linux AppIndicator backend pins gtk-rs 0.18; vbuff never calls VariantStrIter; remove when tray-icon moves to gtk-rs >=0.20" },
+  { id = "RUSTSEC-2026-0194", reason = "wayland-scanner 0.31.10 is the latest release and parses only dependency-vendored protocol XML at build time, never runtime input" },
+  { id = "RUSTSEC-2026-0195", reason = "wayland-scanner 0.31.10 is the latest release and parses only dependency-vendored protocol XML at build time, never runtime input" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+  { crate = "openssl", use-instead = "rustls" },
+  { crate = "openssl-sys", use-instead = "rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[licenses]
+confidence-threshold = 0.90
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "Unicode-3.0",
+  "Zlib",
+]

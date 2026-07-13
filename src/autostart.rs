@@ -127,7 +127,7 @@ fn linux_desktop_entry_path() -> anyhow::Result<PathBuf> {
 fn linux_desktop_entry(exe: &Path) -> String {
     let exe = desktop_exec_escape(&exe.to_string_lossy());
     format!(
-        "[Desktop Entry]\nType=Application\nName=vbuff\nComment=Private clipboard manager\nExec={exe}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=vbuff\nComment=Private clipboard manager\nExec={exe}\nTryExec={exe}\nTerminal=false\nDBusActivatable=false\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=2\n"
     )
 }
 

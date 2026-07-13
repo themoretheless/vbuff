@@ -37,6 +37,20 @@ pub enum ClipboardSelection {
     Primary,
 }
 
+/// Retention request attached to a clipboard write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipboardRetention {
+    #[default]
+    SystemDefault,
+    ExcludeFromSystemHistory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardWriteReceipt {
+    RetentionHintApplied,
+    RetentionHintUnsupported,
+}
+
 /// A coherent snapshot of one clipboard generation.
 #[derive(Clone, Debug)]
 pub struct CapturedClipboard {
@@ -91,6 +105,23 @@ pub trait ClipboardBackend: Send {
         self.write(flavors)
     }
 
+    /// Write with an OS history-retention hint. Generic backends preserve the
+    /// write but report that the hint could not be applied.
+    fn write_tagged_with_retention(
+        &mut self,
+        flavors: &[Flavor],
+        lineage: &CaptureLineage,
+        retention: ClipboardRetention,
+    ) -> Result<ClipboardWriteReceipt> {
+        self.write_tagged(flavors, lineage)?;
+        Ok(match retention {
+            ClipboardRetention::SystemDefault => ClipboardWriteReceipt::RetentionHintApplied,
+            ClipboardRetention::ExcludeFromSystemHistory => {
+                ClipboardWriteReceipt::RetentionHintUnsupported
+            }
+        })
+    }
+
     /// Clear every representation from the clipboard.
     fn clear(&mut self) -> Result<()>;
 }
@@ -111,6 +142,11 @@ pub trait HotkeyBackend: Send {
 
 /// Simulates a paste keystroke into the focused application.
 pub trait PasteBackend: Send {
+    /// Release modifiers that may still be held from the picker hotkey.
+    fn sanitize_modifiers(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Send the platform paste combo (Cmd+V on macOS, Ctrl+V elsewhere).
     fn paste(&mut self) -> Result<()>;
 }

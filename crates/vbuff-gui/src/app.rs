@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::{SearchResult, search};
-use vbuff_types::{Body, CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel};
+use vbuff_types::{
+    Body, CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel, SecurityPostureLevel,
+    SecurityPostureSummary,
+};
 
 use crate::design::{self, Icon};
 use crate::state::{SharedState, UiAction};
@@ -129,6 +132,7 @@ impl eframe::App for PopupApp {
             paused,
             capture_health,
             capture_stats,
+            security_posture,
             recoverable_skip,
             notice,
             show_requested,
@@ -144,6 +148,7 @@ impl eframe::App for PopupApp {
                 s.paused,
                 s.capture_health,
                 s.capture_stats,
+                s.security_posture,
                 s.skipped_recovery_available(std::time::Instant::now()),
                 s.notice.clone(),
                 show,
@@ -267,6 +272,8 @@ impl eframe::App for PopupApp {
 
             ui.horizontal(|ui| {
                 render_capture_status(ui, paused, capture_health);
+                ui.separator();
+                render_security_status(ui, security_posture);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!clips.is_empty(), egui::Button::new("Clear history"))
@@ -615,6 +622,27 @@ fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth)
 
     design::status_dot(ui, color);
     ui.label(RichText::new(label).small().color(color));
+}
+
+fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) {
+    let color = match posture.level {
+        SecurityPostureLevel::Protected => Color32::from_rgb(44, 156, 103),
+        SecurityPostureLevel::Partial => Color32::from_rgb(210, 144, 32),
+        SecurityPostureLevel::Blocked => Color32::from_rgb(194, 64, 72),
+    };
+    design::status_dot(ui, color);
+    ui.label(RichText::new(posture.level.label()).small().color(color))
+        .on_hover_text(format!(
+            "{} active, {} degraded, {} unavailable{}",
+            posture.active,
+            posture.degraded,
+            posture.unavailable,
+            if posture.strict_mode {
+                " · strict mode"
+            } else {
+                ""
+            }
+        ));
 }
 
 fn row_preview(clip: &Clip) -> String {

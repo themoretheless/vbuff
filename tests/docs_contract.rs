@@ -87,32 +87,42 @@ fn top_docs_share_one_dry_backlog_map() {
 }
 
 #[test]
-fn top_docs_link_the_complete_first_implementation_batch() {
-    let ledger_link = "docs/implementation-batch-001-050.md";
-    for file in TOP_DOCS {
-        assert!(
-            read(file).contains(ledger_link),
-            "{file} does not link the first implementation ledger"
-        );
-    }
+fn top_docs_link_every_complete_implementation_batch() {
+    for (ledger_link, expected) in [
+        (
+            "docs/implementation-batch-001-050.md",
+            (1..=50).collect::<Vec<_>>(),
+        ),
+        (
+            "docs/implementation-batch-051-100.md",
+            (51..=100).collect::<Vec<_>>(),
+        ),
+    ] {
+        for file in TOP_DOCS {
+            assert!(
+                read(file).contains(ledger_link),
+                "{file} does not link implementation ledger {ledger_link}"
+            );
+        }
 
-    let ledger = read(ledger_link);
-    let item_section = ledger
-        .split_once("## Item ledger")
-        .expect("batch ledger is missing its item section")
-        .1
-        .split_once("## Three review passes")
-        .expect("batch ledger is missing its review section")
-        .0;
-    let items = item_section
-        .lines()
-        .filter_map(|line| {
-            let mut columns = line.split('|');
-            let _leading = columns.next()?;
-            columns.next()?.trim().parse::<usize>().ok()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(items, (1..=50).collect::<Vec<_>>());
+        let ledger = read(ledger_link);
+        let item_section = ledger
+            .split_once("## Item ledger")
+            .expect("batch ledger is missing its item section")
+            .1
+            .split_once("## Three review passes")
+            .expect("batch ledger is missing its review section")
+            .0;
+        let items = item_section
+            .lines()
+            .filter_map(|line| {
+                let mut columns = line.split('|');
+                let _leading = columns.next()?;
+                columns.next()?.trim().parse::<usize>().ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items, expected);
+    }
 }
 
 #[test]
@@ -234,6 +244,7 @@ fn local_markdown_links_resolve() {
         "docs/ideas-501-600.md",
         "docs/repositories-research-100.md",
         "docs/implementation-batch-001-050.md",
+        "docs/implementation-batch-051-100.md",
     ];
 
     for file in docs {
