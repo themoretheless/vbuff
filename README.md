@@ -91,7 +91,7 @@ vbuff is designed around a single hard rule: **fail closed.** Every uncertainty 
 
 ## Status
 
-vbuff is in active early development. The current executable uses `arboard`, `global-hotkey`, `egui`, and `enigo` for the resident copy -> store -> popup -> paste loop. SQLite schema v4 now includes adaptive prose/code FTS5 search, indexed facets and fingerprints, keyset sessions, transactional CAS refcounts, sharded blob spill, verified migration preflight/rollback, expiry, and rolling content audits. Capture adds adaptive cadence, startup self-test, source-policy contracts, generation/loss accounting, watchdogs, resource budgets, redacted metrics, and an external heartbeat. A new `vbuff-sync` crate contains tested CRDT, HLC, key-wrap, sealed-envelope, membership, policy, Merkle, recovery, receipt, capability, and padding foundations, but no discovery, authenticated network transport, pairing UI, or runtime replication. Native all-flavor backends, SQLCipher, full per-OS parity, daemon/IPC extraction, CLI, and live sync remain target work.
+vbuff is in active early development. The current executable uses `arboard`, `global-hotkey`, `egui`, and `enigo` for the resident copy -> store -> popup -> paste loop. SQLite schema v4 now includes adaptive prose/code FTS5 search, indexed facets and fingerprints, keyset sessions, transactional CAS refcounts, sharded blob spill, verified migration preflight/rollback, expiry, secret clawback, FTS health, and atomic batches. Capture adds adaptive cadence, startup self-test, tiered restart supervision, byte-aware backpressure, structural secret detection, memory-pressure response, content-free race forensics, resource budgets, redacted metrics, and an external heartbeat. `vbuff doctor --json`, process dump hardening, strict fail-closed capture, and a compact live security-posture indicator are active. `vbuff-ipc`, `vbuff-plugin`, and `vbuff-sync` contain tested protocol/plugin/crypto foundations, but no full daemon service, WASM runtime, discovery, authenticated network transport, pairing UI, or runtime replication. Native all-flavor backends, SQLCipher, full per-OS parity, daemon extraction, CLI, and live sync remain target work.
 
 ---
 
@@ -108,7 +108,8 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | `vbuff-gui` | Current `eframe` popup; target adds deeper settings viewports, richer badges, accessibility depth | Yes (partial) |
 | *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, paste timing, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
-| `vbuff-ipc` | Full framed control protocol over Unix socket / Windows named pipe; the root app currently carries only `ShowPopup`/`Ping` bootstrap framing | Later |
+| `vbuff-ipc` | Tested version/capability handshake, filtered events, dry-run, scoped token, and atomic-batch contracts; no live daemon dispatch yet | Foundation only |
+| `vbuff-plugin` | Tested WIT identity, manifest/consent, typed transform, adapter/recognizer, and signed-bundle contracts; no Wasmtime host yet | Foundation only |
 | `vbuff-sync` | Current protocol/crypto foundation; target adds mDNS, authenticated transport, pairing UX, persistence, and replication | Foundation only |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
@@ -132,6 +133,9 @@ The repo is intentionally split so you can understand it without loading the who
 10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
 11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). It is intentionally not linked into the resident runtime yet.
 12. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `app.rs` owns event-driven hotkey/tray/second-instance wakeups; `main.rs` only constructs and starts focused services. A duplicate launch forwards `ShowPopup` to the running instance.
+13. **Reliability and security policy:** read `crates/vbuff-core/src/reliability.rs`, `secret.rs`, and `security_audit.rs`; then read `src/memory_pressure.rs`, `src/maintenance.rs`, and `src/doctor.rs` for the runtime adapters.
+14. **Capability and lifecycle contracts:** read `crates/vbuff-platform/src/capabilities.rs`, `security.rs`, `lifecycle.rs`, `wayland.rs`, and `windows.rs`. These files describe honest fallback decisions; they are not native backend implementations.
+15. **IPC and plugin foundations:** read `crates/vbuff-ipc/src/lib.rs` and `crates/vbuff-plugin/src/lib.rs`, then one module at a time. Neither crate is connected to an ambient network listener or plugin runtime.
 
 The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, single-instance transport stays isolated, and `main.rs` only composes the pieces.
 
@@ -139,7 +143,7 @@ The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contract
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
 
-The current design baseline is implemented rather than aspirational: one token module controls stable popup and row dimensions; familiar row actions are icon buttons with labels/tooltips; empty/search-empty states are distinct; and delete/clear require explicit confirmation. Popup and tray share one typed capture-health state and vocabulary, while content-free notices report command outcomes. The popup masks sensitive content, distinguishes incomplete, local-only, and expiring clips, keeps large saved/skipped/lost totals compact, bounds thumbnail decoding, and offers a time-bounded deliberate recovery when the current clipboard was skipped by privacy policy. Hotkey, tray, and second-instance events wake the UI directly instead of forcing a 100 ms idle poll; a visible popup refreshes at one hertz rather than every frame.
+The current design baseline is implemented rather than aspirational: one token module controls stable popup and row dimensions; familiar row actions are icon buttons with labels/tooltips; empty/search-empty states are distinct; and delete/clear require explicit confirmation. Popup and tray share one typed capture-health state and vocabulary, while content-free notices report command outcomes. The popup masks sensitive content, distinguishes incomplete, local-only, and expiring clips, keeps large saved/skipped/lost totals compact, bounds thumbnail decoding, offers a time-bounded deliberate recovery when the current clipboard was skipped by privacy policy, and shows protected/partial/blocked security posture without adding another panel. Hotkey, tray, and second-instance events wake the UI directly instead of forcing a 100 ms idle poll; a visible popup refreshes at one hertz rather than every frame.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
@@ -156,7 +160,7 @@ The 600-point review is executed in batches of 50. Each batch gets an item-by-it
 | Batch | State | Evidence |
 |---|---|---|
 | 001-050 | Implemented/reviewed at runtime or foundation level; native and transport dependencies remain explicit | [Batch 001-050 ledger](docs/implementation-batch-001-050.md) |
-| 051-100 | Next | Engineering/security backlog in [architecture.md](architecture.md) |
+| 051-100 | Implemented/reviewed at runtime, foundation, adapted, or native-required level | [Batch 051-100 ledger](docs/implementation-batch-051-100.md) |
 | 101-600 | Queued in sequential groups of 50 | Canonical range map below |
 
 "Foundation" is not a synonym for shipped: the `vbuff-sync` algorithms compile and are tested, but the app still has no live sync transport; provenance and generation contracts exist, but `arboard` cannot populate native metadata. The ledger is the source of truth for those distinctions.
@@ -233,7 +237,9 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
 8. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, toggle start-at-login, or quit.
 9. **Press Esc** (or click away) to dismiss the popup without pasting.
 
-The popup status line and the first disabled tray-menu row show whether capture is active, paused, starting, unavailable, or retrying a clipboard/history failure. Command failures and copy-only fallback appear as dismissible notices; these messages never include clipboard payloads.
+The popup status line and the first disabled tray-menu row show whether capture is active, paused, starting, unavailable, or retrying a clipboard/history failure. The same compact popup line reports whether the detected security posture is protected, partial, or blocked. Command failures and copy-only fallback appear as dismissible notices; these messages never include clipboard payloads.
+
+Run `vbuff doctor --json` for a content-free machine-readable startup, store/FTS, process-hardening, and security-capability report. Run `vbuff doctor` for the compact human-readable form; doctor does not start the resident UI or require the single-instance handoff.
 
 The hotkey is rebindable in settings, with conflict detection at bind time. The popup opens near the cursor and is clamped to the work area. Pasting back is fully keyboard-driven: open, filter, navigate, paste, all without the mouse.
 
@@ -251,9 +257,9 @@ Settings, hotkeys, exclusion lists and the per-app blacklist live in a human-edi
 | Windows | `%APPDATA%\vbuff\` | `%APPDATA%\vbuff\vbuff.db` |
 | Linux | `$XDG_CONFIG_HOME/vbuff/` (default `~/.config/vbuff/`) | `$XDG_DATA_HOME/vbuff/vbuff.db` (default `~/.local/share/vbuff/`) |
 
-The target architecture adds an encrypted database, storage-location overrides, cloud-folder warnings, and stronger path validation before broader releases.
+The target architecture adds an encrypted database, storage-location overrides, cloud-folder warnings, and stronger path validation before broader releases. The current config also exposes byte-aware capture limits, RSS soft/hard limits, structural-secret detection and TTL, and `strict_security_mode`; strict mode intentionally refuses capture while required protections such as encryption at rest remain unavailable.
 
-Set `launch_at_login = true` in the config, or use the tray/menu-bar action, to register vbuff with the current OS login startup mechanism. The current MVP writes a LaunchAgent on macOS, an XDG autostart desktop entry on Linux, or a user Run-key entry on Windows.
+Set `launch_at_login = true` in the config, or use the tray/menu-bar action, to register vbuff with the current OS login startup mechanism. The current MVP writes a LaunchAgent on macOS, a readiness-friendly XDG autostart desktop entry on Linux, or a user Run-key entry on Windows. A hardened `systemd --user` unit is also provided at `packaging/linux/vbuff.service` for package maintainers.
 
 ---
 
@@ -278,6 +284,7 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [plan.md](plan.md) - phased implementation plan and milestones.
 - [recommendation.md](recommendation.md) - prioritized product and engineering recommendations.
 - [docs/implementation-batch-001-050.md](docs/implementation-batch-001-050.md) - item-by-item implementation status, review corrections, and acceptance gate for the first batch.
+- [docs/implementation-batch-051-100.md](docs/implementation-batch-051-100.md) - reliability, security, platform-capability, IPC, and plugin implementation status for the second batch.
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape and the four-corner gap.
 - [docs/competitor-extras.md](docs/competitor-extras.md) - 122 additional/advanced competitor features and their suggested priority.
 - [docs/features-top-500.md](docs/features-top-500.md) - the 640-feature catalog with priority tiers.

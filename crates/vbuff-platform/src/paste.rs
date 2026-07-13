@@ -27,7 +27,17 @@ impl EnigoPaste {
 }
 
 impl PasteBackend for EnigoPaste {
+    fn sanitize_modifiers(&mut self) -> Result<()> {
+        for key in [Key::Meta, Key::Control, Key::Alt, Key::Shift] {
+            self.enigo
+                .key(key, Direction::Release)
+                .map_err(|error| PlatformError::Paste(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn paste(&mut self) -> Result<()> {
+        self.sanitize_modifiers()?;
         let modifier_key = match paste_modifier() {
             Modifier::Meta => Key::Meta,
             Modifier::Control => Key::Control,

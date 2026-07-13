@@ -11,12 +11,14 @@ repository = "https://github.com/vbuff/vbuff"
 
 [workspace.dependencies]
 # Internal crates
-vbuff-types = { path = "crates/vbuff-types" }
-vbuff-core = { path = "crates/vbuff-core" }
-vbuff-store = { path = "crates/vbuff-store" }
-vbuff-platform = { path = "crates/vbuff-platform" }
-vbuff-gui = { path = "crates/vbuff-gui" }
-vbuff-sync = { path = "crates/vbuff-sync" }
+vbuff-types = { path = "crates/vbuff-types", version = "0.1.0" }
+vbuff-core = { path = "crates/vbuff-core", version = "0.1.0" }
+vbuff-store = { path = "crates/vbuff-store", version = "0.1.0" }
+vbuff-platform = { path = "crates/vbuff-platform", version = "0.1.0" }
+vbuff-gui = { path = "crates/vbuff-gui", version = "0.1.0" }
+vbuff-sync = { path = "crates/vbuff-sync", version = "0.1.0" }
+vbuff-ipc = { path = "crates/vbuff-ipc", version = "0.1.0" }
+vbuff-plugin = { path = "crates/vbuff-plugin", version = "0.1.0" }
 
 # Data / serialization
 serde = { version = "1", features = ["derive"] }
@@ -68,6 +70,9 @@ base64 = "0.22"
 zstd = "0.13"
 getrandom = "0.3"
 zeroize = "1.8"
+rlimit = "0.11"
+prctl = "1.0"
+memory-stats = { version = "1.2", default-features = false, features = ["always_use_statm"] }
 
 [package]
 name = "vbuff"
@@ -112,3 +117,4 @@ atomic-write-file.workspace = true
 crossbeam-queue.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+memory-stats.workspace = true

@@ -11,17 +11,26 @@
 //! * [`PasteBackend`] - simulate a paste keystroke (`enigo`).
 //! * [`TrayBackend`] - a status-bar/tray icon (`tray-icon`, app crate).
 
+pub mod capabilities;
 mod clipboard;
 mod error;
+pub mod geometry;
 mod hotkey;
+pub mod lifecycle;
 mod paste;
+pub mod security;
 pub mod traits;
+pub mod wayland;
+pub mod windows;
 
 pub use error::PlatformError;
 pub use traits::{
-    CapturedClipboard, ClipboardBackend, ClipboardSelection, HotkeyBackend, KeyCombo, Modifier,
-    PasteBackend,
+    CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
+    ClipboardWriteReceipt, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
 };
+
+pub use capabilities::{CapabilityLevel, FeatureCapability, SecurityPosture};
+pub use security::{ProcessHardeningReport, harden_current_process};
 
 pub use clipboard::ArboardClipboard;
 pub use hotkey::{GlobalHotkeyBackend, parse_combo};

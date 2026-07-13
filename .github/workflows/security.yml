@@ -1,0 +1,45 @@
+name: Supply Chain
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 2"
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install policy tools
+        run: |
+          cargo install --locked cargo-deny --version 0.19.8
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-vet --version 0.10.2
+      - name: Dependency policy
+        run: cargo deny check --hide-inclusion-graph
+      - name: RustSec audit
+        run: cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+      - name: Review attestations
+        run: cargo vet --locked
+      - name: Build fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+
+  fuzz-smoke:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install --locked cargo-fuzz --version 0.13.2
+      - name: Smoke fuzz parsers
+        run: |
+          cargo +nightly fuzz run api_token -- -max_total_time=30
+          cargo +nightly fuzz run plugin_manifest -- -max_total_time=30
+          cargo +nightly fuzz run flavor_json -- -max_total_time=30

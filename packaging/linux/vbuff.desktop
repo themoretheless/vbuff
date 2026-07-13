@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=vbuff
+Comment=Private clipboard manager
+Exec=vbuff
+TryExec=vbuff
+Terminal=false
+DBusActivatable=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2

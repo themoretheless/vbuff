@@ -1,8 +1,10 @@
 //! OS- and transport-independent E2E sync protocol primitives.
+#![forbid(unsafe_code)]
 
 pub mod bootstrap;
 pub mod capability;
 pub mod clock;
+pub mod collection_vault;
 pub mod crdt;
 pub mod crypto;
 pub mod ledger;

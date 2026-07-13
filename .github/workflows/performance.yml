@@ -1,0 +1,23 @@
+name: Performance Budgets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 3 * * 3"
+
+permissions:
+  contents: read
+
+jobs:
+  release-budgets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+      - name: Core hot-path budget
+        run: cargo test --release -p vbuff-core --test performance_budget --locked -- --ignored
+      - name: Store budget
+        run: cargo test --release -p vbuff-store --test performance_budget --locked -- --ignored

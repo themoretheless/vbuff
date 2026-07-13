@@ -3,6 +3,7 @@
 //! This crate holds only the serializable data types shared by every other
 //! crate (core logic, storage, GUI, platform). It deliberately avoids heavy
 //! dependencies so it can be linked everywhere cheaply.
+#![forbid(unsafe_code)]
 //!
 //! The central type is [`Clip`]: one logical copy event that may carry several
 //! [`Flavor`]s (one per MIME representation). A clip is identified by a
@@ -19,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 pub use ipc::{ClientIntent, ServerResponse};
-pub use status::{CaptureHealth, CaptureSessionStats, CommandNotice, NoticeLevel};
+pub use status::{
+    CaptureHealth, CaptureSessionStats, CommandNotice, NoticeLevel, SecurityPostureLevel,
+    SecurityPostureSummary,
+};
 
 /// A ULID-based identifier for a clip.
 ///

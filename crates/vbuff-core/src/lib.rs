@@ -7,6 +7,7 @@
 //! * [`classify`] - heuristic content-kind detection.
 //! * [`filter`] - case-insensitive search + ranking (pinned first, then recency).
 //! * [`eviction`] - retention policy (cap N, never evict pinned).
+#![forbid(unsafe_code)]
 
 pub mod bloom;
 pub mod capture;
@@ -16,7 +17,11 @@ pub mod facets;
 pub mod filter;
 pub mod fingerprint;
 pub mod hash;
+pub mod history_tier;
 pub mod observability;
+pub mod reliability;
+pub mod secret;
+pub mod security_audit;
 
 pub use classify::detect_kind;
 pub use eviction::{EvictionPolicy, evict};

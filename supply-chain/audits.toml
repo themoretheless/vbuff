@@ -1,0 +1,8 @@
+
+# cargo-vet audits file
+
+[[audits.memory-stats]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Automated full-source review of 1.2.0: checked Linux /proc parsing and page-size cache, Darwin task_info, Windows GetProcessMemoryInfo, FreeBSD kinfo_getproc ownership, dependencies, tests, and build metadata; vbuff enables always_use_statm to avoid expensive smaps reads on the resident path."

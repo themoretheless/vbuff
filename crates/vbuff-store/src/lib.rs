@@ -7,14 +7,15 @@
 //! and is opened by a single owner. Inserts are dedup-aware: re-copying
 //! identical content bumps the existing row to the top instead of inserting a
 //! duplicate.
+#![forbid(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use vbuff_core::bloom::BloomFilter;
 use vbuff_core::capture::CaptureOutcome;
@@ -42,6 +43,66 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// The current schema version, stored in `PRAGMA user_version`.
 pub const SCHEMA_VERSION: i64 = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StoreOpenProfile {
+    pub private_path_ms: u64,
+    pub migration_preflight_ms: u64,
+    pub sqlite_open_ms: u64,
+    pub initialization_ms: u64,
+    pub kdf_ms: Option<u64>,
+    pub total_ms: u64,
+    pub encryption_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FtsHealth {
+    pub clip_rows: usize,
+    pub prose_rows: usize,
+    pub code_rows: usize,
+    pub missing_rows: usize,
+    pub orphan_rows: usize,
+    pub dirty_writes: u64,
+}
+
+impl FtsHealth {
+    pub const fn is_healthy(self) -> bool {
+        self.missing_rows == 0 && self.orphan_rows == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StoreDoctorReport {
+    pub schema_version: i64,
+    pub expected_schema_version: i64,
+    pub quick_check: String,
+    pub foreign_key_violations: usize,
+    pub clip_rows: usize,
+    pub fts: FtsHealth,
+    pub cipher_version: Option<String>,
+}
+
+impl StoreDoctorReport {
+    pub fn is_healthy(&self) -> bool {
+        self.schema_version == self.expected_schema_version
+            && self.quick_check == "ok"
+            && self.foreign_key_violations == 0
+            && self.fts.is_healthy()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreMutation {
+    SetPinned { id: ClipId, pinned: bool },
+    SetFavorite { id: ClipId, favorite: bool },
+    Delete { id: ClipId },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SensitiveClawbackReport {
+    pub scanned: usize,
+    pub reclassified: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchCursor {
@@ -115,7 +176,17 @@ impl Store {
 
     /// Open (creating if necessary) the store at a specific path.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_profiled(path).map(|(store, _)| store)
+    }
+
+    /// Open a store and return content-free cold-start timing telemetry.
+    pub fn open_profiled(path: &Path) -> Result<(Self, StoreOpenProfile)> {
+        let total_started = Instant::now();
+        let path_started = Instant::now();
         prepare_private_database_path(path)?;
+        let private_path_ms = elapsed_ms(path_started.elapsed());
+
+        let migration_started = Instant::now();
         let migration = migration::MigrationGuard::prepare(path, SCHEMA_VERSION)?;
         if let Some(guard) = &migration {
             let dry_connection = Connection::open(guard.dry_run_path())?;
@@ -124,12 +195,17 @@ impl Store {
             drop(dry_store);
             guard.finish_dry_run()?;
         }
+        let migration_preflight_ms = elapsed_ms(migration_started.elapsed());
+
+        let sqlite_started = Instant::now();
         let conn = Connection::open(path)?;
+        let sqlite_open_ms = elapsed_ms(sqlite_started.elapsed());
         harden_file_permissions(path)?;
         let cas_root = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("blobs");
+        let initialization_started = Instant::now();
         match Self::from_connection_with_cas(conn, Some(cas::CasStore::new(cas_root)?)) {
             Ok(store) => {
                 harden_database_files(path)?;
@@ -140,7 +216,18 @@ impl Store {
                     guard.rollback()?;
                     return Err(error);
                 }
-                Ok(store)
+                Ok((
+                    store,
+                    StoreOpenProfile {
+                        private_path_ms,
+                        migration_preflight_ms,
+                        sqlite_open_ms,
+                        initialization_ms: elapsed_ms(initialization_started.elapsed()),
+                        kdf_ms: None,
+                        total_ms: elapsed_ms(total_started.elapsed()),
+                        encryption_enabled: false,
+                    },
+                ))
             }
             Err(error) => {
                 if let Some(guard) = &migration {
@@ -149,6 +236,33 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    /// Open an existing database without migrations, backfills, CAS cleanup, or writes.
+    pub fn open_read_only_profiled(path: &Path) -> Result<(Self, StoreOpenProfile)> {
+        let total_started = Instant::now();
+        let sqlite_started = Instant::now();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let sqlite_open_ms = elapsed_ms(sqlite_started.elapsed());
+        let encryption_enabled = conn
+            .query_row("PRAGMA cipher_version", [], |row| row.get::<_, String>(0))
+            .optional()?
+            .is_some();
+        let store = Store {
+            conn,
+            cas: None,
+            dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
+            search_planner: RefCell::new(search::SearchPlanner::default()),
+        };
+        Ok((
+            store,
+            StoreOpenProfile {
+                sqlite_open_ms,
+                total_ms: elapsed_ms(total_started.elapsed()),
+                encryption_enabled,
+                ..StoreOpenProfile::default()
+            },
+        ))
     }
 
     /// Open an in-memory store (useful for tests).
@@ -313,6 +427,7 @@ impl Store {
                 value INTEGER NOT NULL
             );
             INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('fts_dirty', 0);
+            INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('secret_scan_cursor', 0);
 
             CREATE TABLE IF NOT EXISTS content_audit (
                 clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
@@ -958,6 +1073,7 @@ impl Store {
 
     /// Run bounded FTS maintenance only after meaningful write churn.
     pub fn maintain_search_index(&self, dirty_threshold: u64) -> Result<bool> {
+        let dirty_threshold = dirty_threshold.max(1);
         let dirty: i64 = self.conn.query_row(
             "SELECT value FROM maintenance_state WHERE key = 'fts_dirty'",
             [],
@@ -966,16 +1082,203 @@ impl Store {
         if dirty < dirty_threshold.min(i64::MAX as u64) as i64 {
             return Ok(false);
         }
+        for table in ["clip_fts_prose", "clip_fts_code"] {
+            self.conn.execute(
+                &format!("INSERT INTO {table}({table}, rank) VALUES('merge', ?1)"),
+                [32_i64],
+            )?;
+        }
+        if dirty >= dirty_threshold.saturating_mul(4).min(i64::MAX as u64) as i64 {
+            self.conn.execute_batch(
+                r#"
+                INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('optimize');
+                INSERT INTO clip_fts_code(clip_fts_code) VALUES('optimize');
+                "#,
+            )?;
+        }
         self.conn.execute_batch(
             r#"
-            INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('optimize');
-            INSERT INTO clip_fts_code(clip_fts_code) VALUES('optimize');
             INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('integrity-check');
             INSERT INTO clip_fts_code(clip_fts_code) VALUES('integrity-check');
             UPDATE maintenance_state SET value = 0 WHERE key = 'fts_dirty';
             "#,
         )?;
         Ok(true)
+    }
+
+    /// Compare FTS row identities with their source rows and expose write churn.
+    pub fn fts_health(&self) -> Result<FtsHealth> {
+        let clip_rows = query_count(&self.conn, "SELECT COUNT(*) FROM clips")?;
+        let prose_rows = query_count(&self.conn, "SELECT COUNT(*) FROM clip_fts_prose")?;
+        let code_rows = query_count(&self.conn, "SELECT COUNT(*) FROM clip_fts_code")?;
+        let missing_prose = query_count(
+            &self.conn,
+            r#"
+            SELECT COUNT(*) FROM clips AS c
+            LEFT JOIN clip_fts_prose AS f ON f.rowid = c.seq
+            WHERE f.rowid IS NULL
+            "#,
+        )?;
+        let missing_code = query_count(
+            &self.conn,
+            r#"
+            SELECT COUNT(*) FROM clips AS c
+            LEFT JOIN clip_fts_code AS f ON f.rowid = c.seq
+            WHERE c.kind = 7 AND f.rowid IS NULL
+            "#,
+        )?;
+        let orphan_prose = query_count(
+            &self.conn,
+            r#"
+            SELECT COUNT(*) FROM clip_fts_prose AS f
+            LEFT JOIN clips AS c ON c.seq = f.rowid
+            WHERE c.seq IS NULL
+            "#,
+        )?;
+        let orphan_code = query_count(
+            &self.conn,
+            r#"
+            SELECT COUNT(*) FROM clip_fts_code AS f
+            LEFT JOIN clips AS c ON c.seq = f.rowid AND c.kind = 7
+            WHERE c.seq IS NULL
+            "#,
+        )?;
+        let dirty: i64 = self.conn.query_row(
+            "SELECT value FROM maintenance_state WHERE key = 'fts_dirty'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(FtsHealth {
+            clip_rows,
+            prose_rows,
+            code_rows,
+            missing_rows: missing_prose.saturating_add(missing_code),
+            orphan_rows: orphan_prose.saturating_add(orphan_code),
+            dirty_writes: dirty.max(0) as u64,
+        })
+    }
+
+    /// Run read-only checks suitable for `vbuff doctor --json`.
+    pub fn doctor(&self) -> Result<StoreDoctorReport> {
+        let schema_version = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let quick_check = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        let mut foreign_keys = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let mut foreign_key_rows = foreign_keys.query([])?;
+        let mut foreign_key_violations = 0_usize;
+        while foreign_key_rows.next()?.is_some() {
+            foreign_key_violations = foreign_key_violations.saturating_add(1);
+        }
+        let cipher_version = self
+            .conn
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .optional()?;
+        Ok(StoreDoctorReport {
+            schema_version,
+            expected_schema_version: SCHEMA_VERSION,
+            quick_check,
+            foreign_key_violations,
+            clip_rows: query_count(&self.conn, "SELECT COUNT(*) FROM clips")?,
+            fts: self.fts_health()?,
+            cipher_version,
+        })
+    }
+
+    /// Reclassify a bounded set of historical structural secrets.
+    pub fn clawback_sensitive(
+        &self,
+        limit: usize,
+        ttl: Duration,
+    ) -> Result<SensitiveClawbackReport> {
+        let limit = limit.min(i64::MAX as usize);
+        if limit == 0 {
+            return Ok(SensitiveClawbackReport::default());
+        }
+        let cursor: i64 = self.conn.query_row(
+            "SELECT value FROM maintenance_state WHERE key = 'secret_scan_cursor'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT seq, id, metadata_json, item_text FROM clips
+            WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
+              AND item_text <> ''
+              AND seq > ?1
+            ORDER BY seq ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let candidates = statement
+            .query_map(params![cursor, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut report = SensitiveClawbackReport {
+            scanned: candidates.len(),
+            reclassified: 0,
+        };
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(ttl.max(Duration::from_secs(1)))
+                .unwrap_or_else(|_| chrono::Duration::days(1));
+        let transaction = self.conn.unchecked_transaction()?;
+        let next_cursor = if candidates.len() < limit {
+            0
+        } else {
+            candidates.last().map_or(0, |candidate| candidate.0)
+        };
+        for (_, id, metadata_json, item_text) in candidates {
+            let detected = vbuff_core::secret::detect_secrets(&item_text)
+                .iter()
+                .any(|finding| finding.confidence >= 0.9);
+            if !detected {
+                continue;
+            }
+            let mut metadata: StoredMetadata = serde_json::from_str(&metadata_json)?;
+            metadata.sensitive = true;
+            metadata.sync_eligible = Some(false);
+            metadata.expires_at = Some(expires_at);
+            transaction.execute(
+                r#"
+                UPDATE clips SET metadata_json = ?1, expires_at = ?2,
+                    preview = '[sensitive]', item_text = ''
+                WHERE id = ?3
+                "#,
+                params![
+                    serde_json::to_string(&metadata)?,
+                    expires_at.timestamp_millis(),
+                    id
+                ],
+            )?;
+            transaction.execute("DELETE FROM clip_facets WHERE clip_id = ?1", [&id])?;
+            transaction.execute("DELETE FROM clip_embeddings WHERE clip_id = ?1", [&id])?;
+            report.reclassified += 1;
+        }
+        transaction.execute(
+            "UPDATE maintenance_state SET value = ?1 WHERE key = 'secret_scan_cursor'",
+            [next_cursor],
+        )?;
+        transaction.commit()?;
+        if report.reclassified > 0 {
+            self.conn.execute_batch(
+                r#"
+                INSERT INTO clip_fts_prose(clip_fts_prose) VALUES('optimize');
+                INSERT INTO clip_fts_code(clip_fts_code) VALUES('optimize');
+                "#,
+            )?;
+            self.scrub_deleted_pages()?;
+        }
+        Ok(report)
     }
 
     /// Remove CAS files whose transactional refcount reached zero or which a
@@ -1116,6 +1419,46 @@ impl Store {
             params![favorite as i64, id.to_string_repr()],
         )?;
         Ok(())
+    }
+
+    /// Apply all mutations in one SQLite transaction or roll every one back.
+    pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut deleted = false;
+        for mutation in mutations {
+            let (id, changed) = match *mutation {
+                StoreMutation::SetPinned { id, pinned } => (
+                    id,
+                    transaction.execute(
+                        "UPDATE clips SET pinned = ?1 WHERE id = ?2",
+                        params![pinned as i64, id.to_string_repr()],
+                    )?,
+                ),
+                StoreMutation::SetFavorite { id, favorite } => (
+                    id,
+                    transaction.execute(
+                        "UPDATE clips SET favorite = ?1 WHERE id = ?2",
+                        params![favorite as i64, id.to_string_repr()],
+                    )?,
+                ),
+                StoreMutation::Delete { id } => {
+                    deleted = true;
+                    (
+                        id,
+                        transaction
+                            .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?,
+                    )
+                }
+            };
+            if changed != 1 {
+                return Err(StoreError::ClipNotFound(id.to_string_repr()));
+            }
+        }
+        transaction.commit()?;
+        if deleted {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(mutations.len())
     }
 
     /// Delete a single clip by id.
@@ -1437,6 +1780,15 @@ impl StoredMetadata {
 
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn query_count(connection: &Connection, sql: &str) -> Result<usize> {
+    let count: i64 = connection.query_row(sql, [], |row| row.get(0))?;
+    Ok(count.max(0) as usize)
 }
 
 fn searchable_projection(clip: &Clip, max_bytes: usize) -> String {
@@ -1944,8 +2296,138 @@ mod tests {
     fn fts_maintenance_runs_only_after_dirty_threshold() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_clip("dirty index")).unwrap();
+        let health = store.fts_health().unwrap();
+        assert!(health.is_healthy());
+        assert_eq!(health.dirty_writes, 1);
         assert!(store.maintain_search_index(1).unwrap());
         assert!(!store.maintain_search_index(1).unwrap());
+        assert!(!store.maintain_search_index(0).unwrap());
+    }
+
+    #[test]
+    fn doctor_reports_schema_integrity_and_unencrypted_backend_truthfully() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("doctor row")).unwrap();
+
+        let report = store.doctor().unwrap();
+
+        assert!(report.is_healthy());
+        assert_eq!(report.clip_rows, 1);
+        assert_eq!(report.cipher_version, None);
+    }
+
+    #[test]
+    fn sensitive_clawback_removes_search_projection_and_sets_ttl() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_clip("ghp_abcdefghijklmnopqrstuvwxyz123456"))
+            .unwrap();
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.reclassified, 1);
+        assert!(
+            store
+                .search("abcdefghijklmnopqrstuvwxyz123456", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let clip = store.list(1).unwrap().pop().unwrap();
+        assert!(clip.meta.sensitive);
+        assert!(!clip.meta.sync_eligible);
+        assert!(clip.meta.expires_at.is_some());
+    }
+
+    #[test]
+    fn sensitive_clawback_cursor_reaches_rows_beyond_the_first_batch() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("ordinary row one")).unwrap();
+        store.insert(&make_clip("ordinary row two")).unwrap();
+        store
+            .insert(&make_clip("ghp_abcdefghijklmnopqrstuvwxyz123456"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .clawback_sensitive(2, std::time::Duration::from_secs(300))
+                .unwrap()
+                .reclassified,
+            0
+        );
+        assert_eq!(
+            store
+                .clawback_sensitive(2, std::time::Duration::from_secs(300))
+                .unwrap()
+                .reclassified,
+            1
+        );
+    }
+
+    #[test]
+    fn batch_mutation_rolls_back_every_prior_change_on_missing_id() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.insert(&make_clip("first batch row")).unwrap();
+        let second = store.insert(&make_clip("second batch row")).unwrap();
+        let missing = ClipId::new();
+
+        let error = store
+            .apply_batch(&[
+                StoreMutation::SetPinned {
+                    id: first,
+                    pinned: true,
+                },
+                StoreMutation::SetFavorite {
+                    id: missing,
+                    favorite: true,
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(error, StoreError::ClipNotFound(_)));
+        assert!(
+            !store
+                .list(10)
+                .unwrap()
+                .iter()
+                .find(|clip| clip.id == first)
+                .unwrap()
+                .pinned
+        );
+
+        assert_eq!(
+            store
+                .apply_batch(&[
+                    StoreMutation::SetPinned {
+                        id: first,
+                        pinned: true,
+                    },
+                    StoreMutation::Delete { id: second },
+                ])
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(store.list(1).unwrap()[0].pinned);
+    }
+
+    #[test]
+    fn profiled_open_does_not_claim_missing_encryption_or_kdf() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiled.db");
+
+        let (store, profile) = Store::open_profiled(&path).unwrap();
+
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(!profile.encryption_enabled);
+        assert_eq!(profile.kdf_ms, None);
+        drop(store);
+
+        let (read_only, read_only_profile) = Store::open_read_only_profiled(&path).unwrap();
+        assert_eq!(read_only.doctor().unwrap().clip_rows, 0);
+        assert!(!read_only_profile.encryption_enabled);
+        assert!(read_only.insert(&make_clip("must fail")).is_err());
     }
 
     #[test]

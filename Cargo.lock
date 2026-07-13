@@ -2176,6 +2176,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2857,6 +2867,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prctl"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "059a34f111a9dee2ce1ac2826a68b24601c4298cfeb1a587c3cb493d5ab46f52"
+dependencies = [
+ "libc",
+ "nix",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3097,6 +3117,15 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "rlimit"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f35ee2729c56bb610f6dba436bf78135f728b7373bdffae2ec815b2d3eb98cc3"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rusqlite"
@@ -3881,6 +3910,7 @@ dependencies = [
  "egui",
  "global-hotkey",
  "image",
+ "memory-stats",
  "serde",
  "serde_json",
  "toml",
@@ -3899,11 +3929,14 @@ name = "vbuff-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "hmac",
  "regex",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "ulid",
  "url",
  "vbuff-types",
+ "zeroize",
 ]
 
 [[package]]
@@ -3921,14 +3954,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "vbuff-ipc"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.3.4",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "vbuff-types",
+ "zeroize",
+]
+
+[[package]]
 name = "vbuff-platform"
 version = "0.1.0"
 dependencies = [
  "arboard",
  "enigo",
  "global-hotkey",
+ "prctl",
+ "rlimit",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
+ "vbuff-types",
+ "zeroize",
+]
+
+[[package]]
+name = "vbuff-plugin"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
  "vbuff-types",
 ]
 

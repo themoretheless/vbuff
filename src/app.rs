@@ -33,35 +33,14 @@ const PASTE_REPAINT_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Resident services consumed by the eframe event loop.
 pub(crate) struct AppServices {
-    history: History,
-    shared: SharedState,
-    diagnostics: Diagnostics,
-    instance_intents: Receiver<ClientIntent>,
-    paused: Arc<AtomicBool>,
-    config: Config,
-    self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
-}
-
-impl AppServices {
-    pub(crate) fn new(
-        history: History,
-        shared: SharedState,
-        diagnostics: Diagnostics,
-        instance_intents: Receiver<ClientIntent>,
-        paused: Arc<AtomicBool>,
-        config: Config,
-        self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
-    ) -> Self {
-        Self {
-            history,
-            shared,
-            diagnostics,
-            instance_intents,
-            paused,
-            config,
-            self_writes,
-        }
-    }
+    pub(crate) history: History,
+    pub(crate) shared: SharedState,
+    pub(crate) diagnostics: Diagnostics,
+    pub(crate) instance_intents: Receiver<ClientIntent>,
+    pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) config: Config,
+    pub(crate) self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
+    pub(crate) strict_capture_blocked: bool,
 }
 
 pub(crate) fn run(
@@ -136,6 +115,7 @@ struct Runtime {
     hotkey_events: Receiver<GlobalHotKeyEvent>,
     event_waker: Arc<Mutex<Option<egui::Context>>>,
     paused: Arc<AtomicBool>,
+    strict_capture_blocked: bool,
     #[cfg(feature = "tray")]
     config: Config,
     popup: PopupApp,
@@ -163,6 +143,7 @@ impl Runtime {
             paused,
             config,
             self_writes,
+            strict_capture_blocked,
         } = services;
         #[cfg(not(feature = "tray"))]
         let _ = config;
@@ -186,6 +167,7 @@ impl Runtime {
             hotkey_events,
             event_waker,
             paused,
+            strict_capture_blocked,
             #[cfg(feature = "tray")]
             config,
             paste: PasteCoordinator::system(self_writes),
@@ -397,6 +379,17 @@ impl Runtime {
     }
 
     fn toggle_pause(&self) {
+        if self.strict_capture_blocked {
+            self.paused.store(true, Ordering::Relaxed);
+            if let Ok(mut state) = self.shared.lock() {
+                state.paused = true;
+            }
+            self.diagnostics.notice(
+                NoticeLevel::Warning,
+                "Strict security mode still blocks capture",
+            );
+            return;
+        }
         let paused = !self.paused.load(Ordering::Relaxed);
         self.paused.store(paused, Ordering::Relaxed);
         if let Ok(mut state) = self.shared.lock() {
