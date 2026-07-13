@@ -1107,14 +1107,16 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - user-facing, sync, integration, and operations ideas 198-300
 - [docs/ideas-301-400.md](docs/ideas-301-400.md) - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog: current problems, SOLID/DRY cuts, design issues, quality gaps, and roadmap hygiene
+- [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed native correctness, Unicode/search, security, local-first sync, and verification ideas 501-600
+- [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 high-signal repositories and the primary research/standards evidence catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
 
 ---
 
-## 500-point review backlog map
+## 600-point review backlog map
 
-The backlog is intentionally split instead of duplicated. `architecture.md`, `README.md`, and `recommendation.md` should all point to the same ranges so the docs stay DRY while still making the full 500-item review easy to navigate.
+The backlog is intentionally split instead of duplicated. `architecture.md`, `README.md`, `recommendation.md`, and `plan.md` should all point to the same ranges so the docs stay DRY while still making the full 600-item review easy to navigate. The final range is traceable to repository and primary-source evidence rather than popularity alone.
 
 | Range | Canonical file | Ownership lens |
 |---|---|---|
@@ -1123,12 +1125,13 @@ The backlog is intentionally split instead of duplicated. `architecture.md`, `RE
 | 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | Power-user workflows, UI/UX, everyday quality, sync, operations |
 | 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy, search, storage, platform fit, teams, automation, governance |
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current problems, SOLID/DRY refactors, test gaps, designer-grade UX, review hygiene |
+| 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Native protocol correctness, international text/search, security, local-first sync, evidence and verification |
 
 ---
 
 ## Ideas and improvements backlog (engineering & architecture)
 
-> Items 1-113 of a 500-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), and review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md). Effort tags: `S`/`M`/`L`.
+> Items 1-113 of a 600-idea backlog. Companion lists: product/strategy ideas (114-197) in [recommendation.md](recommendation.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md), and evidence-backed ideas (501-600) in [docs/ideas-501-600.md](docs/ideas-501-600.md). Effort tags: `S`/`M`/`L`.
 
 ### Capture & monitoring engine
 

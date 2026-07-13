@@ -53,7 +53,18 @@ Phases follow the spine roadmap exactly: Phase 0 (foundations/scaffolding) -> MV
 
 M0-M6 deliver the single-process MVP. M7-M10 deliver v1 (the multi-crate split happens at M7). M11 is v2. Future-tier work (AI actions, OCR, mobile peers, team libraries, shared boards) is explicitly out of scope here.
 
-The expanded 500-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, and review backlog items 401-500 live in `docs/ideas-401-500.md`. The milestone gates below decide when an idea becomes planned work.
+The expanded 600-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, review backlog items 401-500 live in `docs/ideas-401-500.md`, and evidence-backed ideas 501-600 live in `docs/ideas-501-600.md`. The 100-repository and primary-source evidence catalog lives in `docs/repositories-research-100.md`. The milestone gates below decide when an idea becomes planned work; repository popularity alone never promotes one.
+
+| Range | Canonical backlog source |
+|---|---|
+| 1-113 | [architecture.md](architecture.md) |
+| 114-197 | [recommendation.md](recommendation.md) |
+| 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) |
+| 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) |
+| 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) |
+| 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) |
+
+The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 
 Current baseline before the formal M7 crate extraction: the single-process root is already divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`, alongside the minimal `ShowPopup`/`Ping` startup protocol; capture and commands publish through `Diagnostics`, while popup/tray only consume the resulting typed health and redacted notices. A pause-aware capture heartbeat surfaces `Stalled`, and bind-or-forward runs before database/hotkey initialization with liveness, OS-released owner-lock serialization, and stale-endpoint recovery. Preserve those ownership boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, the full IPC verb surface, and moves the modules behind daemon/IPC contracts instead of recombining their responsibilities in `main.rs`.
 

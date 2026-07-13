@@ -148,9 +148,9 @@ The current design baseline is implemented rather than aspirational: one token m
 
 ---
 
-## 500-point review backlog
+## 600-point review backlog
 
-The 500 proposals, improvements, problems, bugs and "done badly" notes are kept as one numbered backlog, split by decision level so each file stays readable. Treat this as review input, not an automatic scope increase; `plan.md` decides what graduates into implementation.
+The 600 proposals, improvements, problems, bugs and "done badly" notes are kept as one numbered backlog, split by decision level so each file stays readable. Treat this as review input, not an automatic scope increase; `plan.md` decides what graduates into implementation. Items 501-600 are tied to the reviewed repositories, papers, and standards in [docs/repositories-research-100.md](docs/repositories-research-100.md).
 
 | Range | Canonical file | Lens |
 |---|---|---|
@@ -159,6 +159,7 @@ The 500 proposals, improvements, problems, bugs and "done badly" notes are kept 
 | 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | User workflows, UI/UX, sync experience, integrations, operations |
 | 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy controls, search, data model, platform fit, teams, automation |
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY slices, design fixes, review hygiene |
+| 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Evidence-backed native correctness, text/search, security, local-first sync, verification |
 
 ---
 
@@ -267,6 +268,8 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 in the extended backlog.
 - [docs/ideas-301-400.md](docs/ideas-301-400.md) - ideas 301-400 in the extended backlog.
 - [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog items 401-500: problems, SOLID/DRY cuts, UX/design fixes, and roadmap hygiene.
+- [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed backlog items 501-600: native correctness, international text/search, privacy, sync, and release verification.
+- [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 verified high-signal repositories plus the scientific papers, standards, and concrete lessons behind items 501-600.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 
 ---

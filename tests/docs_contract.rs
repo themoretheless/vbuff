@@ -1,9 +1,10 @@
 //! Executable contracts for the large documentation set.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const BACKLOG_RANGES: [(&str, &str, usize, usize); 5] = [
+const BACKLOG_RANGES: [(&str, &str, usize, usize); 6] = [
     (
         "architecture.md",
         "## Ideas and improvements backlog",
@@ -29,12 +30,23 @@ const BACKLOG_RANGES: [(&str, &str, usize, usize); 5] = [
         401,
         500,
     ),
+    (
+        "docs/ideas-501-600.md",
+        "## Native Clipboard Correctness",
+        501,
+        600,
+    ),
 ];
 
-const TOP_DOCS: [&str; 3] = ["README.md", "architecture.md", "recommendation.md"];
+const TOP_DOCS: [&str; 4] = [
+    "README.md",
+    "architecture.md",
+    "recommendation.md",
+    "plan.md",
+];
 
 #[test]
-fn review_backlog_is_exactly_one_through_five_hundred() {
+fn review_backlog_is_exactly_one_through_six_hundred() {
     let mut all = Vec::new();
 
     for (file, marker, start, end) in BACKLOG_RANGES {
@@ -49,7 +61,7 @@ fn review_backlog_is_exactly_one_through_five_hundred() {
         all.extend(actual);
     }
 
-    assert_eq!(all, (1..=500).collect::<Vec<_>>());
+    assert_eq!(all, (1..=600).collect::<Vec<_>>());
 }
 
 #[test]
@@ -60,6 +72,7 @@ fn top_docs_share_one_dry_backlog_map() {
         "| 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) |",
         "| 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) |",
         "| 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) |",
+        "| 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) |",
     ];
 
     for file in TOP_DOCS {
@@ -69,6 +82,78 @@ fn top_docs_share_one_dry_backlog_map() {
                 source.contains(row),
                 "{file} is missing shared map row {row}"
             );
+        }
+    }
+}
+
+#[test]
+fn research_catalog_has_exact_repository_and_source_ids() {
+    let research = read("docs/repositories-research-100.md");
+    let repository_rows: Vec<&str> = research
+        .lines()
+        .filter(|line| numbered_table_id(line, "GH-").is_some())
+        .collect();
+    let repositories: Vec<usize> = repository_rows
+        .iter()
+        .filter_map(|line| numbered_table_id(line, "GH-"))
+        .collect();
+    let sources: Vec<usize> = research
+        .lines()
+        .filter_map(|line| numbered_table_id(line, "S-"))
+        .collect();
+
+    assert_eq!(repositories, (1..=100).collect::<Vec<_>>());
+    assert_eq!(sources, (1..=26).collect::<Vec<_>>());
+
+    let mut repository_links = HashSet::new();
+    for row in repository_rows {
+        let columns: Vec<&str> = row.split('|').collect();
+        let stars: usize = columns[3]
+            .trim()
+            .replace(',', "")
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid star count in {row}: {error}"));
+        assert!(stars >= 500, "repository is below the catalog floor: {row}");
+
+        let link = columns[2]
+            .split_once("](https://github.com/")
+            .and_then(|(_, target)| target.trim().strip_suffix(')'))
+            .unwrap_or_else(|| panic!("invalid GitHub link in {row}"));
+        assert!(
+            repository_links.insert(link),
+            "duplicate repository in research catalog: {link}"
+        );
+    }
+
+    let ideas = read("docs/ideas-501-600.md");
+    let evidenced_items: Vec<&str> = ideas
+        .lines()
+        .filter(|line| numbered_backlog_item(line).is_some())
+        .filter(|line| line.contains("Evidence:"))
+        .collect();
+    assert_eq!(evidenced_items.len(), 100);
+
+    for line in evidenced_items {
+        let evidence_ids: Vec<&str> = line
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+            .filter(|token| token.starts_with("GH-") || token.starts_with("S-"))
+            .collect();
+        assert!(
+            !evidence_ids.is_empty(),
+            "backlog item has no evidence id: {line}"
+        );
+        for id in evidence_ids {
+            let (prefix, number) = id
+                .split_once('-')
+                .unwrap_or_else(|| panic!("invalid evidence id {id}"));
+            let number: usize = number
+                .parse()
+                .unwrap_or_else(|error| panic!("invalid evidence id {id}: {error}"));
+            match prefix {
+                "GH" => assert!((1..=100).contains(&number), "unknown evidence id {id}"),
+                "S" => assert!((1..=26).contains(&number), "unknown evidence id {id}"),
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -117,6 +202,8 @@ fn local_markdown_links_resolve() {
         "docs/ideas-top-300.md",
         "docs/ideas-301-400.md",
         "docs/ideas-401-500.md",
+        "docs/ideas-501-600.md",
+        "docs/repositories-research-100.md",
     ];
 
     for file in docs {
@@ -151,6 +238,12 @@ fn numbered_backlog_item(line: &str) -> Option<usize> {
     rest.starts_with("**")
         .then(|| number.parse().ok())
         .flatten()
+}
+
+fn numbered_table_id(line: &str, prefix: &str) -> Option<usize> {
+    let value = line.strip_prefix("| ")?.strip_prefix(prefix)?;
+    let (number, _) = value.split_once(" |")?;
+    number.parse().ok()
 }
 
 fn markdown_link_targets(source: &str) -> Vec<&str> {

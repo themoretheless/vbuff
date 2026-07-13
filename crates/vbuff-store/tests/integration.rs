@@ -81,3 +81,16 @@ fn wal_files_are_created() {
     let wal = dir.path().join("history.db-wal");
     assert!(wal.exists(), "expected WAL sidecar file to exist");
 }
+
+#[test]
+fn bundled_sqlite_includes_the_wal_reset_fix() {
+    let version = rusqlite::version_number();
+    let fixed_350_backport = (3_050_007..3_051_000).contains(&version);
+    let fixed_mainline = version >= 3_051_003;
+
+    assert!(
+        fixed_350_backport || fixed_mainline,
+        "SQLite {} is in or predates the WAL-reset bug range",
+        rusqlite::version()
+    );
+}

@@ -288,14 +288,16 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/ideas-top-300.md` - user-facing, sync, integration, and operations ideas 198-300
 - `docs/ideas-301-400.md` - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - `docs/ideas-401-500.md` - review backlog: current implementation problems, SOLID/DRY refactors, testing gaps, design fixes, and roadmap hygiene
+- `docs/ideas-501-600.md` - evidence-backed native correctness, international text/search, security, local-first sync, and verification ideas
+- `docs/repositories-research-100.md` - 100 high-signal repositories plus primary papers, standards, and concrete vbuff lessons
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
 
 ---
 
-## 500-point review backlog map
+## 600-point review backlog map
 
-The full 500-item review is shared with `README.md` and `architecture.md` through one DRY range map. Use these ranges as raw decision input; promote an item into `plan.md` only after it has scope, test strategy, and a clear cut line.
+The full 600-item review is shared with `README.md`, `architecture.md`, and `plan.md` through one DRY range map. Use these ranges as raw decision input; promote an item into `plan.md` only after it has scope, test strategy, a clear cut line, and evidence that a smaller existing item does not already solve it.
 
 | Range | Canonical file | Product/engineering lens |
 |---|---|---|
@@ -304,12 +306,13 @@ The full 500-item review is shared with `README.md` and `architecture.md` throug
 | 198-300 | [docs/ideas-top-300.md](docs/ideas-top-300.md) | User workflows, UI/UX, everyday quality, sync experience, integrations, operations |
 | 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy controls, search, data model, platform fit, collaboration, automation |
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY cuts, testing gaps, design fixes, roadmap hygiene |
+| 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Repository/research-backed protocol correctness, Unicode/search, privacy, sync, testing, release evidence |
 
 ---
 
 ## Ideas and improvements backlog (product & strategy)
 
-> Items 114-197 of a 500-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), and review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md). Effort tags: `S`/`M`/`L`.
+> Items 114-197 of a 600-idea backlog. Companion lists: engineering ideas (1-113) in [architecture.md](architecture.md), user-facing/operations ideas (198-300) in [docs/ideas-top-300.md](docs/ideas-top-300.md), extended ideas (301-400) in [docs/ideas-301-400.md](docs/ideas-301-400.md), review backlog items (401-500) in [docs/ideas-401-500.md](docs/ideas-401-500.md), and evidence-backed ideas (501-600) in [docs/ideas-501-600.md](docs/ideas-501-600.md). Effort tags: `S`/`M`/`L`.
 
 ### Differentiation & positioning bets
 

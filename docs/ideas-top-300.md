@@ -1,6 +1,6 @@
 # vbuff - Ideas and Improvements Backlog, Items 198-300
 
-This file covers ideas 198-300 of the 500-idea backlog. Companion lists: engineering ideas (1-113) live in [../architecture.md](../architecture.md), product/strategy ideas (114-197) live in [../recommendation.md](../recommendation.md), extended ideas (301-400) live in [ideas-301-400.md](ideas-301-400.md), and review backlog items (401-500) live in [ideas-401-500.md](ideas-401-500.md). Effort tags are `S`/`M`/`L`.
+This file covers ideas 198-300 of the 600-idea backlog. Companion lists: engineering ideas (1-113) live in [../architecture.md](../architecture.md), product/strategy ideas (114-197) live in [../recommendation.md](../recommendation.md), extended ideas (301-400) live in [ideas-301-400.md](ideas-301-400.md), review backlog items (401-500) live in [ideas-401-500.md](ideas-401-500.md), and evidence-backed ideas (501-600) live in [ideas-501-600.md](ideas-501-600.md). Effort tags are `S`/`M`/`L`.
 
 The backlog is source material, not an automatic commitment. [../plan.md](../plan.md) remains the execution order; an idea only becomes planned work when it is pulled into a milestone.
 
