@@ -5,6 +5,8 @@
 > Positioning in one line: **One clipboard, every machine, never lost, never leaked.** vbuff is the cross-platform clipboard manager that is simultaneously truly cross-OS, genuinely polished, privately synced, and approachable - the intersection no competitor occupies.
 >
 > Sourcing note: the task referenced a separate "decision spine" file and a "pitfalls JSON" with `pitfallsExec`/`topMistakesSummary` keys. Those literal artifacts do not exist in the repo. The positioning, pillars, non-goals, roadmap phases, and success metrics are grounded in `architecture.md` (goals/non-goals, the four backend traits, the four-phase roadmap, the risks table) and `docs/competitive-analysis.md` (the four-corner wedge). Competitor mistakes and differentiators are grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the 122-item `docs/competitor-extras.md`. Feature tiers (MVP/v1/v2/future) come from `docs/features-top-500.md` (640 items) and the extras catalog.
+>
+> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted and the new `vbuff-sync` crate is a tested protocol foundation, not a live network feature. Engineering items 1-50 are reconciled in [the first implementation ledger](docs/implementation-batch-001-050.md).
 
 ---
 
@@ -42,7 +44,7 @@ Rated against the four wedge axes. ✅ strong, ◐ partial, ❌ weak/absent.
 **Bet 1 - Same tool, every desktop OS, identical behavior. (Highest leverage.)**
 Ship one native-feeling, modern UI with identical keybindings and the same hot-path render code on macOS, Windows, Linux/X11, and Linux/Wayland. The architecture already enforces this: a single `egui`/`eframe` render path and four cross-platform traits (`ClipboardBackend`, `HotkeyBackend`, `PasteBackend`, `TrayBackend`) in `vbuff-platform`, with `vbuff-core` containing zero OS-specific and zero GUI code. **Vs rivals:** CopyQ has the reach but not the polish; Paste, Maccy, Pastebot, Raycast/Alfred have polish but are Apple-bound; Ditto is Windows-only. This corner is empty and it is the headline.
 
-**Bet 2 - Zero-knowledge E2E sync that works over the internet, on by default, with a self-host/local-only option.**
+**Bet 2 - Zero-knowledge E2E sync that works over the internet, opt-in, with a self-host/local-only option.**
 Beat CrossPaste (LAN-only) and Paste (Apple-only iCloud) on reach; beat every vendor-cloud tool on privacy. Critically, **never depend on a single backend you can kill** - that is the Clipt lesson (shut down 2023) and the 1Clipboard lesson (abandoned beta on personal Google Drive). The architecture sequences this correctly: `vbuff-sync` with mDNS + Noise/TLS + SAS/QR pairing lands in v1 (LAN first), internet relay/cloud-drive transport in v2, payloads E2E so a relay sees only ciphertext.
 
 **Bet 3 - Private by default, fail-closed, and provably so.**
@@ -73,8 +75,8 @@ Open-source the core (the trust + longevity signal that Ditto, CopyQ, CrossPaste
 | **Capture: native event-driven backends** (Win `WM_CLIPBOARDUPDATE`, Wayland `wlr-data-control`, X11 XFIXES, macOS `changeCount` poll) | **Build now** | MVP | This is the product. `arboard` is the wrong tool (no events, single-flavor). Native per-OS capture behind `ClipboardBackend` is non-negotiable. |
 | **Capture: all flavors byte-for-byte, dedup-by-hash, debounce** | **Build now** | MVP | Multi-flavor atomic capture + BLAKE3 dedup + move-to-top is core fidelity. Reading only `text/plain` is the #1 Linux complaint. |
 | **Capture-decision gate (fail-closed)** | **Build now** | MVP | Concealed/transient hints, app exclusion, incognito, size cap, whitespace skip - every privacy promise routes through one ordered, testable gate before disk. |
-| **Store: SQLite + SQLCipher, WAL, txn-per-capture, count cap, pins exempt** | **Build now** | MVP | Durability + encryption at rest + dedup is the floor. FTS5 schema present from day one even though substring is the shipped search tier. |
-| **Store: out-of-row blob CAS, total-size cap, thumbnails, image transcode** | **Build later** | v1 | Image bloat (Ditto multi-GB DBs, Maccy memory leaks) is a real failure but the MVP count cap + per-item cap contains it; CAS + transcode is v1 hardening. |
+| **Store: SQLite + SQLCipher, WAL, txn-per-capture, count cap, pins exempt** | **Build now** | MVP | WAL, transactions, migrations, dedup, FTS5, and CAS are present; SQLCipher plus OS-keystore keying remains the non-negotiable release gap. |
+| **Store: out-of-row blob CAS, total-size cap, thumbnails, image transcode** | **In progress** | MVP/v1 | Refcounted sharded CAS is now present. Total-byte retention, canonical thumbnails, and transcode remain v1 hardening. |
 | **Search: substring as-you-type + live highlight + type/pinned filters** | **Build now** | MVP | Keyboard-first recall is the core loop. egui `ScrollArea::show_rows` gives row virtualization for free. |
 | **Search: FTS5 indexed, fuzzy, regex, relevance ranking** | **Build later** | v1 | Needed at 30k-50k items (CopyQ/Maccy collapse here), but the SQL infra is staged in MVP; switch the tier on in v1. |
 | **Paste-back into prior focus** (CGEvent / SendInput / XTEST) | **Build now** | MVP | A picker that does not paste back is not a clipboard manager. Capture focus *first*, then write, then inject. |
@@ -86,7 +88,7 @@ Open-source the core (the trust + longevity signal that Ditto, CopyQ, CrossPaste
 | **Tray / menu-bar item + autostart + single-instance guard** | **Build now** | MVP | The watcher must be live within a few hundred ms of login and survive popup dismissal. Even in the single-process MVP, the resident process + single-instance guard is required. |
 | **Daemon/IPC formal split** (`vbuff-daemon`, `vbuff-ipc`) | **Build later** | v1 | The MVP runs watcher + store + GUI in one root-binary process. Promote to the formal daemon/IPC split when the CLI and external pickers need to reach the live watcher. |
 | **CLI** (`vbuff-cli`: list/get/copy/add/search), external pickers, `vbuff://` | **Build later** | v1 | Scriptability is a core differentiator vs polished-but-closed rivals, but it depends on the IPC layer; sequence after the single-machine core is stable. |
-| **Sync** (`vbuff-sync`: mDNS, LAN P2P, Noise/TLS, SAS/QR pairing) | **Build later** | v1 | Bet 2, but it depends on the entire single-machine store being proven. LAN first in v1, internet relay/cloud-drive in v2. The feature catalog tags some sync items MVP; that ordering is wrong and `architecture.md` correctly sequences them into v1. |
+| **Sync** (`vbuff-sync`: mDNS, LAN P2P, authenticated transport, SAS/QR pairing) | **Foundation now, ship later** | v1 | CRDT/HLC, envelopes, membership, policy, anti-entropy, recovery, receipts, capabilities, and padding are tested in isolation. Discovery, transport, persistence, pairing UX, and replication still wait for the single-machine core and M9. |
 | **AI features** (semantic search, OCR, summarize/rewrite/translate, MCP server) | **Build later / mostly skip for now** | v1-future | OCR-on-everything is a privacy footgun (Clipory makes receipts searchable). On-device, opt-in, off-by-default only. The MCP-server-as-memory-layer is a future bet, not a near-term one. |
 | **Collaboration / team** (shared snippet libraries, shareable links, roles, expiry) | **Build later** | v2 | The TextExpander niche. Lands last, after sync and conflict resolution are solid. |
 | **Mobile (iOS/Android) as synced peers** | **Build later** | post-v2 | Real differentiator vs Apple-only Paste, but depends on the sync layer and platform share-sheet workarounds. |
@@ -124,7 +126,7 @@ Design review checklist:
 
 The SOLID/DRY product rule: a command should have one name, one behavior, and one permission model across popup, tray, CLI, IPC, and docs. If "clear history" means different things in two surfaces, the design is wrong even if the code compiles.
 
-Current implementation review: the popup now consumes one design-token module for stable dimensions and spacing, uses fixed-size native icon buttons with accessibility labels/tooltips instead of platform-dependent emoji, distinguishes empty history from no search results, and explicitly confirms both `Delete clip` and `Clear history` while stating that pinned clips survive the latter. Popup and tray render one typed capture-health vocabulary, including an explicit stalled-worker state, and command outcomes use dismissible info/warning/error notices whose strings contain no clipboard payload. The capture worker now has a pause-aware heartbeat/watchdog, so a hang is visible even though native hook re-subscribe and auto-restart still belong to M7. The tray/menu-bar has a transparent clipboard/check glyph, dynamic Pause/Resume and Start/Don't start at login labels, emits the same `AppCommand` values as the popup, and routes destructive clearing through the popup confirmation. Startup is guarded before database/hotkey initialization: duplicate launches send the resident process the same `Show` intent, liveness is probed, and stale endpoints are recovered once. Remaining design work is richer permission/capability status, full screen-reader verification, screenshot regression coverage, and native recovery after a detected capture stall.
+Current implementation review: the popup uses one design-token module for stable dimensions, fixed-size icon actions with labels/tooltips, distinct empty states, and explicit destructive confirmations. Popup and tray share one typed capture-health vocabulary and content-free notices. Rows mask sensitive content and expose incomplete, local-only, and expiry state; the status strip separates saved, intentionally skipped, and lost captures with compact counters; bounded thumbnail decoding rejects oversized or inconsistent images; a recent privacy skip offers one exact-content, time-bounded deliberate recovery. Hotkey, tray, and second-instance actions wake the event loop directly rather than polling every 100 ms, and a visible popup refreshes once per second rather than every frame. TTL and quarantine maintenance refresh the visible snapshot immediately, while quarantine records contain no flavor bytes. A pause-aware heartbeat/watchdog still exposes stalls; native hook re-subscribe, richer capability badges, screen-reader/screenshot verification, and native concealed/provenance coverage remain release work.
 
 ---
 
@@ -282,6 +284,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 
 - `architecture.md` - canonical system design, crate stack, data model, roadmap, risks
 - `plan.md` - phased implementation plan / milestones
+- `docs/implementation-batch-001-050.md` - engineering items 1-50, current status, remaining native/transport dependencies, and three review passes
 - `docs/competitive-analysis.md` - competitor landscape and the four-corner wedge
 - `docs/competitor-extras.md` - the 122-item feature-gap sweep used in section 4
 - `docs/features-top-500.md` - the 640-feature catalog with MVP/v1/v2/future tiers
@@ -292,6 +295,20 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/repositories-research-100.md` - 100 high-signal repositories plus primary papers, standards, and concrete vbuff lessons
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
+
+---
+
+## Backlog execution batches
+
+Execution follows the user's requested groups of 50. The strategy layer does not promote a foundation into a shipped claim merely because code exists.
+
+| Range | State | Product interpretation |
+|---|---|---|
+| 1-50 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-001-050.md); local runtime improvements are active, sync/native contracts are not advertised as finished features |
+| 51-100 | Next | Continue reliability/security engineering before expanding product surface |
+| 101-600 | Queued | Preserve the canonical priority and evidence links below |
+
+The product cut line after the first batch is unchanged: finish trustworthy single-machine storage and native capture before enabling network replication. The sync foundation reduces later protocol risk; it does not justify turning on a network path early.
 
 ---
 

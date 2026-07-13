@@ -62,7 +62,7 @@ impl ClipboardBackend for ArboardClipboard {
 
         Ok(CapturedClipboard {
             flavors,
-            source_app: None,
+            ..CapturedClipboard::default()
         })
     }
 
@@ -87,6 +87,11 @@ impl ClipboardBackend for ArboardClipboard {
         {
             let (w, h) = parse_rgba_dims(&flavor.mime)
                 .ok_or_else(|| PlatformError::Clipboard("rgba flavor missing dimensions".into()))?;
+            if !rgba_dimensions_match(w, h, bytes.len()) {
+                return Err(PlatformError::Clipboard(
+                    "rgba flavor byte length does not match its dimensions".into(),
+                ));
+            }
             let image = ImageData {
                 width: w,
                 height: h,
@@ -100,6 +105,21 @@ impl ClipboardBackend for ArboardClipboard {
 
         Err(PlatformError::Empty)
     }
+
+    fn clear(&mut self) -> Result<()> {
+        self.clipboard
+            .clear()
+            .map_err(|error| PlatformError::Clipboard(error.to_string()))
+    }
+}
+
+fn rgba_dimensions_match(width: usize, height: usize, byte_len: usize) -> bool {
+    width > 0
+        && height > 0
+        && width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            == Some(byte_len)
 }
 
 /// Parse `width=W;height=H` out of an RGBA MIME string.
@@ -129,5 +149,13 @@ mod tests {
     #[test]
     fn missing_dims_is_none() {
         assert_eq!(parse_rgba_dims("image/x-vbuff-rgba"), None);
+    }
+
+    #[test]
+    fn rgba_dimensions_reject_overflow_and_wrong_lengths() {
+        assert!(rgba_dimensions_match(4, 2, 32));
+        assert!(!rgba_dimensions_match(4, 2, 31));
+        assert!(!rgba_dimensions_match(usize::MAX, 2, 0));
+        assert!(!rgba_dimensions_match(0, 2, 0));
     }
 }

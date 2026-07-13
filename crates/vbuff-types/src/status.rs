@@ -19,6 +19,8 @@ pub enum CaptureHealth {
     StorageError,
     /// The worker stopped publishing heartbeats within the watchdog budget.
     Stalled,
+    /// Active read/write/restore probe did not complete coherently.
+    SelfTestFailed,
 }
 
 impl CaptureHealth {
@@ -31,6 +33,7 @@ impl CaptureHealth {
             Self::ClipboardReadError => "Clipboard read issue",
             Self::StorageError => "History write issue",
             Self::Stalled => "Capture stalled",
+            Self::SelfTestFailed => "Capture self-test failed",
         }
     }
 }
@@ -49,6 +52,14 @@ pub enum NoticeLevel {
 pub struct CommandNotice {
     pub level: NoticeLevel,
     pub message: String,
+}
+
+/// Content-free capture accounting shown in the popup and future IPC clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureSessionStats {
+    pub captured: u64,
+    pub intentionally_skipped: u64,
+    pub lost: u64,
 }
 
 #[cfg(test)]

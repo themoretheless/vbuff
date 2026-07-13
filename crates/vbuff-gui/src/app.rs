@@ -9,7 +9,8 @@
 //! queue, which the wiring drains each frame via [`PopupApp::take_actions`].
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
@@ -19,6 +20,9 @@ use vbuff_types::{Body, CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel}
 use crate::design::{self, Icon};
 use crate::state::{SharedState, UiAction};
 use crate::view::{relative_time, short_app_name};
+
+const MAX_THUMBNAIL_DIMENSION: u32 = 16_384;
+const MAX_THUMBNAIL_RGBA_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The eframe application driving the popup.
 pub struct PopupApp {
@@ -120,7 +124,16 @@ impl eframe::App for PopupApp {
         }
 
         // 1. Check for a show request from the wiring.
-        let (clips, paused, capture_health, notice, show_requested, revision) = {
+        let (
+            clips,
+            paused,
+            capture_health,
+            capture_stats,
+            recoverable_skip,
+            notice,
+            show_requested,
+            revision,
+        ) = {
             let Ok(mut s) = self.state.lock() else {
                 tracing::error!("GUI state mutex poisoned");
                 return;
@@ -130,6 +143,8 @@ impl eframe::App for PopupApp {
                 s.clips.clone(),
                 s.paused,
                 s.capture_health,
+                s.capture_stats,
+                s.skipped_recovery_available(std::time::Instant::now()),
                 s.notice.clone(),
                 show,
                 s.revision,
@@ -144,6 +159,12 @@ impl eframe::App for PopupApp {
         if revision != self.last_revision {
             self.last_revision = revision;
             self.selected = 0;
+            let live_ids = clips
+                .iter()
+                .filter(|clip| !clip.meta.sensitive)
+                .map(|clip| clip.id.to_string_repr())
+                .collect::<std::collections::HashSet<_>>();
+            self.thumbnails.retain(|id, _| live_ids.contains(id));
         }
 
         if !self.visible {
@@ -246,7 +267,6 @@ impl eframe::App for PopupApp {
 
             ui.horizontal(|ui| {
                 render_capture_status(ui, paused, capture_health);
-                ui.small(format!("{total} items"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!clips.is_empty(), egui::Button::new("Clear history"))
@@ -265,6 +285,38 @@ impl eframe::App for PopupApp {
                     }
                 });
             });
+            if recoverable_skip {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Current copy was skipped")
+                            .small()
+                            .color(Color32::from_rgb(210, 144, 32)),
+                    );
+                    if ui.small_button("Keep current copy").clicked() {
+                        self.actions.push_back(UiAction::RecoverSkipped);
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.small(format!("{total} items"));
+                    ui.separator();
+                    ui.small(format!(
+                        "{} saved · {} skipped",
+                        compact_count(capture_stats.captured),
+                        compact_count(capture_stats.intentionally_skipped)
+                    ));
+                    let loss_color = if capture_stats.lost == 0 {
+                        ui.visuals().weak_text_color()
+                    } else {
+                        Color32::from_rgb(194, 64, 72)
+                    };
+                    ui.label(
+                        RichText::new(format!("{} lost", compact_count(capture_stats.lost)))
+                            .small()
+                            .color(loss_color),
+                    );
+                });
+            }
             if let Some(notice) = &notice {
                 self.render_notice(ui, notice);
             }
@@ -305,8 +357,9 @@ impl eframe::App for PopupApp {
         self.render_clear_history_confirmation(ctx);
         self.render_delete_confirmation(ctx);
 
-        // Keep repainting while visible so focus/typing feels live.
-        ctx.request_repaint();
+        // Input events repaint immediately; one low-frequency visible refresh
+        // keeps expiry labels and background capture state current.
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
 
@@ -375,7 +428,7 @@ impl PopupApp {
                 }
 
                 // Kind icon / color swatch / thumbnail.
-                if clip.meta.kind == vbuff_types::ContentKind::Color {
+                if clip.meta.kind == vbuff_types::ContentKind::Color && !clip.meta.sensitive {
                     if let Some(text) = clip.primary_text() {
                         draw_color_swatch(ui, text.trim());
                     }
@@ -396,7 +449,7 @@ impl PopupApp {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         // Preview line.
-                        let preview = clip.preview(80);
+                        let preview = row_preview(clip);
                         let resp = ui.add(
                             egui::Label::new(RichText::new(preview).strong())
                                 .truncate()
@@ -412,8 +465,27 @@ impl PopupApp {
                             if let Some(app) = &clip.meta.source_app {
                                 meta.push(short_app_name(app));
                             }
+                            if clip.flavors.iter().any(|flavor| !flavor.is_realized()) {
+                                meta.push("Incomplete".into());
+                            }
+                            if clip.meta.sensitive {
+                                meta.push("Sensitive".into());
+                            }
+                            if !clip.meta.sync_eligible {
+                                meta.push("Local only".into());
+                            }
+                            if let Some(expires_at) = clip.meta.expires_at.as_ref() {
+                                let seconds = expires_at
+                                    .signed_duration_since(Utc::now())
+                                    .num_seconds()
+                                    .max(0);
+                                meta.push(format!("Expires in {seconds}s"));
+                            }
                             meta.push(relative_time(clip.meta.created_at, Utc::now()));
-                            ui.small(meta.join(" · "));
+                            ui.add(
+                                egui::Label::new(RichText::new(meta.join(" · ")).small())
+                                    .truncate(),
+                            );
                         });
                     },
                 );
@@ -511,6 +583,9 @@ impl PopupApp {
 
     /// Get or build a thumbnail texture for an image clip.
     fn thumbnail(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<TextureHandle> {
+        if clip.meta.sensitive {
+            return None;
+        }
         let image = clip.primary_image()?;
         let key = clip.id.to_string_repr();
         if let Some(cached) = self.thumbnails.get(&key) {
@@ -532,13 +607,39 @@ fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth)
             CaptureHealth::ClipboardUnavailable
             | CaptureHealth::ClipboardReadError
             | CaptureHealth::StorageError
-            | CaptureHealth::Stalled => Color32::from_rgb(194, 64, 72),
+            | CaptureHealth::Stalled
+            | CaptureHealth::SelfTestFailed => Color32::from_rgb(194, 64, 72),
         };
         (health.label(), color)
     };
 
     design::status_dot(ui, color);
     ui.label(RichText::new(label).small().color(color));
+}
+
+fn row_preview(clip: &Clip) -> String {
+    if clip.meta.sensitive {
+        "Sensitive content".to_owned()
+    } else {
+        clip.preview(80)
+    }
+}
+
+fn compact_count(count: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[
+        (1_000_000_000_000_000_000, "E"),
+        (1_000_000_000_000_000, "P"),
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+    for &(divisor, suffix) in UNITS {
+        if count >= divisor {
+            return format!("{:.1}{suffix}", count as f64 / divisor as f64);
+        }
+    }
+    count.to_string()
 }
 
 /// Draw a small filled rectangle for a color clip.
@@ -554,6 +655,9 @@ fn draw_color_swatch(ui: &mut egui::Ui, text: &str) {
 /// Parse `#rgb` / `#rrggbb` / `#rrggbbaa` into a Color32.
 fn parse_hex_color(s: &str) -> Option<Color32> {
     let hex = s.strip_prefix('#')?;
+    if !hex.is_ascii() {
+        return None;
+    }
     let bytes = |i: usize, len: usize| u8::from_str_radix(&hex[i..i + len], 16).ok();
     match hex.len() {
         3 => {
@@ -582,25 +686,64 @@ fn build_thumbnail(
     flavor: &vbuff_types::Flavor,
     key: &str,
 ) -> Option<TextureHandle> {
+    let color_image = decode_thumbnail(flavor)?;
+    Some(ctx.load_texture(key, color_image, egui::TextureOptions::LINEAR))
+}
+
+fn decode_thumbnail(flavor: &vbuff_types::Flavor) -> Option<egui::ColorImage> {
     let bytes = match &flavor.body {
         Body::Inline(b) => b,
         Body::Spilled { .. } => return None,
     };
 
-    let color_image = if flavor.mime.starts_with("image/x-vbuff-rgba") {
+    let color_image = if raw_rgba_mime(&flavor.mime) {
         let (w, h) = parse_rgba_dims(&flavor.mime)?;
-        if w == 0 || h == 0 || bytes.len() < w * h * 4 {
+        let required = w.checked_mul(h)?.checked_mul(4)?;
+        if w == 0
+            || h == 0
+            || required != bytes.len()
+            || u64::try_from(required).ok()? > MAX_THUMBNAIL_RGBA_BYTES
+        {
             return None;
         }
-        egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes[..w * h * 4])
+        egui::ColorImage::from_rgba_unmultiplied([w, h], bytes)
     } else {
-        let img = image::load_from_memory(bytes).ok()?;
+        let dimensions_reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        let (width, height) = dimensions_reader.into_dimensions().ok()?;
+        let decoded_bytes = u64::from(width)
+            .checked_mul(u64::from(height))?
+            .checked_mul(4)?;
+        if width == 0
+            || height == 0
+            || width > MAX_THUMBNAIL_DIMENSION
+            || height > MAX_THUMBNAIL_DIMENSION
+            || decoded_bytes > MAX_THUMBNAIL_RGBA_BYTES
+        {
+            return None;
+        }
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_THUMBNAIL_DIMENSION);
+        limits.max_image_height = Some(MAX_THUMBNAIL_DIMENSION);
+        limits.max_alloc = Some(MAX_THUMBNAIL_RGBA_BYTES);
+        let mut reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        reader.limits(limits);
+        let img = reader.decode().ok()?;
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width() as usize, rgba.height() as usize);
         egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw())
     };
 
-    Some(ctx.load_texture(key, color_image, egui::TextureOptions::LINEAR))
+    Some(color_image)
+}
+
+fn raw_rgba_mime(mime: &str) -> bool {
+    mime.split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/x-vbuff-rgba"))
 }
 
 /// Parse `width=W;height=H` from the RGBA MIME string.
@@ -640,5 +783,46 @@ mod tests {
     #[test]
     fn rejects_bad_hex() {
         assert_eq!(parse_hex_color("nope"), None);
+        assert_eq!(parse_hex_color("#é"), None);
+    }
+
+    #[test]
+    fn status_counts_stay_compact() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_250), "1.2K");
+        assert_eq!(compact_count(u64::MAX), "18.4E");
+    }
+
+    #[test]
+    fn sensitive_rows_never_render_clip_text() {
+        let mut meta = vbuff_types::ClipMeta::now(vbuff_types::ContentKind::Text, 6, None);
+        meta.sensitive = true;
+        let clip = Clip {
+            id: ClipId::new(),
+            flavors: vec![vbuff_types::Flavor::inline(
+                "text/plain",
+                b"123456".to_vec(),
+            )],
+            content_hash: [0; 32],
+            meta,
+            pinned: false,
+            favorite: false,
+        };
+
+        assert_eq!(row_preview(&clip), "Sensitive content");
+        assert!(!row_preview(&clip).contains("123456"));
+    }
+
+    #[test]
+    fn raw_thumbnail_decode_is_bounded_and_dimension_checked() {
+        let valid =
+            vbuff_types::Flavor::inline("IMAGE/X-VBUFF-RGBA;width=1;height=1", vec![0, 0, 0, 255]);
+        let invalid = vbuff_types::Flavor::inline(
+            "image/x-vbuff-rgba;width=18446744073709551615;height=2",
+            vec![0; 4],
+        );
+
+        assert_eq!(decode_thumbnail(&valid).unwrap().size, [1, 1]);
+        assert!(decode_thumbnail(&invalid).is_none());
     }
 }

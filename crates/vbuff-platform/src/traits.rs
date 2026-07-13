@@ -3,7 +3,7 @@
 //! These traits are intentionally minimal for the MVP. They are the seam at
 //! which native per-OS backends can later be swapped in.
 
-use vbuff_types::Flavor;
+use vbuff_types::{CaptureGeneration, CaptureLineage, CaptureProvenance, Flavor};
 
 use crate::Result;
 
@@ -29,13 +29,45 @@ pub struct KeyCombo {
     pub key: String,
 }
 
-/// A snapshot of the clipboard's current content, as flavors.
-#[derive(Clone, Debug, Default)]
+/// Which OS selection supplied the snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipboardSelection {
+    #[default]
+    Clipboard,
+    Primary,
+}
+
+/// A coherent snapshot of one clipboard generation.
+#[derive(Clone, Debug)]
 pub struct CapturedClipboard {
     /// Every flavor read from the clipboard, byte-for-byte where possible.
     pub flavors: Vec<Flavor>,
-    /// The frontmost application's identifier, if the backend could learn it.
-    pub source_app: Option<String>,
+    pub provenance: CaptureProvenance,
+    pub generation: Option<CaptureGeneration>,
+    pub lineage: CaptureLineage,
+    pub selection: ClipboardSelection,
+    /// Native backend confirmed the owner/generation remained stable while
+    /// every flavor was materialized.
+    pub coherent_generation: bool,
+    /// PRIMARY has remained stable and an intent signal was observed.
+    pub primary_intended: bool,
+    /// Authoritative OS sensitivity marker; the gate must fail closed.
+    pub concealed: bool,
+}
+
+impl Default for CapturedClipboard {
+    fn default() -> Self {
+        Self {
+            flavors: Vec::new(),
+            provenance: CaptureProvenance::default(),
+            generation: None,
+            lineage: CaptureLineage::default(),
+            selection: ClipboardSelection::Clipboard,
+            coherent_generation: true,
+            primary_intended: true,
+            concealed: false,
+        }
+    }
 }
 
 impl CapturedClipboard {
@@ -52,6 +84,15 @@ pub trait ClipboardBackend: Send {
 
     /// Write a flavor set back to the clipboard (for paste-back).
     fn write(&mut self, flavors: &[Flavor]) -> Result<()>;
+
+    /// Native backends may attach `lineage.write_nonce` as a private sentinel
+    /// flavor. The arboard fallback uses the shared hash ledger instead.
+    fn write_tagged(&mut self, flavors: &[Flavor], _lineage: &CaptureLineage) -> Result<()> {
+        self.write(flavors)
+    }
+
+    /// Clear every representation from the clipboard.
+    fn clear(&mut self) -> Result<()>;
 }
 
 /// Registers and delivers global hotkeys.

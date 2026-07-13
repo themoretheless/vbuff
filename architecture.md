@@ -1,6 +1,6 @@
 # vbuff - Architecture & System Design
 
-vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. It captures every system clipboard change into a durable, searchable, encrypted local history; summons a keyboard-driven popup via a global hotkey; and pastes the chosen clip back into the previously focused application. It is local-first and private by default, with opt-in peer-to-peer LAN sync.
+vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v4 search/CAS/migration hardening, and a tested sync-protocol foundation, but still uses `arboard`, stores the SQLite database without SQLCipher, and has no live sync transport. Current-versus-target status is tracked in [the batch 001-050 ledger](docs/implementation-batch-001-050.md).
 
 ---
 
@@ -27,7 +27,7 @@ vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard m
 
 ---
 
-## System diagram: copy -> monitor -> store -> hotkey -> popup -> paste-back
+## Target system diagram: copy -> monitor -> store -> hotkey -> popup -> paste-back
 
 ```
                           ┌──────────────────────────────────────────────────────────────┐
@@ -204,6 +204,11 @@ The crate tree above is the target workspace. Inside the **current single-proces
 | `src/tray.rs` | Menu-bar icon, menu state, and menu-event mapping |
 | `src/autostart.rs` | Per-OS launch-at-login registration |
 | `src/config.rs` | TOML configuration and defaults |
+| `src/heartbeat.rs` | Atomic external liveness publication for supervisors |
+| `src/maintenance.rs` | Capture-friendly expiry, embeddings, audit, FTS, and CAS maintenance |
+| `src/runtime_metrics.rs` | Bounded content-free metrics and crash snapshots |
+| `src/logging.rs` | Structured tracing formatter with field-name redaction |
+| `crates/vbuff-sync/` | Protocol/crypto foundation only; no discovery or runtime transport yet |
 
 ### SOLID/DRY decomposition and small reading slices
 
@@ -212,8 +217,8 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | Slice | Owns | Does not own | First files to read |
 |---|---|---|---|
 | **Types** | Serializable clip data, flavor bodies, ids, content-kind labels, runtime status/notice contracts, minimal startup intents/responses | SQL, UI state, OS calls, business rules | `crates/vbuff-types/src/lib.rs`, `status.rs`, `ipc.rs` |
-| **Core** | Pure dedup, classification, search ranking, eviction, capture-policy decisions | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs` |
-| **Store** | SQLite schema, migrations, transactions, durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs` |
+| **Core** | Pure dedup, classification, search ranking, eviction, capture policy, coalescing, integrity, ledgers, scheduling, facets, and fingerprints | `rusqlite`, `egui`, `arboard`, native APIs | `crates/vbuff-core/src/lib.rs`, then `capture/` |
+| **Store** | SQLite schema, migrations, transactions, FTS/facets/fingerprints, CAS, audits, and durable queries | Capture policy, GUI filtering decisions, native clipboard access | `crates/vbuff-store/src/lib.rs`, then `search.rs`, `migration.rs`, `cas.rs` |
 | **Platform** | Clipboard, hotkey, paste, tray capabilities behind traits | Product policy, SQL, visual layout | `crates/vbuff-platform/src/traits.rs` |
 | **GUI state** | Query text, selection, view visibility, queued UI actions | Clipboard reads/writes, DB mutations | `crates/vbuff-gui/src/state.rs` |
 | **GUI view** | Search box, rows, badges, thumbnails, keyboard navigation | Capture loop, retention, config parsing | `crates/vbuff-gui/src/app.rs`, `view.rs` |
@@ -223,6 +228,7 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | **Command layer** | Shared `Show`, `Paste`, `CopyLatest`, `ClearHistory`, `Pause`, autostart, and `Quit` semantics | UI widget styling, OS-specific event delivery | `src/commands.rs`, dispatched by `src/app.rs` |
 | **Startup handoff** | One resident process, length-prefixed startup intents, liveness probes, stale endpoint recovery | Clipboard history verbs, CLI API, GUI rendering | `crates/vbuff-types/src/ipc.rs`, `src/single_instance/mod.rs`, then one transport file |
 | **Diagnostics** | Typed `CaptureHealth`, heartbeat/stalled detection, redacted command notices, popup/tray status; target adds capability badges and doctor checks | Clip payload storage, transform behavior | `crates/vbuff-types/src/status.rs`, `src/diagnostics.rs`, `src/capture.rs`, `src/app.rs`, `src/tray.rs` |
+| **Sync foundation** | CRDT/HLC merge rules, key wrapping, sealed envelopes, membership, policy/lanes, Merkle reconciliation, recovery, receipts, capabilities, and wire padding | Network discovery, sockets, pairing screens, runtime replication | `crates/vbuff-sync/src/lib.rs`, then one concern module at a time |
 
 SOLID rules for future edits:
 
@@ -243,7 +249,10 @@ Current extraction status:
 6. **Done:** serializable capture-health/notice contracts live below the GUI in `vbuff-types`; the narrow `Diagnostics` publisher carries worker health and redacted command outcomes to popup/tray without coupling capture policy to rendering.
 7. **Done:** the capture worker publishes a monotonic heartbeat; its watchdog surfaces `CaptureHealth::Stalled`, ignores deliberate pause, and allows a later successful read to report recovery.
 8. **Done:** the root process performs bind-or-forward before opening storage or registering a hotkey; an OS-released owner lock serializes recovery, a second launch forwards `ShowPopup`, `Ping` proves liveness, and a stale endpoint is removed and rebound once.
-9. **Next:** give native backends a re-subscribe/restart hook, replace the Windows bootstrap fallback with the canonical named pipe, and move these stable contracts into `vbuff-daemon`/`vbuff-ipc` at M7.
+9. **Done:** schema v4 owns FTS5 prose/code indexes, structured facets, SimHash/dHash, keyset search, Bloom-assisted dedup, transactional refcounted CAS, verified migration preflight/rollback, expiry, and rolling content audits whose quarantine records never retain flavor bytes.
+10. **Done:** hotkey, tray, and second-instance events wake egui directly; a five-second supervisory repaint replaces the former 100 ms resident poll, while the visible popup uses a one-second refresh for expiry and capture state instead of repainting every frame.
+11. **Foundation:** `vbuff-sync` now has tested protocol/crypto building blocks, while transport, persistence, pairing UI, and runtime integration remain M9 work.
+12. **Next:** give native backends generation/provenance/concealed/all-flavor capture plus re-subscribe/restart hooks, replace the Windows bootstrap fallback with the canonical named pipe, and move stable contracts into `vbuff-daemon`/`vbuff-ipc` at M7.
 
 The current startup transport is deliberately smaller than the target IPC service. macOS/Linux use an owner-only Unix domain socket; Windows uses authenticated loopback plus owner-local metadata until the named-pipe backend lands. Both carry only `ShowPopup` and `Ping`, use bounded length-prefixed JSON frames, and keep clipboard data outside the bootstrap channel.
 
@@ -1085,7 +1094,7 @@ Note on sourcing: this prompt referenced a pitfalls JSON (with `pitfallsExec` / 
 | 16 | Slow search / full scans as history grows to 30k-50k items (CopyQ, Maccy) | FTS5 full-text index over a normalized text projection, kept in sync transactionally with inserts/deletes; virtualized, paged, keyset-loaded picker (never `SELECT *` the table) | `vbuff-store` (FTS5) + `vbuff-gui` (virtualized list) | Performance metric: picker open and search-as-you-type stay under ~16ms/frame with 50,000+ items |
 | 17 | Auto-paste silently fails, pastes into the wrong window, or leaks held modifiers (CopyQ, Win+V, Klipper) | Restore focus and wait for the target to be confirmed frontmost before injecting a real paste; clear physical modifier state first; surface a clear message on detected failure instead of a silent no-op | `vbuff-platform` (focus-restore + injection) | Cross-platform behavioral test: paste lands in the previously focused app; modifier state verified cleared; failure surfaces a message |
 | 18 | Routing the live DB through a cloud-sync folder -> `.conflict` files and corruption (Ditto) | Keep the DB in a per-machine, owner-only app-data location; sync at the record level through a real conflict-resolving protocol, never the raw SQLite file (non-goal); warn if the DB path is inside a known cloud folder | `vbuff-store` (path) + `vbuff-sync` (record-level) + `directories` | Startup check warns on cloud-folder DB path; sync conflict test asserts conflict-free record merge |
-| 19 | Insecure, paywalled, LAN-only, or dead-backend sync (CrossPaste LAN-only, Paste subscription/Apple-only, Clipt/1Clipboard dead backend) | Zero-knowledge E2E encrypted sync over the internet, on by default, with SAS/QR pairing and a self-host/local-only option; no single vendor backend that can read clips or be killed (non-goal) | `vbuff-sync` + `ring`/`rustls`/`x25519`+`chacha20poly1305` | Sync metric: clip appears on a paired device in a few seconds, E2E encrypted; relay sees only ciphertext, verified by test |
+| 19 | Insecure, paywalled, LAN-only, or dead-backend sync (CrossPaste LAN-only, Paste subscription/Apple-only, Clipt/1Clipboard dead backend) | Zero-knowledge E2E encrypted sync over the internet, explicitly opt-in, with SAS/QR pairing and a self-host/local-only option; no single vendor backend that can read clips or be killed (non-goal) | `vbuff-sync` + `ring`/`rustls`/`x25519`+`chacha20poly1305` | Sync metric: clip appears on a paired device in a few seconds, E2E encrypted; relay sees only ciphertext, verified by test |
 | 20 | Plaintext, world-readable history; no auth gate; recoverable "deleted" secrets in freelist/WAL/journal (Ditto, CopyQ, Win+V) | Create 0700/0600 data files in correct per-OS paths; encrypt sensitive items at rest; scrub deleted secrets with `secure_delete` + WAL-truncate + `VACUUM`; optional unlock gate for history | `vbuff-store` + `directories` + crypto crates | Permission audit on data dir/files; post-delete scan asserts no recoverable plaintext residue |
 | 21 | Capture silently dying - listener crash, broken Windows viewer-chain, GNOME Wayland unsupported, second manager fighting for the chain (Win+V, ClipboardFusion, CopyQ, Ditto) | Supervised capture component with a heartbeat/watchdog that re-registers OS hooks (modern `AddClipboardFormatListener`, not the fragile `SetClipboardViewer` chain); detect second managers and tolerate them via fingerprinting; always show a "capturing / paused / unsupported" status | `vbuff-daemon` (watchdog) + `vbuff-platform` | Self-test confirms listener registered; heartbeat after a known self-write detects a stalled chain and re-subscribes; visible health indicator makes silent loss impossible |
 | 22 | PRIMARY vs CLIPBOARD selection confusion floods or misses copies on Linux (X11 core, GPaste, Klipper, CopyQ) | Treat PRIMARY and CLIPBOARD as distinct sources; capture CLIPBOARD by default, make PRIMARY opt-in and debounced so mere selection does not flood history | `vbuff-platform` (Linux backend) | Test: select-to-copy does not create entries by default; opt-in PRIMARY only commits after the selection settles |
@@ -1102,6 +1111,7 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [README.md](README.md) - project overview, build & usage
 - [plan.md](plan.md) - phased implementation plan
 - [recommendation.md](recommendation.md) - prioritized product & engineering recommendations
+- [docs/implementation-batch-001-050.md](docs/implementation-batch-001-050.md) - execution status and review evidence for engineering backlog items 1-50
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - user-facing, sync, integration, and operations ideas 198-300
@@ -1111,6 +1121,20 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 high-signal repositories and the primary research/standards evidence catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
+
+---
+
+## Backlog execution batches
+
+The numbered backlog remains the canonical statement of intent; implementation status is kept separately so proposal text is never rewritten into a misleading completion claim.
+
+| Range | Execution state | Canonical evidence |
+|---|---|---|
+| 1-50 | First implementation/review batch complete at the runtime, foundation, adapted, or explicit native-required level | [Batch 001-050 ledger](docs/implementation-batch-001-050.md) |
+| 51-100 | Next engineering batch | Items below in this file |
+| 101-600 | Queued in groups of 50 | Shared range map below |
+
+The architectural cut line is strict: a pure algorithm can be complete as a foundation without being a shipped feature. In particular, native provenance/generation/realization work is not complete through `arboard`, and sync is not a user feature until authenticated transport, persistence, pairing UX, and replication are wired.
 
 ---
 

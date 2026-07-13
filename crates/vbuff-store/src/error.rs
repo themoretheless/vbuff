@@ -24,4 +24,12 @@ pub enum StoreError {
     /// A stored row was malformed.
     #[error("corrupt store row: {0}")]
     Corrupt(String),
+
+    /// A migration preflight, verification, or rollback failed.
+    #[error("migration error: {0}")]
+    Migration(String),
+
+    /// Privacy maintenance could not finish after a logical mutation.
+    #[error("store maintenance error: {0}")]
+    Maintenance(String),
 }

@@ -23,6 +23,8 @@ pub struct Config {
     /// Source apps to exclude from capture (matched as a substring of the
     /// source-app identifier). Stub-honored in the MVP.
     pub excluded_apps: Vec<String>,
+    /// Ordered source-context rules evaluated before content inspection.
+    pub source_rules: Vec<SourceRuleConfig>,
     /// Skip capturing empty/whitespace-only text copies.
     pub skip_whitespace_only: bool,
     /// Register vbuff to launch when the user logs in.
@@ -37,10 +39,31 @@ impl Default for Config {
             max_history: 500,
             paste_modifier: String::new(),
             excluded_apps: Vec::new(),
+            source_rules: Vec::new(),
             skip_whitespace_only: true,
             launch_at_login: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceRuleConfig {
+    pub app_contains: Option<String>,
+    pub title_regex: Option<String>,
+    pub url_host_suffix: Option<String>,
+    pub action: SourceRuleAction,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRuleAction {
+    #[default]
+    Capture,
+    Skip,
+    PlainTextOnly,
+    StripImages,
+    CaptureSensitive,
 }
 
 /// The default hotkey string for the current OS.

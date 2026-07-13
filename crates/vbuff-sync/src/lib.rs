@@ -1,0 +1,16 @@
+//! OS- and transport-independent E2E sync protocol primitives.
+
+pub mod bootstrap;
+pub mod capability;
+pub mod clock;
+pub mod crdt;
+pub mod crypto;
+pub mod ledger;
+pub mod membership;
+pub mod merkle;
+pub mod policy;
+pub mod wire;
+
+mod error;
+
+pub use error::{Result, SyncError};

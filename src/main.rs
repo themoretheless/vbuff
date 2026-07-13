@@ -10,8 +10,12 @@ mod capture;
 mod commands;
 mod config;
 mod diagnostics;
+mod heartbeat;
 mod history;
+mod logging;
+mod maintenance;
 mod paste;
+mod runtime_metrics;
 mod single_instance;
 #[cfg(feature = "tray")]
 mod tray;
@@ -20,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
+use vbuff_core::capture::SelfWriteLedger;
 use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
@@ -34,7 +39,7 @@ use single_instance::LaunchOutcome;
 const GUI_LIMIT: usize = 1000;
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
+    logging::init();
 
     let (_instance_guard, instance_intents) =
         match single_instance::acquire_or_forward(ClientIntent::ShowPopup)
@@ -60,13 +65,18 @@ fn main() -> anyhow::Result<()> {
     let shared: SharedState = Arc::new(Mutex::new(AppState::with_clips(recent)));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
     let diagnostics = Diagnostics::new(Arc::clone(&shared));
+    diagnostics.install_panic_hook();
+    let _heartbeat_thread = heartbeat::spawn(diagnostics.clone());
+    let _maintenance_thread = maintenance::spawn(history.clone(), diagnostics.clone());
     let paused = Arc::new(AtomicBool::new(false));
+    let self_writes = Arc::new(Mutex::new(SelfWriteLedger::default()));
 
     let _capture_thread = capture::spawn(
         history.clone(),
         diagnostics.clone(),
         Arc::clone(&paused),
         config.clone(),
+        Arc::clone(&self_writes),
     );
 
     let mut hotkey_backend = GlobalHotkeyBackend::new().context("creating hotkey backend")?;
@@ -87,12 +97,7 @@ fn main() -> anyhow::Result<()> {
         instance_intents,
         paused,
         config,
+        self_writes,
     );
     app::run(app_services, hotkey_backend, hotkey_id)
-}
-
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }

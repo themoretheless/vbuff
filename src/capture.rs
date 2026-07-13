@@ -5,61 +5,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vbuff_core::capture::{
+    AdaptivePollScheduler, CaptureAction, CaptureDecision, CaptureInput, CaptureLossLedger,
+    CaptureOutcome, CapturePolicy, CaptureRule, DropClass, DropReason, GenerationObservation,
+    GenerationTracker, PollObservation, SelectionSource, SelfTestObservation, SelfTestState,
+    SelfWriteLedger, SkippedCapture, SkippedCaptureRing, SourcePredicate, SubsystemBudget,
+    annotate_integrity, prune_redundant_flavors, verify_integrity,
+};
+use vbuff_core::observability::RedactedClipFields;
 use vbuff_core::{content_hash_from_flavors, detect_kind};
-use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend};
+use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardSelection};
 use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta};
 
-use crate::config::Config;
+use crate::config::{Config, SourceRuleAction};
 use crate::diagnostics::Diagnostics;
 use crate::history::History;
 
 const MIN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The pure, inexpensive rules that run before a clip reaches storage.
-#[derive(Clone, Debug)]
-struct CapturePolicy {
-    skip_whitespace_only: bool,
-    excluded_apps: Vec<String>,
-}
-
-impl From<&Config> for CapturePolicy {
-    fn from(config: &Config) -> Self {
-        Self {
-            skip_whitespace_only: config.skip_whitespace_only,
-            excluded_apps: config
-                .excluded_apps
-                .iter()
-                .filter(|app| !app.is_empty())
-                .map(|app| app.to_lowercase())
-                .collect(),
-        }
-    }
-}
-
-impl CapturePolicy {
-    fn accepts(&self, captured: &CapturedClipboard) -> bool {
-        if self.skip_whitespace_only
-            && captured
-                .flavors
-                .iter()
-                .find_map(|flavor| flavor.as_text())
-                .is_some_and(|text| text.trim().is_empty())
-        {
-            return false;
-        }
-
-        if captured.source_app.as_ref().is_some_and(|source| {
-            let source = source.to_lowercase();
-            self.excluded_apps
-                .iter()
-                .any(|excluded| source.contains(excluded))
-        }) {
-            return false;
-        }
-
-        true
-    }
-}
+const SKIP_RECOVERY_WINDOW_MS: u64 = 30_000;
 
 /// Keeps storage failures dominant until a later write proves recovery.
 #[derive(Default)]
@@ -118,6 +81,7 @@ pub(crate) fn spawn(
     diagnostics: Diagnostics,
     paused: Arc<AtomicBool>,
     config: Config,
+    self_writes: Arc<Mutex<SelfWriteLedger>>,
 ) -> std::thread::JoinHandle<()> {
     let heartbeat = Arc::new(Heartbeat::new(Instant::now()));
     let running = Arc::new(AtomicBool::new(true));
@@ -133,7 +97,7 @@ pub(crate) fn spawn(
     std::thread::spawn(move || {
         let panic_diagnostics = diagnostics.clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            run_worker(history, diagnostics, paused, config, heartbeat)
+            run_worker(history, diagnostics, paused, config, heartbeat, self_writes)
         }));
         running.store(false, Ordering::Release);
         if result.is_err() {
@@ -149,6 +113,7 @@ fn run_worker(
     paused: Arc<AtomicBool>,
     config: Config,
     heartbeat: Arc<Heartbeat>,
+    self_writes: Arc<Mutex<SelfWriteLedger>>,
 ) {
     heartbeat.beat();
     let mut clipboard = match ArboardClipboard::new() {
@@ -160,27 +125,59 @@ fn run_worker(
         }
     };
 
-    diagnostics.capture_health(CaptureHealth::Watching);
-    let policy = CapturePolicy::from(&config);
-    let interval = Duration::from_millis(config.poll_interval_ms.max(50));
+    if capture_self_test(&mut clipboard, &self_writes) {
+        diagnostics.capture_health(CaptureHealth::Watching);
+    } else {
+        diagnostics.capture_health(CaptureHealth::SelfTestFailed);
+        tracing::warn!("clipboard capture self-test failed; continuing in degraded mode");
+    }
+    let policy = capture_policy(&config);
+    let initial_interval = Duration::from_millis(config.poll_interval_ms.max(50));
+    let mut scheduler = AdaptivePollScheduler::new(
+        Duration::from_millis(config.poll_interval_ms.clamp(50, 120)),
+        initial_interval,
+        Duration::from_millis(config.poll_interval_ms.max(900)),
+    );
+    diagnostics.poll_interval(scheduler.interval());
     let mut last_hash: Option<[u8; 32]> = None;
     let mut health_state = CaptureHealthState::default();
+    let mut generation_tracker = GenerationTracker::default();
+    let mut loss_ledger = CaptureLossLedger::default();
+    let mut skipped = SkippedCaptureRing::new(8);
+    let budget = Arc::new(Mutex::new(SubsystemBudget::new(
+        Duration::from_secs(60),
+        Duration::from_millis(120),
+        600,
+    )));
+    let budget_tripped = Arc::new(AtomicBool::new(false));
+    let request_backoff = Arc::new(AtomicBool::new(false));
 
     loop {
+        if request_backoff.swap(false, Ordering::AcqRel) {
+            diagnostics.poll_interval(scheduler.back_off());
+        }
         heartbeat.beat();
-        std::thread::sleep(interval);
+        std::thread::sleep(scheduler.interval());
         heartbeat.beat();
+        let _budget_guard = CaptureBudgetGuard::new(
+            Arc::clone(&budget),
+            Arc::clone(&budget_tripped),
+            Arc::clone(&request_backoff),
+            diagnostics.clone(),
+        );
 
         if paused.load(Ordering::Relaxed) {
+            observe_scheduler(&mut scheduler, &diagnostics, PollObservation::Stable);
             continue;
         }
 
-        let captured = match clipboard.read() {
+        let mut captured = match clipboard.read() {
             Ok(captured) => {
                 if let Some(health) = health_state.read_succeeded() {
                     diagnostics.capture_health(health);
                 }
                 if captured.is_empty() {
+                    observe_scheduler(&mut scheduler, &diagnostics, PollObservation::Stable);
                     continue;
                 }
                 captured
@@ -191,23 +188,192 @@ fn run_worker(
                 {
                     tracing::warn!("clipboard read failed; retrying: {error}");
                 }
+                observe_scheduler(&mut scheduler, &diagnostics, PollObservation::MissRisk);
                 continue;
             }
         };
-        let hash = content_hash_from_flavors(&captured.flavors);
-        if last_hash == Some(hash) {
+        annotate_integrity(&mut captured.flavors);
+        if !verify_integrity(&captured.flavors).is_empty() {
+            record_drop(
+                &history,
+                &diagnostics,
+                &mut loss_ledger,
+                DropReason::TornRead,
+                1,
+            );
+            observe_scheduler(&mut scheduler, &diagnostics, PollObservation::MissRisk);
             continue;
         }
 
-        if !policy.accepts(&captured) {
-            last_hash = Some(hash);
+        let observed_hash = content_hash_from_flavors(&captured.flavors);
+        let observed_at = Instant::now();
+        let recovery_requested = diagnostics.take_skipped_recovery();
+        let explicit_recovery = recovery_requested
+            && skipped.latest().is_some_and(|entry| {
+                entry.reason.is_recoverable()
+                    && observed_at.saturating_duration_since(entry.observed_at)
+                        <= Duration::from_millis(SKIP_RECOVERY_WINDOW_MS)
+                    && entry.provenance == captured.provenance
+                    && entry.content_hash == observed_hash
+                    && match (entry.generation, captured.generation) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+
+        if last_hash == Some(observed_hash) && !explicit_recovery {
+            observe_scheduler(&mut scheduler, &diagnostics, PollObservation::Stable);
+            continue;
+        }
+        observe_scheduler(
+            &mut scheduler,
+            &diagnostics,
+            PollObservation::ClipboardChanged,
+        );
+
+        if !explicit_recovery && let Some(generation) = captured.generation {
+            match generation_tracker.observe(generation) {
+                GenerationObservation::Gap { missed } => record_drop(
+                    &history,
+                    &diagnostics,
+                    &mut loss_ledger,
+                    DropReason::GenerationGap,
+                    missed,
+                ),
+                GenerationObservation::Stale => {
+                    record_drop(
+                        &history,
+                        &diagnostics,
+                        &mut loss_ledger,
+                        DropReason::GenerationStale,
+                        1,
+                    );
+                    continue;
+                }
+                GenerationObservation::First
+                | GenerationObservation::Consecutive
+                | GenerationObservation::EpochChanged => {}
+            }
+        }
+
+        let self_write = self_writes
+            .lock()
+            .map(|mut ledger| ledger.matches(observed_hash, &captured.lineage, Instant::now()))
+            .unwrap_or_else(|_| {
+                tracing::error!("self-write ledger mutex poisoned");
+                false
+            });
+        let policy_input = CaptureInput {
+            flavors: &captured.flavors,
+            provenance: &captured.provenance,
+            source: match captured.selection {
+                ClipboardSelection::Clipboard => SelectionSource::Clipboard,
+                ClipboardSelection::Primary => SelectionSource::Primary,
+            },
+            primary_intended: captured.primary_intended,
+            coherent_generation: captured.coherent_generation,
+            concealed: captured.concealed,
+            self_write,
+        };
+        let decision = if explicit_recovery
+            && !self_write
+            && captured.coherent_generation
+            && captured
+                .flavors
+                .iter()
+                .any(vbuff_types::Flavor::is_realized)
+        {
+            CaptureDecision::Capture {
+                action: CaptureAction::Capture,
+                sensitive: true,
+                sync_eligible: false,
+                expires_after: None,
+            }
+        } else {
+            policy.decide(policy_input)
+        };
+
+        let CaptureDecision::Capture {
+            action,
+            sensitive,
+            sync_eligible,
+            expires_after,
+        } = decision
+        else {
+            let CaptureDecision::Skip(reason) = decision else {
+                unreachable!()
+            };
+            skipped.push(SkippedCapture {
+                observed_at,
+                reason,
+                provenance: captured.provenance.clone(),
+                generation: captured.generation,
+                content_hash: observed_hash,
+            });
+            if reason.is_recoverable() {
+                diagnostics.offer_skipped_recovery(Duration::from_millis(SKIP_RECOVERY_WINDOW_MS));
+            } else {
+                diagnostics.clear_skipped_recovery();
+            }
+            record_drop(&history, &diagnostics, &mut loss_ledger, reason, 1);
+            if reason.class() == DropClass::Intentional {
+                last_hash = Some(observed_hash);
+            } else {
+                observe_scheduler(&mut scheduler, &diagnostics, PollObservation::MissRisk);
+            }
+            continue;
+        };
+
+        apply_action(&mut captured.flavors, action);
+        prune_redundant_flavors(&mut captured.flavors);
+        if !captured
+            .flavors
+            .iter()
+            .any(vbuff_types::Flavor::is_realized)
+        {
+            record_drop(
+                &history,
+                &diagnostics,
+                &mut loss_ledger,
+                DropReason::NoRealizedFlavor,
+                1,
+            );
             continue;
         }
 
-        let clip = build_clip(captured, hash);
-        match history.insert(&clip, config.max_history) {
+        let stored_hash = content_hash_from_flavors(&captured.flavors);
+        let clip = build_clip(
+            captured,
+            stored_hash,
+            sensitive,
+            sync_eligible,
+            expires_after,
+        );
+        let fields = RedactedClipFields::from(&clip);
+        let span = tracing::info_span!(
+            "capture_commit",
+            clip_id = %fields.clip_id,
+            byte_size = fields.byte_size,
+            kind = ?fields.kind,
+            source_app = fields.source_app.unwrap_or("[redacted]"),
+            sensitive = fields.sensitive,
+        );
+        let _entered = span.enter();
+        diagnostics.write_queue_depth(1);
+        let insert_started = Instant::now();
+        let insert_result = history.insert(&clip, config.max_history);
+        diagnostics.latency("capture_insert", insert_started.elapsed());
+        diagnostics.write_queue_depth(0);
+        match insert_result {
             Ok(()) => {
-                last_hash = Some(hash);
+                diagnostics.clear_skipped_recovery();
+                last_hash = Some(observed_hash);
+                loss_ledger.captured();
+                diagnostics.capture_outcome(CaptureOutcome::Captured, 1);
+                if let Err(error) = history.record_capture_outcome(CaptureOutcome::Captured, 1) {
+                    tracing::warn!("capture accounting write failed: {error}");
+                }
                 diagnostics.capture_health(health_state.store_succeeded());
             }
             Err(error) => {
@@ -216,8 +382,202 @@ fn run_worker(
                 if diagnostics.capture_health(health_state.store_failed()) {
                     tracing::warn!("capture insert failed; retrying: {error}");
                 }
+                record_drop(
+                    &history,
+                    &diagnostics,
+                    &mut loss_ledger,
+                    DropReason::StoreFailure,
+                    1,
+                );
             }
         }
+    }
+}
+
+struct CaptureBudgetGuard {
+    started: cpu_time::ThreadTime,
+    budget: Arc<Mutex<SubsystemBudget>>,
+    tripped: Arc<AtomicBool>,
+    request_backoff: Arc<AtomicBool>,
+    diagnostics: Diagnostics,
+}
+
+impl CaptureBudgetGuard {
+    fn new(
+        budget: Arc<Mutex<SubsystemBudget>>,
+        tripped: Arc<AtomicBool>,
+        request_backoff: Arc<AtomicBool>,
+        diagnostics: Diagnostics,
+    ) -> Self {
+        Self {
+            started: cpu_time::ThreadTime::now(),
+            budget,
+            tripped,
+            request_backoff,
+            diagnostics,
+        }
+    }
+}
+
+impl Drop for CaptureBudgetGuard {
+    fn drop(&mut self) {
+        let observation = self
+            .budget
+            .lock()
+            .map(|mut budget| budget.record(Instant::now(), self.started.elapsed(), 1));
+        let Ok(observation) = observation else {
+            return;
+        };
+        let exceeded = observation != vbuff_core::capture::BudgetObservation::WithinBudget;
+        if exceeded {
+            self.request_backoff.store(true, Ordering::Release);
+            if !self.tripped.swap(true, Ordering::AcqRel) {
+                self.diagnostics.budget_trip();
+                tracing::warn!(
+                    ?observation,
+                    "capture subsystem exceeded its rolling budget"
+                );
+            }
+        } else {
+            self.tripped.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn observe_scheduler(
+    scheduler: &mut AdaptivePollScheduler,
+    diagnostics: &Diagnostics,
+    observation: PollObservation,
+) {
+    let interval = scheduler.observe(observation, Instant::now());
+    diagnostics.poll_interval(interval);
+}
+
+fn capture_self_test(
+    clipboard: &mut impl ClipboardBackend,
+    self_writes: &Arc<Mutex<SelfWriteLedger>>,
+) -> bool {
+    let Ok(original) = clipboard.read() else {
+        return false;
+    };
+    let nonce = ClipId::new().to_string_repr();
+    let probe = vec![vbuff_types::Flavor::inline(
+        "text/plain;charset=utf-8",
+        format!("vbuff-self-test-{nonce}").into_bytes(),
+    )];
+    let probe_hash = content_hash_from_flavors(&probe);
+    let lineage = vbuff_types::CaptureLineage {
+        origin_device: None,
+        write_nonce: Some(nonce.clone()),
+    };
+    let mut state = SelfTestState::start(probe_hash);
+
+    let probe_ok = clipboard.write_tagged(&probe, &lineage).is_ok()
+        && clipboard.read().is_ok_and(|observed| {
+            let observed_hash = content_hash_from_flavors(&observed.flavors);
+            let suppressed = self_writes
+                .lock()
+                .map(|mut ledger| {
+                    ledger.register(probe_hash, nonce, Instant::now());
+                    ledger.matches(observed_hash, &observed.lineage, Instant::now())
+                })
+                .unwrap_or(false);
+            observed_hash == probe_hash && suppressed
+        });
+    state = state.observe(if probe_ok {
+        SelfTestObservation::EchoConfirmed
+    } else {
+        SelfTestObservation::UnexpectedEcho
+    });
+
+    let restored = if original.is_empty() {
+        clipboard.clear().is_ok()
+    } else {
+        let restore_nonce = ClipId::new().to_string_repr();
+        let restore_lineage = vbuff_types::CaptureLineage {
+            origin_device: None,
+            write_nonce: Some(restore_nonce.clone()),
+        };
+        let restored = clipboard
+            .write_tagged(&original.flavors, &restore_lineage)
+            .is_ok();
+        if restored {
+            let restore_hash = content_hash_from_flavors(&original.flavors);
+            if let Ok(mut ledger) = self_writes.lock() {
+                ledger.register(restore_hash, restore_nonce, Instant::now());
+            }
+        }
+        restored
+    };
+    state = state.observe(if restored {
+        SelfTestObservation::RestoreConfirmed
+    } else {
+        SelfTestObservation::TimedOut
+    });
+
+    state == SelfTestState::Passed
+}
+
+fn capture_policy(config: &Config) -> CapturePolicy {
+    let rules = config
+        .source_rules
+        .iter()
+        .filter_map(|rule| {
+            let predicate = SourcePredicate::try_new(
+                rule.app_contains.clone(),
+                rule.title_regex.as_deref(),
+                rule.url_host_suffix.clone(),
+            )
+            .map_err(|error| {
+                tracing::warn!(pattern = ?rule.title_regex, "invalid capture-rule regex: {error}");
+            })
+            .ok()?;
+            let action = match rule.action {
+                SourceRuleAction::Capture => CaptureAction::Capture,
+                SourceRuleAction::Skip => CaptureAction::Skip,
+                SourceRuleAction::PlainTextOnly => CaptureAction::PlainTextOnly,
+                SourceRuleAction::StripImages => CaptureAction::StripImages,
+                SourceRuleAction::CaptureSensitive => CaptureAction::CaptureSensitive,
+            };
+            Some(CaptureRule { predicate, action })
+        })
+        .collect();
+    CapturePolicy {
+        skip_whitespace_only: config.skip_whitespace_only,
+        excluded_apps: config
+            .excluded_apps
+            .iter()
+            .filter(|app| !app.is_empty())
+            .cloned()
+            .collect(),
+        rules,
+        ..CapturePolicy::default()
+    }
+}
+
+fn apply_action(flavors: &mut Vec<vbuff_types::Flavor>, action: CaptureAction) {
+    match action {
+        CaptureAction::PlainTextOnly => flavors.retain(vbuff_types::Flavor::is_plain_text),
+        CaptureAction::StripImages => flavors.retain(|flavor| !flavor.is_image()),
+        CaptureAction::Capture | CaptureAction::CaptureSensitive => {}
+        CaptureAction::Skip => flavors.clear(),
+    }
+}
+
+fn record_drop(
+    history: &History,
+    diagnostics: &Diagnostics,
+    ledger: &mut CaptureLossLedger,
+    reason: DropReason,
+    count: u64,
+) {
+    ledger.dropped_n(reason, count);
+    diagnostics.capture_outcome(CaptureOutcome::Dropped(reason), count);
+    if let Err(error) = history.record_capture_outcome(CaptureOutcome::Dropped(reason), count) {
+        tracing::warn!(
+            reason = reason.as_str(),
+            "capture accounting write failed: {error}"
+        );
     }
 }
 
@@ -262,7 +622,13 @@ fn watchdog_health(
     (!paused && heartbeat.is_stale(now, timeout)).then_some(CaptureHealth::Stalled)
 }
 
-fn build_clip(captured: CapturedClipboard, content_hash: [u8; 32]) -> Clip {
+fn build_clip(
+    captured: CapturedClipboard,
+    content_hash: [u8; 32],
+    sensitive: bool,
+    sync_eligible: bool,
+    expires_after: Option<Duration>,
+) -> Clip {
     let kind = detect_kind(&captured.flavors);
     let byte_size = captured
         .flavors
@@ -270,11 +636,22 @@ fn build_clip(captured: CapturedClipboard, content_hash: [u8; 32]) -> Clip {
         .map(|flavor| flavor.body.byte_size())
         .sum();
 
+    let source_app = captured.provenance.app_id.clone();
+    let mut meta = ClipMeta::now(kind, byte_size, source_app);
+    meta.provenance = captured.provenance;
+    meta.generation = captured.generation;
+    meta.lineage = captured.lineage;
+    meta.sensitive = sensitive;
+    meta.sync_eligible = sync_eligible;
+    meta.expires_at = expires_after
+        .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
+        .map(|ttl| chrono::Utc::now() + ttl);
+
     Clip {
         id: ClipId::new(),
         flavors: captured.flavors,
         content_hash,
-        meta: ClipMeta::now(kind, byte_size, captured.source_app),
+        meta,
         pinned: false,
         favorite: false,
     }
@@ -283,13 +660,57 @@ fn build_clip(captured: CapturedClipboard, content_hash: [u8; 32]) -> Clip {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vbuff_platform::{PlatformError, Result as PlatformResult};
     use vbuff_types::Flavor;
+
+    #[derive(Clone)]
+    struct SelfTestClipboard {
+        current: CapturedClipboard,
+    }
+
+    impl ClipboardBackend for SelfTestClipboard {
+        fn read(&mut self) -> PlatformResult<CapturedClipboard> {
+            Ok(self.current.clone())
+        }
+
+        fn write(&mut self, flavors: &[Flavor]) -> PlatformResult<()> {
+            if flavors.is_empty() {
+                return Err(PlatformError::Empty);
+            }
+            self.current = CapturedClipboard {
+                flavors: flavors.to_vec(),
+                ..CapturedClipboard::default()
+            };
+            Ok(())
+        }
+
+        fn clear(&mut self) -> PlatformResult<()> {
+            self.current = CapturedClipboard::default();
+            Ok(())
+        }
+    }
 
     fn captured(text: &str, source_app: Option<&str>) -> CapturedClipboard {
         CapturedClipboard {
             flavors: vec![Flavor::inline("text/plain", text.as_bytes().to_vec())],
-            source_app: source_app.map(str::to_owned),
+            provenance: vbuff_types::CaptureProvenance {
+                app_id: source_app.map(str::to_owned),
+                ..Default::default()
+            },
+            ..CapturedClipboard::default()
         }
+    }
+
+    fn decision(policy: &CapturePolicy, captured: &CapturedClipboard) -> CaptureDecision {
+        policy.decide(CaptureInput {
+            flavors: &captured.flavors,
+            provenance: &captured.provenance,
+            source: SelectionSource::Clipboard,
+            primary_intended: true,
+            coherent_generation: true,
+            concealed: false,
+            self_write: false,
+        })
     }
 
     #[test]
@@ -298,21 +719,51 @@ mod tests {
             excluded_apps: vec!["onepassword".into()],
             ..Default::default()
         };
-        let policy = CapturePolicy::from(&config);
+        let policy = capture_policy(&config);
 
-        assert!(!policy.accepts(&captured("  \n", None)));
-        assert!(!policy.accepts(&captured("secret", Some("com.AgileBits.OnePassword7"))));
-        assert!(policy.accepts(&captured("hello", Some("com.apple.Safari"))));
+        assert_eq!(
+            decision(&policy, &captured("  \n", None)),
+            CaptureDecision::Skip(DropReason::WhitespaceOnly)
+        );
+        assert_eq!(
+            decision(
+                &policy,
+                &captured("secret", Some("com.AgileBits.OnePassword7"))
+            ),
+            CaptureDecision::Skip(DropReason::ExcludedSource)
+        );
+        assert!(matches!(
+            decision(&policy, &captured("hello", Some("com.apple.Safari"))),
+            CaptureDecision::Capture { .. }
+        ));
+    }
+
+    #[test]
+    fn plain_text_action_drops_html_and_images() {
+        let mut flavors = vec![
+            Flavor::inline("text/html", b"<b>safe</b>".to_vec()),
+            Flavor::inline("text/plain;charset=utf-8", b"safe".to_vec()),
+            Flavor::inline("image/png", vec![1, 2, 3]),
+        ];
+
+        apply_action(&mut flavors, CaptureAction::PlainTextOnly);
+
+        assert_eq!(flavors.len(), 1);
+        assert!(flavors[0].is_plain_text());
     }
 
     #[test]
     fn build_clip_preserves_source_and_byte_count() {
         let captured = captured("hello", Some("editor.app"));
         let hash = content_hash_from_flavors(&captured.flavors);
-        let clip = build_clip(captured, hash);
+        let clip = build_clip(captured, hash, true, false, Some(Duration::from_secs(90)));
 
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));
+        assert_eq!(clip.meta.provenance.app_id.as_deref(), Some("editor.app"));
+        assert!(clip.meta.sensitive);
+        assert!(!clip.meta.sync_eligible);
+        assert!(clip.meta.expires_at.is_some());
         assert_eq!(clip.content_hash, hash);
     }
 
@@ -358,5 +809,24 @@ mod tests {
 
         assert_eq!(watchdog_timeout(&fast), Duration::from_secs(5));
         assert_eq!(watchdog_timeout(&slow), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn self_test_restores_and_suppresses_the_original_clipboard() {
+        let original = captured("do not recapture me", Some("secret.app"));
+        let original_hash = content_hash_from_flavors(&original.flavors);
+        let mut clipboard = SelfTestClipboard { current: original };
+        let ledger = Arc::new(Mutex::new(SelfWriteLedger::default()));
+
+        assert!(capture_self_test(&mut clipboard, &ledger));
+        assert_eq!(
+            content_hash_from_flavors(&clipboard.current.flavors),
+            original_hash
+        );
+        assert!(ledger.lock().unwrap().matches(
+            original_hash,
+            &vbuff_types::CaptureLineage::default(),
+            Instant::now(),
+        ));
     }
 }

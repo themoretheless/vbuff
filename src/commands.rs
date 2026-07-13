@@ -16,6 +16,7 @@ pub(crate) enum AppCommand {
     RequestClearHistory,
     ClearHistory,
     TogglePause,
+    RecoverSkipped,
     #[cfg(feature = "tray")]
     ToggleAutostart,
     DismissNotice,
@@ -32,6 +33,7 @@ impl From<UiAction> for AppCommand {
             UiAction::Delete(id) => Self::Delete(id),
             UiAction::ClearHistory => Self::ClearHistory,
             UiAction::TogglePause => Self::TogglePause,
+            UiAction::RecoverSkipped => Self::RecoverSkipped,
             UiAction::DismissNotice => Self::DismissNotice,
             UiAction::Hide => Self::Hide,
         }
@@ -55,6 +57,14 @@ mod tests {
         assert_eq!(
             AppCommand::from(UiAction::DismissNotice),
             AppCommand::DismissNotice
+        );
+    }
+
+    #[test]
+    fn skipped_capture_recovery_stays_a_high_level_command() {
+        assert_eq!(
+            AppCommand::from(UiAction::RecoverSkipped),
+            AppCommand::RecoverSkipped
         );
     }
 }

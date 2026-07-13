@@ -1,8 +1,9 @@
 //! Shared state and action types exchanged between the GUI and the app wiring.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use vbuff_types::{CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel};
+use vbuff_types::{CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel};
 
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
 /// background capture thread can push new clips while the GUI reads them.
@@ -14,6 +15,10 @@ pub struct AppState {
     pub paused: bool,
     /// Current health of the resident capture worker.
     pub capture_health: CaptureHealth,
+    /// Content-free accounting for this resident-process session.
+    pub capture_stats: CaptureSessionStats,
+    /// A recent privacy skip may be explicitly re-read from the live clipboard.
+    pub recoverable_skip_until: Option<Instant>,
     /// Latest redacted command result, dismissible from the popup.
     pub notice: Option<CommandNotice>,
     /// Set to true by the wiring when the popup should be shown/focused.
@@ -52,6 +57,34 @@ impl AppState {
         true
     }
 
+    pub fn add_capture_stats(&mut self, captured: u64, skipped: u64, lost: u64) {
+        self.capture_stats.captured = self.capture_stats.captured.saturating_add(captured);
+        self.capture_stats.intentionally_skipped = self
+            .capture_stats
+            .intentionally_skipped
+            .saturating_add(skipped);
+        self.capture_stats.lost = self.capture_stats.lost.saturating_add(lost);
+    }
+
+    pub fn offer_skipped_recovery(&mut self, now: Instant, window: Duration) {
+        self.recoverable_skip_until = now.checked_add(window);
+    }
+
+    pub fn clear_skipped_recovery(&mut self) {
+        self.recoverable_skip_until = None;
+    }
+
+    pub fn skipped_recovery_available(&self, now: Instant) -> bool {
+        self.recoverable_skip_until
+            .is_some_and(|deadline| now <= deadline)
+    }
+
+    pub fn take_skipped_recovery(&mut self, now: Instant) -> bool {
+        let available = self.skipped_recovery_available(now);
+        self.clear_skipped_recovery();
+        available
+    }
+
     /// Replace the current command notice with a redacted message.
     pub fn set_notice(&mut self, level: NoticeLevel, message: impl Into<String>) {
         self.notice = Some(CommandNotice {
@@ -82,6 +115,8 @@ pub enum UiAction {
     ClearHistory,
     /// Toggle capture pause.
     TogglePause,
+    /// Explicitly keep the current clipboard after a recent privacy skip.
+    RecoverSkipped,
     /// Dismiss the current command result.
     DismissNotice,
     /// Hide the popup (Esc / focus loss).
@@ -118,5 +153,18 @@ mod tests {
 
         state.clear_notice();
         assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn skipped_recovery_offer_expires_and_is_single_use() {
+        let mut state = AppState::default();
+        let now = Instant::now();
+        state.offer_skipped_recovery(now, Duration::from_secs(30));
+        assert!(state.skipped_recovery_available(now + Duration::from_secs(29)));
+        assert!(!state.skipped_recovery_available(now + Duration::from_secs(31)));
+
+        state.offer_skipped_recovery(now, Duration::from_secs(30));
+        assert!(state.take_skipped_recovery(now));
+        assert!(!state.take_skipped_recovery(now));
     }
 }

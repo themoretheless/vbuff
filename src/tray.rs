@@ -90,30 +90,22 @@ impl Tray {
         self.clear_history.set_enabled(clip_count > 0);
     }
 
-    pub(crate) fn poll(&self) -> Vec<AppCommand> {
-        let mut commands = Vec::new();
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let command = if event.id == self.show_id {
-                Some(AppCommand::Show)
-            } else if event.id == self.copy_latest_id {
-                Some(AppCommand::CopyLatest)
-            } else if event.id == self.clear_history_id {
-                Some(AppCommand::RequestClearHistory)
-            } else if event.id == self.pause_id {
-                Some(AppCommand::TogglePause)
-            } else if event.id == self.autostart_id {
-                Some(AppCommand::ToggleAutostart)
-            } else if event.id == self.quit_id {
-                Some(AppCommand::Quit)
-            } else {
-                None
-            };
-
-            if let Some(command) = command {
-                commands.push(command);
-            }
+    pub(crate) fn command_for(&self, event: &MenuEvent) -> Option<AppCommand> {
+        if event.id == self.show_id {
+            Some(AppCommand::Show)
+        } else if event.id == self.copy_latest_id {
+            Some(AppCommand::CopyLatest)
+        } else if event.id == self.clear_history_id {
+            Some(AppCommand::RequestClearHistory)
+        } else if event.id == self.pause_id {
+            Some(AppCommand::TogglePause)
+        } else if event.id == self.autostart_id {
+            Some(AppCommand::ToggleAutostart)
+        } else if event.id == self.quit_id {
+            Some(AppCommand::Quit)
+        } else {
+            None
         }
-        commands
     }
 }
 

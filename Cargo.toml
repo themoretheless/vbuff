@@ -16,6 +16,7 @@ vbuff-core = { path = "crates/vbuff-core" }
 vbuff-store = { path = "crates/vbuff-store" }
 vbuff-platform = { path = "crates/vbuff-platform" }
 vbuff-gui = { path = "crates/vbuff-gui" }
+vbuff-sync = { path = "crates/vbuff-sync" }
 
 # Data / serialization
 serde = { version = "1", features = ["derive"] }
@@ -24,9 +25,11 @@ toml = "0.8"
 ulid = { version = "1.2", features = ["serde"] }
 blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+url = "2"
 
 # Storage
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 
 # GUI
 eframe = { version = "0.32", default-features = false, features = [
@@ -51,6 +54,20 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cpu-time = "1"
+atomic-write-file = "0.3"
+crossbeam-queue = "0.3.12"
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3.0"
+x25519-dalek = { version = "2.0.1", features = ["getrandom", "static_secrets", "zeroize"] }
+bip39 = "2.2.2"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+zstd = "0.13"
+getrandom = "0.3"
+zeroize = "1.8"
 
 [package]
 name = "vbuff"
@@ -90,4 +107,8 @@ dirs.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+cpu-time.workspace = true
+atomic-write-file.workspace = true
+crossbeam-queue.workspace = true
 blake3.workspace = true
+chrono.workspace = true
