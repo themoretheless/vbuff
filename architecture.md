@@ -317,7 +317,7 @@ pub trait ClipboardBackend: Send {
 }
 
 /// Register/unregister global hotkeys and deliver presses.
-pub trait HotkeyBackend: Send {
+pub trait HotkeyBackend {
     fn register(&self, id: HotkeyId, combo: &KeyCombo) -> Result<()>;
     fn unregister(&self, id: HotkeyId) -> Result<()>;
     fn events(&self) -> Receiver<HotkeyId>;
@@ -339,6 +339,12 @@ pub trait TrayBackend: Send {
     fn events(&self) -> Receiver<TrayEvent>; // Open, TogglePause, PasteRecent(idx), Quit...
 }
 ```
+
+`HotkeyBackend` deliberately has no `Send` supertrait. Native registration
+managers can own thread-affine event-loop handles (including the Windows
+manager used by `global-hotkey`); the owner stays on its creating thread and
+forwards only typed hotkey events across channels. Clipboard and paste
+backends retain `Send` because the current runtime moves them into workers.
 
 Two adjacent traits round out the platform surface (kept separate so they can degrade independently): `SecretStoreBackend` (Keychain / DPAPI-Credential-Manager / Secret-Service) and `AutostartBackend` (LaunchAgent/SMAppService / Run-key / XDG autostart).
 

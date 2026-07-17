@@ -80,3 +80,5 @@ Reviewed on 2026-07-18. This ledger is the execution overlay for engineering bac
 This batch is accepted only after formatting, strict clippy, all workspace and no-default tests, golden snapshots, release performance budgets, dependency policy/audit/vet, fuzz-target compilation, documentation contracts, local-link checks, workflow syntax review, and `git diff --check` pass. Native-required and foundation rows are not release claims.
 
 Local macOS execution completed those gates on 2026-07-18, including five short libFuzzer campaigns and a generated app-bundle smoke test. The checked-in GitHub Actions matrix remains responsible for clean macOS/Windows/Linux reruns, credentialed notarization, independent-runner reproducibility, scheduled mutation testing, and longer fuzz campaigns.
+
+The first post-merge Windows matrix run exposed an invalid cross-platform assumption: the native global-hotkey manager is thread-affine there, while the shared trait required `Send`. The follow-up review removed that unnecessary supertrait, documented event-loop ownership, and added a non-`Send` conformance test so the Windows contract cannot regress silently.
