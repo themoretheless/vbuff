@@ -129,9 +129,10 @@ pub trait ClipboardBackend: Send {
 /// Registers and delivers global hotkeys.
 ///
 /// Event delivery uses the backing crate's global receiver; callers poll it
-/// from their event loop (see the app crate). The trait therefore only covers
-/// (un)registration.
-pub trait HotkeyBackend: Send {
+/// from their event loop (see the app crate). Registration managers may wrap
+/// thread-affine OS handles, so they remain on the creating event-loop thread;
+/// only the event channel crosses thread boundaries.
+pub trait HotkeyBackend {
     /// Register the given combo as the show/hide hotkey. Returns the opaque
     /// platform id of the registered hotkey.
     fn register(&mut self, combo: &KeyCombo) -> Result<u32>;
@@ -149,4 +150,42 @@ pub trait PasteBackend: Send {
 
     /// Send the platform paste combo (Cmd+V on macOS, Ctrl+V elsewhere).
     fn paste(&mut self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+
+    struct ThreadAffineHotkey {
+        marker: Rc<()>,
+    }
+
+    impl HotkeyBackend for ThreadAffineHotkey {
+        fn register(&mut self, _combo: &KeyCombo) -> Result<u32> {
+            Ok(7)
+        }
+
+        fn unregister(&mut self, _id: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hotkey_backends_may_be_thread_affine() {
+        let mut backend = ThreadAffineHotkey {
+            marker: Rc::new(()),
+        };
+        let combo = KeyCombo {
+            modifiers: vec![Modifier::Control],
+            key: "V".to_string(),
+        };
+
+        let id = backend.register(&combo).unwrap();
+        backend.unregister(id).unwrap();
+
+        assert_eq!(id, 7);
+        assert_eq!(Rc::strong_count(&backend.marker), 1);
+    }
 }
