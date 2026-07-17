@@ -5,7 +5,10 @@
 //! with SMAppService, installer-managed Run keys, or systemd units, but the
 //! app already has a working toggle.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::PathBuf;
 
 /// Register or unregister vbuff for launch at login.
 pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
