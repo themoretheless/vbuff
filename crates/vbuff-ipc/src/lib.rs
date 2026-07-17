@@ -3,12 +3,16 @@
 
 pub mod api_token;
 pub mod batch;
+pub mod callback;
 pub mod dry_run;
 pub mod event;
 pub mod handshake;
 
 pub use api_token::{ApiScope, ApiTokenClaims, ApiTokenError, ApiTokenIssuer};
 pub use batch::{BatchMutation, BatchRequest, BatchResponse};
+pub use callback::{
+    CallbackError, CallbackInvocation, CallbackTarget, CallbackTokenIssuer, TransformAction,
+};
 pub use dry_run::{DryRunPreview, DryRunRequest};
 pub use event::{EventEnvelope, EventFilter, EventKind};
 pub use handshake::{

@@ -52,6 +52,17 @@ impl History {
         })
     }
 
+    /// Insert one explicit starter pack and refresh the snapshot once.
+    pub(crate) fn insert_many(&self, clips: &[Clip], max_history: usize) -> anyhow::Result<()> {
+        self.mutate_and_refresh(|store| {
+            for clip in clips {
+                store.insert(clip)?;
+            }
+            store.enforce_cap(max_history)?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn record_capture_outcome(
         &self,
         outcome: CaptureOutcome,

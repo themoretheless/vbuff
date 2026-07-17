@@ -16,16 +16,23 @@ use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::{SearchResult, search};
 use vbuff_types::{
-    Body, CaptureHealth, Clip, ClipId, CommandNotice, NoticeLevel, SecurityPostureLevel,
-    SecurityPostureSummary,
+    Body, CapabilityView, CapabilityViewLevel, CaptureHealth, Clip, ClipId, CommandNotice,
+    NoticeLevel, PrivacyDecisionLevel, PrivacyLedgerSummary, SecurityPostureLevel,
+    SecurityPostureSummary, SloMetricState, SloStatusSummary,
 };
 
 use crate::design::{self, Icon};
-use crate::state::{SharedState, UiAction};
+use crate::state::{SharedState, StarterPack, UiAction};
 use crate::view::{relative_time, short_app_name};
 
 const MAX_THUMBNAIL_DIMENSION: u32 = 16_384;
 const MAX_THUMBNAIL_RGBA_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopupSurface {
+    History,
+    Trust,
+}
 
 /// The eframe application driving the popup.
 pub struct PopupApp {
@@ -56,6 +63,8 @@ pub struct PopupApp {
     confirm_clear_history: bool,
     /// Clip awaiting explicit delete confirmation.
     confirm_delete: Option<ClipId>,
+    /// Compact history and inspectable trust surfaces share one popup.
+    surface: PopupSurface,
 }
 
 impl PopupApp {
@@ -74,6 +83,7 @@ impl PopupApp {
             design_applied: false,
             confirm_clear_history: false,
             confirm_delete: None,
+            surface: PopupSurface::History,
         }
     }
 
@@ -89,6 +99,7 @@ impl PopupApp {
         self.selected = 0;
         self.confirm_clear_history = false;
         self.confirm_delete = None;
+        self.surface = PopupSurface::History;
         self.shown_at = Some(Instant::now());
         self.request_focus_next_frame = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -99,6 +110,13 @@ impl PopupApp {
     pub fn request_clear_history_confirmation(&mut self, ctx: &egui::Context) {
         self.show(ctx);
         self.confirm_clear_history = true;
+    }
+
+    /// Open the popup directly on its trust surface.
+    pub fn request_trust_view(&mut self, ctx: &egui::Context) {
+        self.show(ctx);
+        self.surface = PopupSurface::Trust;
+        self.request_focus_next_frame = false;
     }
 
     /// Hide the popup.
@@ -133,6 +151,9 @@ impl eframe::App for PopupApp {
             capture_health,
             capture_stats,
             security_posture,
+            capabilities,
+            privacy_ledger,
+            slo_status,
             recoverable_skip,
             notice,
             show_requested,
@@ -149,6 +170,9 @@ impl eframe::App for PopupApp {
                 s.capture_health,
                 s.capture_stats,
                 s.security_posture,
+                s.capabilities.clone(),
+                s.privacy_ledger.clone(),
+                s.slo_status.clone(),
                 s.skipped_recovery_available(std::time::Instant::now()),
                 s.notice.clone(),
                 show,
@@ -205,20 +229,25 @@ impl eframe::App for PopupApp {
                 if i.key_pressed(Key::Escape) {
                     self.actions.push_back(UiAction::Hide);
                 }
-                if i.key_pressed(Key::ArrowDown) && total > 0 {
+                if self.surface == PopupSurface::History
+                    && i.key_pressed(Key::ArrowDown)
+                    && total > 0
+                {
                     self.selected = (self.selected + 1).min(total - 1);
                 }
-                if i.key_pressed(Key::ArrowUp) && total > 0 {
+                if self.surface == PopupSurface::History && i.key_pressed(Key::ArrowUp) && total > 0
+                {
                     self.selected = self.selected.saturating_sub(1);
                 }
-                if i.key_pressed(Key::Enter)
+                if self.surface == PopupSurface::History
+                    && i.key_pressed(Key::Enter)
                     && total > 0
                     && let Some(id) = filtered.get(self.selected)
                 {
                     self.actions.push_back(UiAction::Paste(*id));
                 }
                 // Cmd/Ctrl + 1..9 quick select.
-                if modifier_down {
+                if self.surface == PopupSurface::History && modifier_down {
                     for (n, key) in [
                         (1, Key::Num1),
                         (2, Key::Num2),
@@ -250,114 +279,101 @@ impl eframe::App for PopupApp {
             clips.iter().map(|c| (c.id, c)).collect();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Header: search box + status.
-            ui.horizontal(|ui| {
-                let hint = if paused {
-                    "Search (capture PAUSED)…"
-                } else {
-                    "Search…"
-                };
-                let edit = egui::TextEdit::singleline(&mut self.query)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY);
-                let resp = ui.add(edit);
-                if self.request_focus_next_frame {
-                    resp.request_focus();
-                    self.request_focus_next_frame = false;
-                } else if !resp.has_focus() && self.actions.is_empty() {
-                    // Keep the search box focused for type-to-filter.
-                    resp.request_focus();
-                }
-            });
+            self.render_surface_header(ui, paused);
 
-            ui.horizontal(|ui| {
-                render_capture_status(ui, paused, capture_health);
-                ui.separator();
-                render_security_status(ui, security_posture);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!clips.is_empty(), egui::Button::new("Clear history"))
-                        .clicked()
-                    {
-                        self.confirm_clear_history = true;
-                        self.confirm_delete = None;
-                    }
-                    let (pause_icon, pause_tooltip) = if paused {
-                        (Icon::Resume, "Resume capture")
-                    } else {
-                        (Icon::Pause, "Pause capture")
-                    };
-                    if design::icon_button(ui, pause_icon, pause_tooltip, paused).clicked() {
-                        self.actions.push_back(UiAction::TogglePause);
-                    }
-                });
-            });
-            if recoverable_skip {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Current copy was skipped")
-                            .small()
-                            .color(Color32::from_rgb(210, 144, 32)),
-                    );
-                    if ui.small_button("Keep current copy").clicked() {
-                        self.actions.push_back(UiAction::RecoverSkipped);
-                    }
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.small(format!("{total} items"));
-                    ui.separator();
-                    ui.small(format!(
-                        "{} saved · {} skipped",
-                        compact_count(capture_stats.captured),
-                        compact_count(capture_stats.intentionally_skipped)
-                    ));
-                    let loss_color = if capture_stats.lost == 0 {
-                        ui.visuals().weak_text_color()
-                    } else {
-                        Color32::from_rgb(194, 64, 72)
-                    };
-                    ui.label(
-                        RichText::new(format!("{} lost", compact_count(capture_stats.lost)))
-                            .small()
-                            .color(loss_color),
-                    );
-                });
-            }
-            if let Some(notice) = &notice {
-                self.render_notice(ui, notice);
-            }
-            ui.separator();
-
-            if total == 0 {
-                ui.with_layout(
-                    egui::Layout::top_down_justified(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(72.0);
-                        let message = if self.query.trim().is_empty() {
-                            "No clipboard history yet"
-                        } else {
-                            "No matching clips"
-                        };
-                        ui.label(RichText::new(message).strong());
-                    },
-                );
-            } else {
-                // Stable-height virtualized rows keep controls from shifting.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, design::ROW_HEIGHT, total, |ui, row_range| {
-                        for row in row_range {
-                            let Some(id) = filtered.get(row) else {
-                                continue;
+            match self.surface {
+                PopupSurface::History => {
+                    ui.horizontal(|ui| {
+                        render_capture_status(ui, paused, capture_health);
+                        ui.separator();
+                        render_security_status(ui, security_posture);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_enabled_ui(!clips.is_empty(), |ui| {
+                                if design::icon_button(ui, Icon::Delete, "Clear history", false)
+                                    .clicked()
+                                {
+                                    self.confirm_clear_history = true;
+                                    self.confirm_delete = None;
+                                }
+                            });
+                            let (pause_icon, pause_tooltip) = if paused {
+                                (Icon::Resume, "Resume capture")
+                            } else {
+                                (Icon::Pause, "Pause capture")
                             };
-                            let Some(clip) = clip_by_id.get(id) else {
-                                continue;
-                            };
-                            let selected = row == self.selected;
-                            self.render_row(ui, ctx, row, clip, selected);
-                        }
+                            if design::icon_button(ui, pause_icon, pause_tooltip, paused).clicked()
+                            {
+                                self.actions.push_back(UiAction::TogglePause);
+                            }
+                        });
                     });
+                    if recoverable_skip {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Current copy was skipped")
+                                    .small()
+                                    .color(Color32::from_rgb(210, 144, 32)),
+                            );
+                            if ui.small_button("Keep current copy").clicked() {
+                                self.actions.push_back(UiAction::RecoverSkipped);
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.small(format!("{total} items"));
+                            ui.separator();
+                            ui.small(format!(
+                                "{} saved · {} skipped",
+                                compact_count(capture_stats.captured),
+                                compact_count(capture_stats.intentionally_skipped)
+                            ));
+                            let loss_color = if capture_stats.lost == 0 {
+                                ui.visuals().weak_text_color()
+                            } else {
+                                Color32::from_rgb(194, 64, 72)
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} lost",
+                                    compact_count(capture_stats.lost)
+                                ))
+                                .small()
+                                .color(loss_color),
+                            );
+                        });
+                    }
+                    if let Some(notice) = &notice {
+                        self.render_notice(ui, notice);
+                    }
+                    ui.separator();
+
+                    if total == 0 {
+                        self.render_empty_history(ui, clips.is_empty());
+                    } else {
+                        // Stable-height virtualized rows keep controls from shifting.
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show_rows(ui, design::ROW_HEIGHT, total, |ui, row_range| {
+                                for row in row_range {
+                                    let Some(id) = filtered.get(row) else {
+                                        continue;
+                                    };
+                                    let Some(clip) = clip_by_id.get(id) else {
+                                        continue;
+                                    };
+                                    let selected = row == self.selected;
+                                    self.render_row(ui, ctx, row, clip, selected);
+                                }
+                            });
+                    }
+                }
+                PopupSurface::Trust => self.render_trust_surface(
+                    ui,
+                    security_posture,
+                    &capabilities,
+                    &privacy_ledger,
+                    &slo_status,
+                ),
             }
         });
 
@@ -371,6 +387,204 @@ impl eframe::App for PopupApp {
 }
 
 impl PopupApp {
+    fn render_surface_header(&mut self, ui: &mut egui::Ui, paused: bool) {
+        ui.horizontal(|ui| match self.surface {
+            PopupSurface::History => {
+                let hint = if paused {
+                    "Search (capture paused)…"
+                } else {
+                    "Search…"
+                };
+                let search_width =
+                    (ui.available_width() - design::ICON_BUTTON_SIZE - 8.0).max(160.0);
+                let edit = egui::TextEdit::singleline(&mut self.query).hint_text(hint);
+                let response = ui.add_sized([search_width, design::ICON_BUTTON_SIZE], edit);
+                if self.request_focus_next_frame {
+                    response.request_focus();
+                    self.request_focus_next_frame = false;
+                } else if !response.has_focus() && self.actions.is_empty() {
+                    response.request_focus();
+                }
+                if design::icon_button(ui, Icon::Shield, "Trust and privacy", false).clicked() {
+                    self.surface = PopupSurface::Trust;
+                }
+            }
+            PopupSurface::Trust => {
+                let title_width =
+                    (ui.available_width() - design::ICON_BUTTON_SIZE - 8.0).max(160.0);
+                ui.add_sized(
+                    [title_width, design::ICON_BUTTON_SIZE],
+                    egui::Label::new(RichText::new("Trust and privacy").strong()),
+                );
+                if design::icon_button(ui, Icon::History, "Clipboard history", false).clicked() {
+                    self.surface = PopupSurface::History;
+                    self.request_focus_next_frame = true;
+                }
+            }
+        });
+    }
+
+    fn render_empty_history(&mut self, ui: &mut egui::Ui, history_is_empty: bool) {
+        ui.with_layout(
+            egui::Layout::top_down_justified(egui::Align::Center),
+            |ui| {
+                ui.add_space(56.0);
+                let truly_empty = history_is_empty && self.query.trim().is_empty();
+                ui.label(
+                    RichText::new(if truly_empty {
+                        "No clipboard history yet"
+                    } else {
+                        "No matching clips"
+                    })
+                    .strong(),
+                );
+                if truly_empty {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Add local examples").small().weak());
+                    ui.horizontal(|ui| {
+                        const PACK_BUTTON_WIDTH: f32 = 88.0;
+                        let row_width = PACK_BUTTON_WIDTH * 2.0 + ui.spacing().item_spacing.x;
+                        ui.add_space(((ui.available_width() - row_width) / 2.0).max(0.0));
+                        if ui
+                            .add_sized([PACK_BUTTON_WIDTH, 28.0], egui::Button::new("Developer"))
+                            .clicked()
+                        {
+                            self.actions
+                                .push_back(UiAction::InstallStarterPack(StarterPack::Developer));
+                        }
+                        if ui
+                            .add_sized([PACK_BUTTON_WIDTH, 28.0], egui::Button::new("Writing"))
+                            .clicked()
+                        {
+                            self.actions
+                                .push_back(UiAction::InstallStarterPack(StarterPack::Writing));
+                        }
+                    });
+                }
+            },
+        );
+    }
+
+    fn render_trust_surface(
+        &mut self,
+        ui: &mut egui::Ui,
+        posture: SecurityPostureSummary,
+        capabilities: &[CapabilityView],
+        ledger: &PrivacyLedgerSummary,
+        slo: &SloStatusSummary,
+    ) {
+        let posture_color = security_color(posture.level);
+        egui::Frame::new()
+            .fill(posture_color.gamma_multiply(0.10))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    design::status_dot(ui, posture_color);
+                    ui.label(RichText::new(posture.level.label()).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(format!(
+                            "{} active · {} degraded · {} unavailable",
+                            posture.active, posture.degraded, posture.unavailable
+                        ));
+                    });
+                });
+            });
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Release SLOs").strong());
+                egui::Grid::new("trust_slo_grid")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        render_slo_row(ui, "Zero lost captures", slo.zero_loss, "budget 0");
+                        render_slo_row(ui, "Search p99", slo.search_latency, "budget 16 ms");
+                        render_slo_row(ui, "Idle CPU", slo.idle_cpu, "budget 0.5%");
+                        render_slo_row(ui, "Login ready", slo.login_ready, "budget 1.5 s");
+                    });
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("Platform capabilities").strong());
+                if capabilities.is_empty() {
+                    ui.label(RichText::new("No capability evidence published").weak());
+                } else {
+                    for capability in capabilities {
+                        let color = capability_color(capability.level);
+                        ui.horizontal_wrapped(|ui| {
+                            design::status_dot(ui, color);
+                            ui.label(RichText::new(capability.feature.replace('_', " ")).strong());
+                            ui.label(RichText::new(capability.level.label()).small().color(color));
+                            ui.label(RichText::new(&capability.detail).small().weak());
+                        });
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Privacy decisions").strong());
+                    let color = if ledger.chain_valid {
+                        Color32::from_rgb(44, 156, 103)
+                    } else {
+                        Color32::from_rgb(194, 64, 72)
+                    };
+                    ui.label(
+                        RichText::new(if ledger.chain_valid {
+                            "Chain verified"
+                        } else {
+                            "Chain invalid"
+                        })
+                        .small()
+                        .color(color),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("head {}", ledger.head_hash_prefix))
+                                .small()
+                                .monospace()
+                                .weak(),
+                        );
+                    });
+                });
+                if ledger.recent.is_empty() {
+                    ui.label(RichText::new("No capture decisions in this session").weak());
+                } else {
+                    for event in &ledger.recent {
+                        let color = privacy_color(event.decision);
+                        let time = chrono::DateTime::<Utc>::from_timestamp_millis(
+                            event.timestamp_ms as i64,
+                        )
+                        .map(|value| value.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "--:--:--".into());
+                        ui.horizontal(|ui| {
+                            design::status_dot(ui, color);
+                            ui.monospace(format!("#{:04}", event.sequence));
+                            ui.label(RichText::new(event.decision.label()).color(color));
+                            ui.label(format!("{} ×{}", event.reason, event.count));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new(time).small().weak());
+                                },
+                            );
+                        });
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("Release trust").strong());
+                ui.horizontal(|ui| {
+                    ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                    ui.separator();
+                    ui.label(RichText::new("Offline checksum verification").small());
+                    ui.separator();
+                    ui.label(RichText::new("Signed provenance workflow").small());
+                });
+            });
+    }
+
     fn render_notice(&mut self, ui: &mut egui::Ui, notice: &CommandNotice) {
         let (accent, fill) = match notice.level {
             NoticeLevel::Info => (
@@ -625,11 +839,7 @@ fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth)
 }
 
 fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) {
-    let color = match posture.level {
-        SecurityPostureLevel::Protected => Color32::from_rgb(44, 156, 103),
-        SecurityPostureLevel::Partial => Color32::from_rgb(210, 144, 32),
-        SecurityPostureLevel::Blocked => Color32::from_rgb(194, 64, 72),
-    };
+    let color = security_color(posture.level);
     design::status_dot(ui, color);
     ui.label(RichText::new(posture.level.label()).small().color(color))
         .on_hover_text(format!(
@@ -643,6 +853,43 @@ fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) {
                 ""
             }
         ));
+}
+
+fn security_color(level: SecurityPostureLevel) -> Color32 {
+    match level {
+        SecurityPostureLevel::Protected => Color32::from_rgb(44, 156, 103),
+        SecurityPostureLevel::Partial => Color32::from_rgb(210, 144, 32),
+        SecurityPostureLevel::Blocked => Color32::from_rgb(194, 64, 72),
+    }
+}
+
+fn capability_color(level: CapabilityViewLevel) -> Color32 {
+    match level {
+        CapabilityViewLevel::Active => Color32::from_rgb(44, 156, 103),
+        CapabilityViewLevel::Degraded => Color32::from_rgb(210, 144, 32),
+        CapabilityViewLevel::Unavailable => Color32::from_rgb(194, 64, 72),
+        CapabilityViewLevel::NotApplicable => Color32::from_rgb(112, 120, 132),
+    }
+}
+
+fn privacy_color(level: PrivacyDecisionLevel) -> Color32 {
+    match level {
+        PrivacyDecisionLevel::Captured => Color32::from_rgb(44, 156, 103),
+        PrivacyDecisionLevel::Skipped => Color32::from_rgb(210, 144, 32),
+        PrivacyDecisionLevel::Lost => Color32::from_rgb(194, 64, 72),
+    }
+}
+
+fn render_slo_row(ui: &mut egui::Ui, label: &str, state: SloMetricState, budget: &str) {
+    let color = match state {
+        SloMetricState::Met => Color32::from_rgb(44, 156, 103),
+        SloMetricState::Breached => Color32::from_rgb(194, 64, 72),
+        SloMetricState::Unknown => Color32::from_rgb(112, 120, 132),
+    };
+    ui.label(label);
+    ui.label(RichText::new(state.label()).small().color(color));
+    ui.label(RichText::new(budget).small().weak());
+    ui.end_row();
 }
 
 fn row_preview(clip: &Clip) -> String {

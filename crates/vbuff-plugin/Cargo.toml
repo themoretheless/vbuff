@@ -7,9 +7,11 @@ description = "Capability-scoped WASM component contracts and plugin SDK for vbu
 
 [dependencies]
 vbuff-types.workspace = true
+vbuff-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
 url.workspace = true
+toml.workspace = true

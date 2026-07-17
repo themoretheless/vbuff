@@ -19,6 +19,8 @@ pub(crate) enum Icon {
     Pause,
     Resume,
     Close,
+    Shield,
+    History,
 }
 
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -54,6 +56,8 @@ pub(crate) fn icon_button(
         Icon::Pause => draw_pause(ui, center, stroke),
         Icon::Resume => draw_resume(ui, center, visuals.fg_stroke.color),
         Icon::Close => draw_close(ui, center, stroke),
+        Icon::Shield => draw_shield(ui, center, stroke),
+        Icon::History => draw_history(ui, center, stroke),
     }
 
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), tooltip));
@@ -145,4 +149,41 @@ fn draw_close(ui: &Ui, center: Pos2, stroke: Stroke) {
         ],
         stroke,
     );
+}
+
+fn draw_shield(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let points = vec![
+        center + egui::vec2(0.0, -7.0),
+        center + egui::vec2(6.0, -4.5),
+        center + egui::vec2(5.0, 2.5),
+        center + egui::vec2(0.0, 7.0),
+        center + egui::vec2(-5.0, 2.5),
+        center + egui::vec2(-6.0, -4.5),
+    ];
+    ui.painter().add(Shape::closed_line(
+        points,
+        Stroke::new(1.6_f32, stroke.color),
+    ));
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-2.5, 0.0),
+            center + egui::vec2(-0.5, 2.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-0.5, 2.0),
+            center + egui::vec2(3.2, -2.5),
+        ],
+        stroke,
+    );
+}
+
+fn draw_history(ui: &Ui, center: Pos2, stroke: Stroke) {
+    ui.painter().circle_stroke(center, 6.0, stroke);
+    ui.painter()
+        .line_segment([center, center + egui::vec2(0.0, -3.5)], stroke);
+    ui.painter()
+        .line_segment([center, center + egui::vec2(3.0, 1.5)], stroke);
 }

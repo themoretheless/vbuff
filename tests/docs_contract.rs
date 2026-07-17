@@ -97,6 +97,10 @@ fn top_docs_link_every_complete_implementation_batch() {
             "docs/implementation-batch-051-100.md",
             (51..=100).collect::<Vec<_>>(),
         ),
+        (
+            "docs/implementation-batch-101-150.md",
+            (101..=150).collect::<Vec<_>>(),
+        ),
     ] {
         for file in TOP_DOCS {
             assert!(
@@ -128,6 +132,7 @@ fn top_docs_link_every_complete_implementation_batch() {
 #[test]
 fn research_catalog_has_exact_repository_and_source_ids() {
     let research = read("docs/repositories-research-100.md");
+    assert!(research.contains("verified through the GitHub GraphQL API on 2026-07-18"));
     let repository_rows: Vec<&str> = research
         .lines()
         .filter(|line| numbered_table_id(line, "GH-").is_some())
@@ -203,7 +208,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("## Read the project in small pieces"));
     assert!(readme.contains("## Design direction"));
     assert!(readme.contains("`AppCommand` is the one command vocabulary"));
-    assert!(readme.contains("typed capture-health state"));
+    assert!(readme.contains("typed capture-health vocabulary"));
     assert!(readme.contains("read `src/diagnostics.rs`"));
     assert!(readme.contains("read `src/single_instance/mod.rs`"));
     assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
@@ -245,6 +250,8 @@ fn local_markdown_links_resolve() {
         "docs/repositories-research-100.md",
         "docs/implementation-batch-001-050.md",
         "docs/implementation-batch-051-100.md",
+        "docs/implementation-batch-101-150.md",
+        "docs/product-strategy-decisions.md",
     ];
 
     for file in docs {

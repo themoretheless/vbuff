@@ -1,6 +1,6 @@
 # vbuff - Architecture & System Design
 
-vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v4 search/CAS/migration hardening, tiered capture recovery, byte/RSS pressure policy, secret clawback, doctor/strict posture, and tested sync/IPC/plugin foundations, but still uses `arboard`, stores the SQLite database without SQLCipher, and has no live sync transport or plugin runtime. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md) and [batch 051-100](docs/implementation-batch-051-100.md) ledgers.
+vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v4 search/CAS/migration hardening, tiered capture recovery, byte/RSS pressure policy, secret clawback, a live Trust/privacy/SLO surface, redacted config exchange, an offline verifier, and tested sync/IPC/plugin/update foundations. It still uses `arboard`, stores the SQLite database without SQLCipher, and has no live sync transport, plugin runtime, or updater fetch/install path. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), and [batch 101-150](docs/implementation-batch-101-150.md) ledgers.
 
 ---
 
@@ -184,6 +184,7 @@ vbuff/
 │   ├── vbuff-ipc/             # framed protocol (serde) over UDS/named-pipe; client + server.
 │   ├── vbuff-plugin/          # WIT, manifests, typed transforms, adapters, recognizers, signed bundles.
 │   ├── vbuff-sync/            # mDNS discovery, Noise/TLS transport, pairing, replication (LAN P2P).
+│   ├── vbuff-update/          # signed update manifests, build attestations, checksum verification.
 │   └── vbuff-cli/             # `vbuff` verbs; pure IPC client. shell completions, --json.
 └── src/main.rs                # the single binary: role dispatch (daemon vs forward vs cli verb).
 ```
@@ -205,6 +206,8 @@ The crate tree above is the target workspace. Inside the **current single-proces
 | `src/tray.rs` | Menu-bar icon, menu state, and menu-event mapping |
 | `src/autostart.rs` | Per-OS launch-at-login registration |
 | `src/config.rs` | TOML configuration and defaults |
+| `src/seed_pack.rs` | Explicit local starter clips; no onboarding or persistence policy |
+| `src/verify.rs` | Offline release checksum CLI adapter; no network or update installation |
 | `src/heartbeat.rs` | Atomic external liveness publication for supervisors |
 | `src/maintenance.rs` | Capture-friendly expiry, embeddings, audit, FTS, and CAS maintenance |
 | `src/doctor.rs` | Content-free human/JSON startup, store, and security health report |
@@ -214,6 +217,7 @@ The crate tree above is the target workspace. Inside the **current single-proces
 | `crates/vbuff-sync/` | Protocol/crypto foundation only; no discovery or runtime transport yet |
 | `crates/vbuff-ipc/` | Versioned/scoped control contracts only; no daemon listener/dispatcher yet |
 | `crates/vbuff-plugin/` | Capability/typed-plugin contracts only; no Wasmtime component host yet |
+| `crates/vbuff-update/` | Signed update/build-verification contracts; no network fetch or installer yet |
 
 ### SOLID/DRY decomposition and small reading slices
 
@@ -236,6 +240,7 @@ The implementation should remain learnable as a set of small, single-purpose sli
 | **IPC foundation** | Version/capability negotiation, event filters, dry-run, scoped tokens, and bounded batch contracts | Socket ownership, authentication transport, command execution | `crates/vbuff-ipc/src/lib.rs`, then one concern module at a time |
 | **Plugin foundation** | WIT identity, manifests/grants, typed pipelines, adapters, recognizers, signed bundles, and lockfile | Wasmtime execution, ambient OS access, installation UI | `crates/vbuff-plugin/src/lib.rs`, then one concern module at a time |
 | **Sync foundation** | CRDT/HLC merge rules, key wrapping, per-collection vault keys, sealed envelopes, membership, policy/lanes, Merkle reconciliation, recovery, receipts, capabilities, and wire padding | Network discovery, sockets, pairing screens, runtime replication | `crates/vbuff-sync/src/lib.rs`, then one concern module at a time |
+| **Update foundation** | Signed manifests, key rotation, downgrade/replay protection, staged rollout, build attestation, and streaming checksums | Network fetch, durable release state, install/rollback, updater UI | `crates/vbuff-update/src/lib.rs`, then `manifest.rs`, `attestation.rs`, and `src/verify.rs` |
 
 SOLID rules for future edits:
 
@@ -261,7 +266,8 @@ Current extraction status:
 11. **Foundation:** `vbuff-sync` now has tested protocol/crypto building blocks, while transport, persistence, pairing UI, and runtime integration remain M9 work.
 12. **Done:** tiered capture supervision, byte-aware backpressure, RSS-aware maintenance, secret detection/clawback, doctor output, process hardening, strict posture, FTS health, and atomic store batches are active in the current root runtime.
 13. **Foundation:** `vbuff-ipc` and `vbuff-plugin` own tested bounded contracts, but no daemon listener, local HTTP server, Wasmtime host, or third-party plugin execution is enabled.
-14. **Next:** give native backends generation/provenance/concealed/all-flavor capture plus in-place hook re-subscribe, replace the Windows bootstrap fallback with the canonical named pipe, and move stable contracts into `vbuff-daemon` at M7.
+14. **Done/foundation:** the popup owns a golden-tested History/Trust split; `Diagnostics` publishes a bounded hash-chained privacy ledger; `vbuff-update` owns signed release contracts; config/verify remain narrow root adapters.
+15. **Next:** give native backends generation/provenance/concealed/all-flavor capture plus in-place hook re-subscribe, replace the Windows bootstrap fallback with the canonical named pipe, and move stable contracts into `vbuff-daemon` at M7.
 
 The current startup transport is deliberately smaller than the target IPC service. macOS/Linux use an owner-only Unix domain socket; Windows uses authenticated loopback plus owner-local metadata until the named-pipe backend lands. Both carry only `ShowPopup` and `Ping`, use bounded length-prefixed JSON frames, and keep clipboard data outside the bootstrap channel.
 
@@ -1122,6 +1128,8 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [recommendation.md](recommendation.md) - prioritized product & engineering recommendations
 - [docs/implementation-batch-001-050.md](docs/implementation-batch-001-050.md) - execution status and review evidence for engineering backlog items 1-50
 - [docs/implementation-batch-051-100.md](docs/implementation-batch-051-100.md) - execution status and review evidence for engineering backlog items 51-100
+- [docs/implementation-batch-101-150.md](docs/implementation-batch-101-150.md) - release, Trust UI, migration/sync, product-policy, and review evidence for items 101-150
+- [docs/product-strategy-decisions.md](docs/product-strategy-decisions.md) - explicit resolution of conflicting licensing/pricing/governance hypotheses 128-140
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - user-facing, sync, integration, and operations ideas 198-300
@@ -1142,7 +1150,8 @@ The numbered backlog remains the canonical statement of intent; implementation s
 |---|---|---|
 | 1-50 | First implementation/review batch complete at the runtime, foundation, adapted, or explicit native-required level | [Batch 001-050 ledger](docs/implementation-batch-001-050.md) |
 | 51-100 | Second implementation/review batch complete with native and runtime dependencies kept explicit | [Batch 051-100 ledger](docs/implementation-batch-051-100.md) |
-| 101-600 | Queued in groups of 50 | Shared range map below |
+| 101-150 | Third implementation/review batch complete with native, release-credential, transport, and policy dependencies explicit | [Batch 101-150 ledger](docs/implementation-batch-101-150.md) |
+| 151-600 | Queued in groups of 50 | Shared range map below |
 
 The architectural cut line is strict: a pure algorithm can be complete as a foundation without being a shipped feature. In particular, native provenance/generation/realization work is not complete through `arboard`, and sync is not a user feature until authenticated transport, persistence, pairing UX, and replication are wired.
 

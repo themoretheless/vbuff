@@ -115,6 +115,30 @@ pub fn derive_collection_key(
     Ok(key)
 }
 
+pub fn derive_isolated_collection_key(
+    root_key: &[u8; 32],
+    unlock_secret: &[u8],
+    id: &CollectionVaultId,
+    epoch: u64,
+) -> Result<Zeroizing<[u8; 32]>> {
+    if unlock_secret.len() < 16 {
+        return Err(SyncError::Invalid(
+            "collection unlock secret is too short".into(),
+        ));
+    }
+    let mut input = Zeroizing::new(Vec::with_capacity(32 + unlock_secret.len()));
+    input.extend_from_slice(root_key);
+    input.extend_from_slice(unlock_secret);
+    let hkdf = Hkdf::<Sha256>::new(Some(b"vbuff-isolated-collection-v1"), &input);
+    let mut info = Vec::with_capacity(id.as_str().len() + 8);
+    info.extend_from_slice(id.as_str().as_bytes());
+    info.extend_from_slice(&epoch.to_be_bytes());
+    let mut key = Zeroizing::new([0_u8; 32]);
+    hkdf.expand(&info, &mut *key)
+        .map_err(|_| SyncError::Crypto)?;
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +171,16 @@ mod tests {
         };
         assert!(!state.permits_read());
         assert!(!state.permits_sync());
+    }
+
+    #[test]
+    fn isolated_vault_requires_a_distinct_unlock_secret() {
+        let id = CollectionVaultId::new("private").unwrap();
+        let first =
+            derive_isolated_collection_key(&[1; 32], b"correct horse battery", &id, 1).unwrap();
+        let second =
+            derive_isolated_collection_key(&[1; 32], b"different unlock key", &id, 1).unwrap();
+        assert_ne!(*first, *second);
+        assert!(derive_isolated_collection_key(&[1; 32], b"short", &id, 1).is_err());
     }
 }

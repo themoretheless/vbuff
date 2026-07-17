@@ -12,14 +12,20 @@
 //! * [`TrayBackend`] - a status-bar/tray icon (`tray-icon`, app crate).
 
 pub mod capabilities;
+pub mod cf_html;
 mod clipboard;
 mod error;
+pub mod format_map;
 pub mod geometry;
 mod hotkey;
+pub mod keymap;
 pub mod lifecycle;
 mod paste;
+pub mod paste_fidelity;
+pub mod permission;
 pub mod security;
 pub mod traits;
+pub mod tripwire;
 pub mod wayland;
 pub mod windows;
 
@@ -30,7 +36,13 @@ pub use traits::{
 };
 
 pub use capabilities::{CapabilityLevel, FeatureCapability, SecurityPosture};
+pub use cf_html::{CfHtml, CfHtmlError, parse_cf_html};
+pub use format_map::{FormatFamily, FormatKey, canonical_format};
+pub use keymap::{CanonicalAction, KeyBinding, KeymapTarget, canonical_keymap};
+pub use paste_fidelity::{PasteConformanceIssue, PasteConformanceReport, PasteTrace};
+pub use permission::{PermissionEvent, PermissionKind, PermissionState, PermissionWatchdog};
 pub use security::{ProcessHardeningReport, harden_current_process};
+pub use tripwire::{ClipboardReadObservation, ScrapeTripwire, TripwireAlert};
 
 pub use clipboard::ArboardClipboard;
 pub use hotkey::{GlobalHotkeyBackend, parse_combo};

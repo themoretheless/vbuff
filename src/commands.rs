@@ -1,6 +1,6 @@
 //! Commands shared by the popup, tray, hotkey, and app wiring.
 
-use vbuff_gui::UiAction;
+use vbuff_gui::{StarterPack, UiAction};
 use vbuff_types::ClipId;
 
 /// One vocabulary for every user-facing command surface.
@@ -17,6 +17,7 @@ pub(crate) enum AppCommand {
     ClearHistory,
     TogglePause,
     RecoverSkipped,
+    InstallStarterPack(StarterPack),
     #[cfg(feature = "tray")]
     ToggleAutostart,
     DismissNotice,
@@ -34,6 +35,7 @@ impl From<UiAction> for AppCommand {
             UiAction::ClearHistory => Self::ClearHistory,
             UiAction::TogglePause => Self::TogglePause,
             UiAction::RecoverSkipped => Self::RecoverSkipped,
+            UiAction::InstallStarterPack(pack) => Self::InstallStarterPack(pack),
             UiAction::DismissNotice => Self::DismissNotice,
             UiAction::Hide => Self::Hide,
         }

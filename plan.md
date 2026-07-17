@@ -8,9 +8,9 @@ The product wedge, restated so every milestone can be checked against it: vbuff 
 
 ## 0. The single-process MVP vs. the full multi-crate workspace
 
-`architecture.md` defines a Cargo workspace of nine crates plus a root binary:
+`architecture.md` defines a target Cargo workspace of eleven focused crates plus a root binary:
 
-`vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-daemon`, `vbuff-gui`, `vbuff-ipc`, `vbuff-sync`, `vbuff-cli`, and the root `src/main.rs` binary.
+`vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-daemon`, `vbuff-gui`, `vbuff-ipc`, `vbuff-plugin`, `vbuff-sync`, `vbuff-update`, `vbuff-cli`, and the root `src/main.rs` binary.
 
 The shippable MVP is a deliberate **single-process subset** of that workspace. The target MVP links and runs:
 
@@ -19,6 +19,7 @@ The shippable MVP is a deliberate **single-process subset** of that workspace. T
 - `vbuff-store` (currently bundled SQLite schema v4 + FTS5 + migrations + blob CAS + WAL; SQLCipher and OS-keystore integration are still required)
 - `vbuff-platform` (the four backend traits + per-OS impls + `MockBackend`)
 - `vbuff-gui` (eframe popup + settings viewports, the egui hot path)
+- `vbuff-update` (signed release contracts and the offline checksum verifier; network fetch/install remains deferred)
 - the root binary (`src/main.rs`): single-instance guard, role dispatch, wiring
 
 The later crates are explicitly deferred:
@@ -27,6 +28,7 @@ The later crates are explicitly deferred:
 - `vbuff-ipc` - the framed control-socket protocol and client/server; deferred to M7. The MVP still needs a single-instance guard (bind-or-forward) but its forwarded intent is minimal (just "show popup"), not the full IPC verb surface.
 - `vbuff-cli` - the `vbuff` verb surface (`list`/`get`/`copy`/`add`/`search`/`delete`, `--json`, completions); deferred to M8. It is a pure IPC client, so it cannot exist before `vbuff-ipc`.
 - `vbuff-sync` runtime integration - the crate now contains tested CRDT/HLC, envelope, membership, policy, anti-entropy, recovery, receipt, capability, and padding foundations. Discovery, authenticated transport, pairing UI, durable replication, and app wiring remain deferred to M9 (v1) and M11 (v2 transports).
+- `vbuff-plugin` runtime integration - manifests, typed transforms, migrations, offline evidence, and signed packs are tested foundations; Wasmtime execution and installation remain deferred.
 
 This means: in MVP, the root binary is both daemon and GUI host in one process, exactly as `architecture.md` describes ("the GUI runs inside the daemon process on the main thread, while capture/store/sync run on background threads"). The "daemon" is a *role*, not yet a separate crate. The crate split into `vbuff-daemon`/`vbuff-ipc` is a refactor we perform once the single-process loop is proven, precisely so the CLI and sync have something to talk to.
 
@@ -66,7 +68,7 @@ The expanded 600-idea backlog is reference material, not an implicit scope incre
 
 The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 
-Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `heartbeat`, `maintenance`, `memory_pressure`, `doctor`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, security posture, content-free notices, expiry/local/incomplete state, and saved/skipped/lost totals. Hotkey, tray, and second-instance messages wake egui directly, while tiered capture supervision, byte/RSS pressure policy, secret clawback, and maintenance budgets protect the resident loop. Store schema v4 owns FTS5 health/merge, facets, fingerprints, keyset sessions, transactional batches, CAS, migration verification, expiry, and audits. `vbuff-ipc` and `vbuff-plugin` now own tested future-facing contracts, but no daemon listener or Wasmtime host is enabled. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, live dispatch for the full IPC verb surface, and moves stable modules behind daemon/IPC contracts.
+Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `seed_pack`, `verify`, `heartbeat`, `maintenance`, `memory_pressure`, `doctor`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, detailed capabilities, a content-free hash-chained privacy ledger, explicit SLO states, notices, expiry/local/incomplete state, and saved/skipped/lost totals. The golden-tested popup keeps History and Trust as two compact surfaces, and empty history offers only explicit local seed packs. Hotkey, tray, and second-instance messages wake egui directly, while tiered capture supervision, byte/RSS pressure policy, secret clawback, and maintenance budgets protect the resident loop. Store schema v4 owns FTS5 health/merge, facets, fingerprints, keyset sessions, transactional batches, CAS, migration verification, expiry, and audits. `vbuff-ipc`, `vbuff-plugin`, `vbuff-sync`, and `vbuff-update` own tested future-facing contracts, but no daemon listener, Wasmtime host, sync transport, or auto-update install loop is enabled. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, live dispatch for the full IPC verb surface, and moves stable modules behind daemon/IPC contracts.
 
 ### Batch execution overlay
 
@@ -76,7 +78,8 @@ The 600-item list is now executed in sequential batches of 50 without rewriting 
 |---|---|---|
 | 001-050 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-001-050.md) |
 | 051-100 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-051-100.md); native APIs, SQLCipher, daemon dispatch, and Wasmtime remain milestone gates |
-| 101-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
+| 101-150 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-101-150.md); native OS conformance, release credentials, live updater/sync/plugin paths, and SQLCipher remain gates |
+| 151-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
 
 Batch completion does not override milestone acceptance. For example, item 035 can have a tested membership/SAS/rekey foundation while M9 remains open until pairing, authenticated transport, persistence, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite the broader schema v4 work already landed.
 
@@ -94,7 +97,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 
 **Phase.** Phase 0 (pre-MVP foundations).
 
-**Crates/modules touched.** Workspace root `Cargo.toml`; stubs for `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform` (with `macos/`, `windows/`, `linux/{x11,wayland}/` module tree), `vbuff-gui`, `vbuff-daemon`, `vbuff-ipc`, `vbuff-sync`, `vbuff-cli`; root `src/main.rs`.
+**Crates/modules touched.** Workspace root `Cargo.toml`; stubs for `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform` (with `macos/`, `windows/`, `linux/{x11,wayland}/` module tree), `vbuff-gui`, `vbuff-daemon`, `vbuff-ipc`, `vbuff-plugin`, `vbuff-sync`, `vbuff-update`, `vbuff-cli`; root `src/main.rs`.
 
 **Task checklist.**
 - [ ] Create `[workspace]` `Cargo.toml` listing all nine member crates plus the root binary; pin a workspace-wide Rust toolchain (`rust-toolchain.toml`) and a single edition.

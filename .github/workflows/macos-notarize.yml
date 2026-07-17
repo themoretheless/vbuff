@@ -1,0 +1,63 @@
+name: macOS Notarized Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  sign-notarize-gatekeeper:
+    runs-on: macos-15
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Require release credentials
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_APP_PASSWORD"
+      - name: Import signing identity
+        run: |
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p build "$RUNNER_TEMP/vbuff.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/vbuff.keychain-db"
+          security unlock-keychain -p build "$RUNNER_TEMP/vbuff.keychain-db"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/vbuff.keychain-db"
+          security list-keychain -d user -s "$RUNNER_TEMP/vbuff.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -s -k build "$RUNNER_TEMP/vbuff.keychain-db"
+      - name: Build app bundle
+        run: |
+          cargo build --release --locked
+          scripts/package-macos.sh target/release/vbuff dist/vbuff.app
+      - name: Sign hardened runtime
+        run: |
+          codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/vbuff.app
+          codesign --verify --deep --strict --verbose=2 dist/vbuff.app
+      - name: Notarize and verify Gatekeeper
+        run: |
+          ditto -c -k --keepParent dist/vbuff.app dist/vbuff-macos.zip
+          xcrun notarytool submit dist/vbuff-macos.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple dist/vbuff.app
+          xcrun stapler validate dist/vbuff.app
+          spctl --assess --type execute --verbose=4 dist/vbuff.app
+          ditto -c -k --keepParent dist/vbuff.app dist/vbuff-macos-notarized.zip
+          shasum -a 256 dist/vbuff-macos-notarized.zip > dist/SHA256SUMS-macos
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vbuff-macos-notarized
+          path: |
+            dist/vbuff-macos-notarized.zip
+            dist/SHA256SUMS-macos
+          if-no-files-found: error

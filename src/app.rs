@@ -116,7 +116,6 @@ struct Runtime {
     event_waker: Arc<Mutex<Option<egui::Context>>>,
     paused: Arc<AtomicBool>,
     strict_capture_blocked: bool,
-    #[cfg(feature = "tray")]
     config: Config,
     popup: PopupApp,
     paste: PasteCoordinator,
@@ -145,8 +144,6 @@ impl Runtime {
             self_writes,
             strict_capture_blocked,
         } = services;
-        #[cfg(not(feature = "tray"))]
-        let _ = config;
         let (intent_sender, instance_intents) = channel();
         let intent_waker = Arc::clone(&event_waker);
         std::thread::spawn(move || {
@@ -168,7 +165,6 @@ impl Runtime {
             event_waker,
             paused,
             strict_capture_blocked,
-            #[cfg(feature = "tray")]
             config,
             paste: PasteCoordinator::system(self_writes),
             #[cfg(feature = "tray")]
@@ -318,6 +314,16 @@ impl Runtime {
                         NoticeLevel::Warning,
                         "The skipped clipboard is no longer current",
                     );
+                }
+            }
+            AppCommand::InstallStarterPack(pack) => {
+                let clips = crate::seed_pack::clips(pack);
+                match self.history.insert_many(&clips, self.config.max_history) {
+                    Ok(()) => self.notice(NoticeLevel::Info, "Starter examples added locally"),
+                    Err(error) => {
+                        self.notice(NoticeLevel::Error, "Couldn't add starter examples");
+                        tracing::warn!("installing starter pack failed: {error}");
+                    }
                 }
             }
             #[cfg(feature = "tray")]
