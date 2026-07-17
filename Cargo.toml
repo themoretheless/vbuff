@@ -64,7 +64,7 @@ atomic-write-file = "0.3"
 crossbeam-queue = "0.3.12"
 chacha20poly1305 = "0.11"
 ed25519-dalek = "3.0"
-x25519-dalek = { version = "2.0.1", features = ["getrandom", "static_secrets", "zeroize"] }
+x25519-dalek = { version = "3.0.0", features = ["getrandom", "static_secrets", "zeroize"] }
 bip39 = "2.2.2"
 hkdf = "0.12"
 hmac = "0.12"
