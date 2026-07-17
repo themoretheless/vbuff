@@ -1,6 +1,7 @@
 //! Hybrid logical clocks with deterministic device tie-breaking.
 
 use serde::{Deserialize, Serialize};
+use vbuff_core::clock::Clock;
 
 /// Remote wall time may lead local time only by this bounded tolerance.
 pub const MAX_REMOTE_FUTURE_MS: u64 = 5 * 60 * 1_000;
@@ -31,6 +32,10 @@ impl HybridLogicalClock {
         self.clone()
     }
 
+    pub fn tick_with(&mut self, clock: &impl Clock) -> Self {
+        self.tick(clock.now_ms())
+    }
+
     pub fn observe(&mut self, remote: &Self, now_ms: u64) -> Self {
         let remote = remote.bounded_at(now_ms);
         let local_physical = self.physical_ms;
@@ -52,6 +57,10 @@ impl HybridLogicalClock {
             self.logical = 0;
         }
         self.clone()
+    }
+
+    pub fn observe_with(&mut self, remote: &Self, clock: &impl Clock) -> Self {
+        self.observe(remote, clock.now_ms())
     }
 
     /// Clamp an untrusted clock received from another device.
@@ -114,5 +123,15 @@ mod tests {
         };
 
         assert_eq!((clock.tick(9).physical_ms, clock.logical), (11, 0));
+    }
+
+    #[test]
+    fn injected_clock_drives_tick_and_observe_without_wall_time() {
+        let clock = vbuff_core::clock::ManualClock::new(100);
+        let mut local = HybridLogicalClock::new("a", 0);
+        assert_eq!(local.tick_with(&clock).physical_ms, 100);
+        clock.advance(25);
+        let remote = HybridLogicalClock::new("b", 120);
+        assert_eq!(local.observe_with(&remote, &clock).physical_ms, 125);
     }
 }

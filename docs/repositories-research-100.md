@@ -1,6 +1,6 @@
 # vbuff - 100 High-Signal Repository Reviews
 
-This is a curated engineering sample, not a global GitHub popularity chart. Repositories were selected for direct relevance to clipboard capture, desktop interaction, Rust platform work, local search, privacy, local-first sync, accessibility, testing, and release engineering. Star counts were verified through the GitHub GraphQL API on 2026-07-14 and are a point-in-time signal, not a quality guarantee. The smallest project in the sample has about 650 stars; most have thousands or tens of thousands.
+This is a curated engineering sample, not a global GitHub popularity chart. Repositories were selected for direct relevance to clipboard capture, desktop interaction, Rust platform work, local search, privacy, local-first sync, accessibility, testing, and release engineering. Star counts were verified through the GitHub GraphQL API on 2026-07-18 and are a point-in-time signal, not a quality guarantee. The smallest project in the sample has about 650 stars; most have thousands or tens of thousands.
 
 The catalog uses stable evidence ids (`GH-001` through `GH-100`). New backlog items 501-600 in [ideas-501-600.md](ideas-501-600.md) cite these ids and the primary materials below instead of treating popularity as proof.
 
@@ -8,126 +8,126 @@ The catalog uses stable evidence ids (`GH-001` through `GH-100`). New backlog it
 
 | ID | Repository | Stars | What vbuff should learn |
 |---|---|---:|---|
-| GH-001 | [hluk/CopyQ](https://github.com/hluk/CopyQ) | 11,993 | Keep the core history fast and understandable; isolate scripting and commands behind explicit capabilities. |
-| GH-002 | [Clipy/Clipy](https://github.com/Clipy/Clipy) | 8,767 | A native menu-bar workflow wins through low summon latency, compact rows, and predictable keyboard behavior. |
-| GH-003 | [EcoPasteHub/EcoPaste](https://github.com/EcoPasteHub/EcoPaste) | 7,168 | Study a modern Rust/Tauri clipboard product, especially its cross-platform tradeoffs and rich-content model. |
-| GH-004 | [sabrogden/Ditto](https://github.com/sabrogden/Ditto) | 6,732 | Mine years of Windows clipboard-format, database, hotkey, and peer-sync edge cases without inheriting its UI density. |
-| GH-005 | [Slackadays/Clipboard](https://github.com/Slackadays/Clipboard) | 5,840 | Preserve a composable CLI surface and stream-friendly operations alongside the resident GUI. |
-| GH-006 | [CrossPaste/crosspaste-desktop](https://github.com/CrossPaste/crosspaste-desktop) | 2,230 | Compare real cross-platform pairing, device discovery, rich formats, and transfer failure states. |
-| GH-007 | [PasteBar/PasteBarApp](https://github.com/PasteBar/PasteBarApp) | 2,109 | Treat collections, actions, and polished local workflows as separate layers over history. |
-| GH-008 | [sentriz/cliphist](https://github.com/sentriz/cliphist) | 1,498 | Keep Wayland capture, durable history, and picker integration as small composable processes. |
+| GH-001 | [hluk/CopyQ](https://github.com/hluk/CopyQ) | 12,010 | Keep the core history fast and understandable; isolate scripting and commands behind explicit capabilities. |
+| GH-002 | [Clipy/Clipy](https://github.com/Clipy/Clipy) | 8,778 | A native menu-bar workflow wins through low summon latency, compact rows, and predictable keyboard behavior. |
+| GH-003 | [EcoPasteHub/EcoPaste](https://github.com/EcoPasteHub/EcoPaste) | 7,190 | Study a modern Rust/Tauri clipboard product, especially its cross-platform tradeoffs and rich-content model. |
+| GH-004 | [sabrogden/Ditto](https://github.com/sabrogden/Ditto) | 6,754 | Mine years of Windows clipboard-format, database, hotkey, and peer-sync edge cases without inheriting its UI density. |
+| GH-005 | [Slackadays/Clipboard](https://github.com/Slackadays/Clipboard) | 5,845 | Preserve a composable CLI surface and stream-friendly operations alongside the resident GUI. |
+| GH-006 | [CrossPaste/crosspaste-desktop](https://github.com/CrossPaste/crosspaste-desktop) | 2,235 | Compare real cross-platform pairing, device discovery, rich formats, and transfer failure states. |
+| GH-007 | [PasteBar/PasteBarApp](https://github.com/PasteBar/PasteBarApp) | 2,116 | Treat collections, actions, and polished local workflows as separate layers over history. |
+| GH-008 | [sentriz/cliphist](https://github.com/sentriz/cliphist) | 1,502 | Keep Wayland capture, durable history, and picker integration as small composable processes. |
 | GH-009 | [Keruspe/GPaste](https://github.com/Keruspe/GPaste) | 914 | Separate the long-lived daemon, D-Bus API, shell integration, and UI clients cleanly. |
-| GH-010 | [bugaevc/wl-clipboard](https://github.com/bugaevc/wl-clipboard) | 2,377 | Reuse protocol-correct Wayland primitives and understand offer lifetime and seat semantics. |
+| GH-010 | [bugaevc/wl-clipboard](https://github.com/bugaevc/wl-clipboard) | 2,381 | Reuse protocol-correct Wayland primitives and understand offer lifetime and seat semantics. |
 | GH-011 | [cdown/clipmenu](https://github.com/cdown/clipmenu) | 1,250 | A tiny storage/selection pipeline is a useful reference oracle for headless Linux behavior. |
-| GH-012 | [yuzeguitarist/Deck](https://github.com/yuzeguitarist/Deck) | 1,340 | Study card-like clipboard inspection while keeping primary recall denser than a dashboard. |
-| GH-013 | [sindresorhus/Pasteboard-Viewer](https://github.com/sindresorhus/Pasteboard-Viewer) | 840 | Ship a safe diagnostic inspector for pasteboard items and flavors instead of hiding format failures. |
-| GH-014 | [FuzzyIdeas/Clop](https://github.com/FuzzyIdeas/Clop) | 1,579 | Run media optimization as an opt-in derived representation and never mutate the canonical capture. |
-| GH-015 | [Sathvik-Rao/ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) | 1,820 | Review encrypted cross-device transport, reconnect behavior, and explicit device trust. |
+| GH-012 | [yuzeguitarist/Deck](https://github.com/yuzeguitarist/Deck) | 1,341 | Study card-like clipboard inspection while keeping primary recall denser than a dashboard. |
+| GH-013 | [sindresorhus/Pasteboard-Viewer](https://github.com/sindresorhus/Pasteboard-Viewer) | 841 | Ship a safe diagnostic inspector for pasteboard items and flavors instead of hiding format failures. |
+| GH-014 | [FuzzyIdeas/Clop](https://github.com/FuzzyIdeas/Clop) | 1,583 | Run media optimization as an opt-in derived representation and never mutate the canonical capture. |
+| GH-015 | [Sathvik-Rao/ClipCascade](https://github.com/Sathvik-Rao/ClipCascade) | 1,821 | Review encrypted cross-device transport, reconnect behavior, and explicit device trust. |
 | GH-016 | [jedisct1/piknik](https://github.com/jedisct1/piknik) | 2,514 | Keep one-shot encrypted transfer simple, scriptable, and independent from full history replication. |
-| GH-017 | [espanso/espanso](https://github.com/espanso/espanso) | 14,096 | Version configuration, isolate packages, and make per-app exclusions part of the safety model. |
-| GH-018 | [Wox-launcher/Wox](https://github.com/Wox-launcher/Wox) | 27,137 | Bound plugin latency and keep query routing deterministic when many providers answer. |
-| GH-019 | [Flow-Launcher/Flow.Launcher](https://github.com/Flow-Launcher/Flow.Launcher) | 15,161 | Study ranking, action menus, result stability, and plugin failure containment. |
-| GH-020 | [albertlauncher/albert](https://github.com/albertlauncher/albert) | 7,959 | Keep the query core independent from frontend and extension implementations. |
+| GH-017 | [espanso/espanso](https://github.com/espanso/espanso) | 14,112 | Version configuration, isolate packages, and make per-app exclusions part of the safety model. |
+| GH-018 | [Wox-launcher/Wox](https://github.com/Wox-launcher/Wox) | 27,149 | Bound plugin latency and keep query routing deterministic when many providers answer. |
+| GH-019 | [Flow-Launcher/Flow.Launcher](https://github.com/Flow-Launcher/Flow.Launcher) | 15,192 | Study ranking, action menus, result stability, and plugin failure containment. |
+| GH-020 | [albertlauncher/albert](https://github.com/albertlauncher/albert) | 7,960 | Keep the query core independent from frontend and extension implementations. |
 | GH-021 | [Ulauncher/Ulauncher](https://github.com/Ulauncher/Ulauncher) | 4,483 | Treat extension compatibility and user-visible failure recovery as product contracts. |
-| GH-022 | [oliverschwendener/ueli](https://github.com/oliverschwendener/ueli) | 4,558 | Compare cross-platform settings, search providers, keyboard navigation, and packaging. |
-| GH-023 | [ospfranco/sol](https://github.com/ospfranco/sol) | 2,997 | Study a focused native launcher for macOS and its fast, restrained interaction surface. |
-| GH-024 | [anyrun-org/anyrun](https://github.com/anyrun-org/anyrun) | 1,273 | Keep Wayland popup placement and provider processes explicit and independently replaceable. |
+| GH-022 | [oliverschwendener/ueli](https://github.com/oliverschwendener/ueli) | 4,561 | Compare cross-platform settings, search providers, keyboard navigation, and packaging. |
+| GH-023 | [ospfranco/sol](https://github.com/ospfranco/sol) | 3,003 | Study a focused native launcher for macOS and its fast, restrained interaction surface. |
+| GH-024 | [anyrun-org/anyrun](https://github.com/anyrun-org/anyrun) | 1,276 | Keep Wayland popup placement and provider processes explicit and independently replaceable. |
 | GH-025 | [Keypirinha/Keypirinha](https://github.com/Keypirinha/Keypirinha) | 1,133 | Preserve keyboard speed, portable configuration, and a stable action vocabulary. |
 
 ## Rust Desktop and Platform Foundations
 
 | ID | Repository | Stars | What vbuff should learn |
 |---|---|---:|---|
-| GH-026 | [emilk/egui](https://github.com/emilk/egui) | 29,634 | Follow upstream accessibility, viewport, texture-cache, and input semantics instead of compensating in app code. |
-| GH-027 | [iced-rs/iced](https://github.com/iced-rs/iced) | 30,965 | Compare explicit state/update architecture and long-running subscription ownership. |
-| GH-028 | [slint-ui/slint](https://github.com/slint-ui/slint) | 23,192 | Study design-system consistency, native accessibility, and low-resource desktop rendering. |
-| GH-029 | [rust-windowing/winit](https://github.com/rust-windowing/winit) | 6,047 | Respect event-loop ownership, monitor/DPI changes, activation, sleep, and platform thread constraints. |
-| GH-030 | [tauri-apps/tauri](https://github.com/tauri-apps/tauri) | 109,014 | Learn capability configuration, updater hardening, tray behavior, and cross-platform packaging boundaries. |
-| GH-031 | [lapce/lapce](https://github.com/lapce/lapce) | 38,650 | Study a large Rust desktop app's command routing, state boundaries, text workload, and startup costs. |
-| GH-032 | [zed-industries/zed](https://github.com/zed-industries/zed) | 86,923 | Review high-performance text rendering, async task ownership, collaboration, and deterministic commands. |
-| GH-033 | [1Password/arboard](https://github.com/1Password/arboard) | 953 | Treat the current fallback backend as a narrow portability baseline, not proof of native format fidelity. |
-| GH-034 | [AccessKit/accesskit](https://github.com/AccessKit/accesskit) | 1,484 | Model semantic nodes and actions as testable application state, not visual afterthoughts. |
-| GH-035 | [Smithay/smithay](https://github.com/Smithay/smithay) | 3,101 | Understand compositor-side Wayland ownership, seats, selections, and protocol capability boundaries. |
-| GH-036 | [Smithay/wayland-rs](https://github.com/Smithay/wayland-rs) | 1,399 | Use generated protocol types and explicit object lifetimes at the Wayland boundary. |
-| GH-037 | [xremap/xremap](https://github.com/xremap/xremap) | 2,133 | Study input permissions, compositor differences, device hotplug, and remapping failure modes. |
-| GH-038 | [microsoft/windows-rs](https://github.com/microsoft/windows-rs) | 12,558 | Keep Win32 wrappers thin, typed, and localized around ownership and thread-affinity rules. |
-| GH-039 | [madsmtm/objc2](https://github.com/madsmtm/objc2) | 981 | Use ownership-aware Objective-C bindings rather than scattering unsafe AppKit calls. |
-| GH-040 | [z-galaxy/zbus](https://github.com/z-galaxy/zbus) | 718 | Keep D-Bus/portal contracts typed, versioned, cancellable, and timeout-bounded. |
+| GH-026 | [emilk/egui](https://github.com/emilk/egui) | 29,722 | Follow upstream accessibility, viewport, texture-cache, and input semantics instead of compensating in app code. |
+| GH-027 | [iced-rs/iced](https://github.com/iced-rs/iced) | 31,001 | Compare explicit state/update architecture and long-running subscription ownership. |
+| GH-028 | [slint-ui/slint](https://github.com/slint-ui/slint) | 23,239 | Study design-system consistency, native accessibility, and low-resource desktop rendering. |
+| GH-029 | [rust-windowing/winit](https://github.com/rust-windowing/winit) | 6,061 | Respect event-loop ownership, monitor/DPI changes, activation, sleep, and platform thread constraints. |
+| GH-030 | [tauri-apps/tauri](https://github.com/tauri-apps/tauri) | 109,169 | Learn capability configuration, updater hardening, tray behavior, and cross-platform packaging boundaries. |
+| GH-031 | [lapce/lapce](https://github.com/lapce/lapce) | 38,664 | Study a large Rust desktop app's command routing, state boundaries, text workload, and startup costs. |
+| GH-032 | [zed-industries/zed](https://github.com/zed-industries/zed) | 87,149 | Review high-performance text rendering, async task ownership, collaboration, and deterministic commands. |
+| GH-033 | [1Password/arboard](https://github.com/1Password/arboard) | 954 | Treat the current fallback backend as a narrow portability baseline, not proof of native format fidelity. |
+| GH-034 | [AccessKit/accesskit](https://github.com/AccessKit/accesskit) | 1,488 | Model semantic nodes and actions as testable application state, not visual afterthoughts. |
+| GH-035 | [Smithay/smithay](https://github.com/Smithay/smithay) | 3,109 | Understand compositor-side Wayland ownership, seats, selections, and protocol capability boundaries. |
+| GH-036 | [Smithay/wayland-rs](https://github.com/Smithay/wayland-rs) | 1,398 | Use generated protocol types and explicit object lifetimes at the Wayland boundary. |
+| GH-037 | [xremap/xremap](https://github.com/xremap/xremap) | 2,134 | Study input permissions, compositor differences, device hotplug, and remapping failure modes. |
+| GH-038 | [microsoft/windows-rs](https://github.com/microsoft/windows-rs) | 12,570 | Keep Win32 wrappers thin, typed, and localized around ownership and thread-affinity rules. |
+| GH-039 | [madsmtm/objc2](https://github.com/madsmtm/objc2) | 983 | Use ownership-aware Objective-C bindings rather than scattering unsafe AppKit calls. |
+| GH-040 | [z-galaxy/zbus](https://github.com/z-galaxy/zbus) | 721 | Keep D-Bus/portal contracts typed, versioned, cancellable, and timeout-bounded. |
 | GH-041 | [flatpak/xdg-desktop-portal](https://github.com/flatpak/xdg-desktop-portal) | 815 | Treat portal grants and restore tokens as environment-scoped capabilities that can expire. |
-| GH-042 | [pop-os/cosmic-text](https://github.com/pop-os/cosmic-text) | 2,109 | Use a real shaping pipeline for Unicode, bidi text, fallback fonts, and grapheme-safe geometry. |
-| GH-043 | [linebender/parley](https://github.com/linebender/parley) | 652 | Track modern text layout and accessibility-friendly selection/highlight primitives. |
-| GH-044 | [image-rs/image](https://github.com/image-rs/image) | 5,816 | Enforce decoded-pixel, dimensions, allocation, and malformed-image limits before thumbnailing. |
-| GH-045 | [tokio-rs/tracing](https://github.com/tokio-rs/tracing) | 6,775 | Use structured spans and a redaction layer so diagnostics never absorb clipboard payloads. |
+| GH-042 | [pop-os/cosmic-text](https://github.com/pop-os/cosmic-text) | 2,111 | Use a real shaping pipeline for Unicode, bidi text, fallback fonts, and grapheme-safe geometry. |
+| GH-043 | [linebender/parley](https://github.com/linebender/parley) | 671 | Track modern text layout and accessibility-friendly selection/highlight primitives. |
+| GH-044 | [image-rs/image](https://github.com/image-rs/image) | 5,820 | Enforce decoded-pixel, dimensions, allocation, and malformed-image limits before thumbnailing. |
+| GH-045 | [tokio-rs/tracing](https://github.com/tokio-rs/tracing) | 6,781 | Use structured spans and a redaction layer so diagnostics never absorb clipboard payloads. |
 
 ## Storage, Search, and Security
 
 | ID | Repository | Stars | What vbuff should learn |
 |---|---|---:|---|
-| GH-046 | [sqlite/sqlite](https://github.com/sqlite/sqlite) | 10,038 | Copy SQLite's crash, fault-injection, integrity, and version-aware discipline around the actual storage mode. |
-| GH-047 | [sqlcipher/sqlcipher](https://github.com/sqlcipher/sqlcipher) | 7,202 | Treat cipher parameters, migration, key rotation, and plaintext verification as explicit versioned contracts. |
-| GH-048 | [rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) | 4,297 | Track the bundled SQLite version separately from the Rust wrapper version and test feature changes. |
-| GH-049 | [quickwit-oss/tantivy](https://github.com/quickwit-oss/tantivy) | 15,545 | Compare tokenization, segment maintenance, relevance testing, and deterministic ranking. |
-| GH-050 | [meilisearch/meilisearch](https://github.com/meilisearch/meilisearch) | 58,556 | Study typo tolerance and ranking rules, but keep vbuff's local index small and explainable. |
-| GH-051 | [typesense/typesense](https://github.com/typesense/typesense) | 26,301 | Make typo tolerance bounded by field, token length, and exact-match priority. |
-| GH-052 | [tursodatabase/libsql](https://github.com/tursodatabase/libsql) | 16,955 | Learn replication and embedded-database tradeoffs without replacing a simpler local-only store prematurely. |
-| GH-053 | [spacejam/sled](https://github.com/spacejam/sled) | 9,046 | Treat crash consistency claims as obligations backed by fault tests and a conservative recovery story. |
-| GH-054 | [fjall-rs/fjall](https://github.com/fjall-rs/fjall) | 2,216 | Review modern Rust LSM design, compaction, snapshots, and recovery as comparative evidence. |
-| GH-055 | [keepassxreboot/keepassxc](https://github.com/keepassxreboot/keepassxc) | 27,977 | Study vault locking, clipboard expiry, memory handling, security settings, and user-visible trust. |
-| GH-056 | [bitwarden/clients](https://github.com/bitwarden/clients) | 13,265 | Review cross-platform secret UX, device trust, autofill boundaries, and release hardening. |
-| GH-057 | [gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) | 28,119 | Use detector ids, allowlists, entropy, fixtures, and measurable false-positive control. |
-| GH-058 | [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) | 27,031 | Separate candidate detection from optional verification and never make network verification implicit. |
-| GH-059 | [Infisical/infisical](https://github.com/Infisical/infisical) | 27,935 | Review key lifecycle, auditability, secret rotation, and least-privilege service boundaries. |
-| GH-060 | [FiloSottile/age](https://github.com/FiloSottile/age) | 22,855 | Prefer small, misuse-resistant cryptographic formats and explicit recipient identity. |
-| GH-061 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | 13,804 | Use high-level authenticated-encryption APIs, guarded memory where justified, and published test vectors. |
-| GH-062 | [rustls/rustls](https://github.com/rustls/rustls) | 7,518 | Keep secure defaults, protocol state machines, and certificate/key handling away from product logic. |
-| GH-063 | [RustCrypto/AEADs](https://github.com/RustCrypto/AEADs) | 945 | Pin algorithms and nonce rules through interoperable vectors instead of inventing envelope crypto. |
-| GH-064 | [getsops/sops](https://github.com/getsops/sops) | 22,478 | Separate encrypted payloads from key recipients and make key rotation auditable. |
-| GH-065 | [OWASP/mastg](https://github.com/OWASP/mastg) | 13,045 | Turn the threat model into repeatable platform checks rather than prose-only security claims. |
+| GH-046 | [sqlite/sqlite](https://github.com/sqlite/sqlite) | 10,057 | Copy SQLite's crash, fault-injection, integrity, and version-aware discipline around the actual storage mode. |
+| GH-047 | [sqlcipher/sqlcipher](https://github.com/sqlcipher/sqlcipher) | 7,209 | Treat cipher parameters, migration, key rotation, and plaintext verification as explicit versioned contracts. |
+| GH-048 | [rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) | 4,308 | Track the bundled SQLite version separately from the Rust wrapper version and test feature changes. |
+| GH-049 | [quickwit-oss/tantivy](https://github.com/quickwit-oss/tantivy) | 15,559 | Compare tokenization, segment maintenance, relevance testing, and deterministic ranking. |
+| GH-050 | [meilisearch/meilisearch](https://github.com/meilisearch/meilisearch) | 58,629 | Study typo tolerance and ranking rules, but keep vbuff's local index small and explainable. |
+| GH-051 | [typesense/typesense](https://github.com/typesense/typesense) | 26,320 | Make typo tolerance bounded by field, token length, and exact-match priority. |
+| GH-052 | [tursodatabase/libsql](https://github.com/tursodatabase/libsql) | 16,968 | Learn replication and embedded-database tradeoffs without replacing a simpler local-only store prematurely. |
+| GH-053 | [spacejam/sled](https://github.com/spacejam/sled) | 9,045 | Treat crash consistency claims as obligations backed by fault tests and a conservative recovery story. |
+| GH-054 | [fjall-rs/fjall](https://github.com/fjall-rs/fjall) | 2,221 | Review modern Rust LSM design, compaction, snapshots, and recovery as comparative evidence. |
+| GH-055 | [keepassxreboot/keepassxc](https://github.com/keepassxreboot/keepassxc) | 28,035 | Study vault locking, clipboard expiry, memory handling, security settings, and user-visible trust. |
+| GH-056 | [bitwarden/clients](https://github.com/bitwarden/clients) | 13,306 | Review cross-platform secret UX, device trust, autofill boundaries, and release hardening. |
+| GH-057 | [gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) | 28,183 | Use detector ids, allowlists, entropy, fixtures, and measurable false-positive control. |
+| GH-058 | [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) | 27,082 | Separate candidate detection from optional verification and never make network verification implicit. |
+| GH-059 | [Infisical/infisical](https://github.com/Infisical/infisical) | 28,154 | Review key lifecycle, auditability, secret rotation, and least-privilege service boundaries. |
+| GH-060 | [FiloSottile/age](https://github.com/FiloSottile/age) | 22,902 | Prefer small, misuse-resistant cryptographic formats and explicit recipient identity. |
+| GH-061 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | 13,812 | Use high-level authenticated-encryption APIs, guarded memory where justified, and published test vectors. |
+| GH-062 | [rustls/rustls](https://github.com/rustls/rustls) | 7,524 | Keep secure defaults, protocol state machines, and certificate/key handling away from product logic. |
+| GH-063 | [RustCrypto/AEADs](https://github.com/RustCrypto/AEADs) | 947 | Pin algorithms and nonce rules through interoperable vectors instead of inventing envelope crypto. |
+| GH-064 | [getsops/sops](https://github.com/getsops/sops) | 22,527 | Separate encrypted payloads from key recipients and make key rotation auditable. |
+| GH-065 | [OWASP/mastg](https://github.com/OWASP/mastg) | 13,057 | Turn the threat model into repeatable platform checks rather than prose-only security claims. |
 
 ## Sync and Local-First Systems
 
 | ID | Repository | Stars | What vbuff should learn |
 |---|---|---:|---|
-| GH-066 | [syncthing/syncthing](https://github.com/syncthing/syncthing) | 86,340 | Study durable device identity, discovery, conflict handling, relay fallback, and honest status. |
-| GH-067 | [localsend/localsend](https://github.com/localsend/localsend) | 85,228 | Keep nearby transfer discoverable and simple while authenticating peers and surfacing network failures. |
-| GH-068 | [KDE/kdeconnect-kde](https://github.com/KDE/kdeconnect-kde) | 3,848 | Review clipboard loops, device permissions, plugin isolation, and desktop/mobile lifecycle mismatch. |
-| GH-069 | [schollz/croc](https://github.com/schollz/croc) | 35,520 | Use PAKE-like short-code pairing, relay fallback, resume, and one-shot transfer semantics. |
-| GH-070 | [magic-wormhole/magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) | 22,709 | Bind human-readable pairing codes to authenticated key exchange and explicit completion. |
-| GH-071 | [libp2p/rust-libp2p](https://github.com/libp2p/rust-libp2p) | 5,577 | Treat discovery, transport, identity, and stream protocols as independently negotiated layers. |
-| GH-072 | [yjs/yjs](https://github.com/yjs/yjs) | 22,182 | Study compact CRDT updates, state vectors, garbage collection, and offline convergence. |
-| GH-073 | [automerge/automerge](https://github.com/automerge/automerge) | 6,411 | Define operations and conflicts explicitly, then prove convergence across reorder and duplication. |
-| GH-074 | [loro-dev/loro](https://github.com/loro-dev/loro) | 5,811 | Compare modern CRDT version vectors, snapshots, diffing, and state compaction. |
-| GH-075 | [vlcn-io/cr-sqlite](https://github.com/vlcn-io/cr-sqlite) | 3,737 | Review row-level CRDT semantics while keeping raw database-file sync forbidden. |
-| GH-076 | [anyproto/any-sync](https://github.com/anyproto/any-sync) | 1,657 | Study local-first account/device identity, encrypted spaces, and peer topology. |
-| GH-077 | [tailscale/tailscale](https://github.com/tailscale/tailscale) | 33,927 | Learn NAT traversal, key rotation, network-state UX, and conservative connectivity fallback. |
-| GH-078 | [zerotier/ZeroTierOne](https://github.com/zerotier/ZeroTierOne) | 16,917 | Review virtual-network identity and topology, but avoid importing network complexity into MVP sync. |
-| GH-079 | [rclone/rclone](https://github.com/rclone/rclone) | 58,328 | Study resumable transfers, checksums, bandwidth policies, and provider failure taxonomy. |
-| GH-080 | [restic/restic](https://github.com/restic/restic) | 34,993 | Use content-addressed encrypted chunks, authenticated snapshots, retention, and restore verification. |
-| GH-081 | [borgbackup/borg](https://github.com/borgbackup/borg) | 13,508 | Study chunking, deduplication, repository integrity, compaction, and interrupted recovery. |
-| GH-082 | [pubkey/rxdb](https://github.com/pubkey/rxdb) | 23,268 | Compare local-first replication checkpoints, conflict handlers, schema migration, and offline state. |
+| GH-066 | [syncthing/syncthing](https://github.com/syncthing/syncthing) | 86,557 | Study durable device identity, discovery, conflict handling, relay fallback, and honest status. |
+| GH-067 | [localsend/localsend](https://github.com/localsend/localsend) | 85,434 | Keep nearby transfer discoverable and simple while authenticating peers and surfacing network failures. |
+| GH-068 | [KDE/kdeconnect-kde](https://github.com/KDE/kdeconnect-kde) | 3,860 | Review clipboard loops, device permissions, plugin isolation, and desktop/mobile lifecycle mismatch. |
+| GH-069 | [schollz/croc](https://github.com/schollz/croc) | 35,582 | Use PAKE-like short-code pairing, relay fallback, resume, and one-shot transfer semantics. |
+| GH-070 | [magic-wormhole/magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) | 22,717 | Bind human-readable pairing codes to authenticated key exchange and explicit completion. |
+| GH-071 | [libp2p/rust-libp2p](https://github.com/libp2p/rust-libp2p) | 5,579 | Treat discovery, transport, identity, and stream protocols as independently negotiated layers. |
+| GH-072 | [yjs/yjs](https://github.com/yjs/yjs) | 22,198 | Study compact CRDT updates, state vectors, garbage collection, and offline convergence. |
+| GH-073 | [automerge/automerge](https://github.com/automerge/automerge) | 6,427 | Define operations and conflicts explicitly, then prove convergence across reorder and duplication. |
+| GH-074 | [loro-dev/loro](https://github.com/loro-dev/loro) | 5,890 | Compare modern CRDT version vectors, snapshots, diffing, and state compaction. |
+| GH-075 | [vlcn-io/cr-sqlite](https://github.com/vlcn-io/cr-sqlite) | 3,741 | Review row-level CRDT semantics while keeping raw database-file sync forbidden. |
+| GH-076 | [anyproto/any-sync](https://github.com/anyproto/any-sync) | 1,660 | Study local-first account/device identity, encrypted spaces, and peer topology. |
+| GH-077 | [tailscale/tailscale](https://github.com/tailscale/tailscale) | 33,994 | Learn NAT traversal, key rotation, network-state UX, and conservative connectivity fallback. |
+| GH-078 | [zerotier/ZeroTierOne](https://github.com/zerotier/ZeroTierOne) | 16,935 | Review virtual-network identity and topology, but avoid importing network complexity into MVP sync. |
+| GH-079 | [rclone/rclone](https://github.com/rclone/rclone) | 58,389 | Study resumable transfers, checksums, bandwidth policies, and provider failure taxonomy. |
+| GH-080 | [restic/restic](https://github.com/restic/restic) | 35,039 | Use content-addressed encrypted chunks, authenticated snapshots, retention, and restore verification. |
+| GH-081 | [borgbackup/borg](https://github.com/borgbackup/borg) | 13,523 | Study chunking, deduplication, repository integrity, compaction, and interrupted recovery. |
+| GH-082 | [pubkey/rxdb](https://github.com/pubkey/rxdb) | 23,273 | Compare local-first replication checkpoints, conflict handlers, schema migration, and offline state. |
 | GH-083 | [tinyplex/tinybase](https://github.com/tinyplex/tinybase) | 5,124 | Keep reactive local state, derived indexes, persistence, and synchronization as separable modules. |
-| GH-084 | [orbitinghail/sqlsync](https://github.com/orbitinghail/sqlsync) | 2,904 | Review local SQLite views over synchronized operations without assuming file-level replication. |
-| GH-085 | [TryQuiet/quiet](https://github.com/TryQuiet/quiet) | 2,617 | Study peer identity, Tor/offline behavior, local-first UX, and the support cost of complex networking. |
+| GH-084 | [orbitinghail/sqlsync](https://github.com/orbitinghail/sqlsync) | 2,905 | Review local SQLite views over synchronized operations without assuming file-level replication. |
+| GH-085 | [TryQuiet/quiet](https://github.com/TryQuiet/quiet) | 2,620 | Study peer identity, Tor/offline behavior, local-first UX, and the support cost of complex networking. |
 
 ## Accessibility, Testing, and Release Engineering
 
 | ID | Repository | Stars | What vbuff should learn |
 |---|---|---:|---|
-| GH-086 | [nvaccess/nvda](https://github.com/nvaccess/nvda) | 2,599 | Test real focus, name, role, value, live updates, and list navigation with an actual screen reader. |
-| GH-087 | [dequelabs/axe-core](https://github.com/dequelabs/axe-core) | 7,307 | Encode deterministic accessibility rules, while retaining manual assistive-technology review. |
-| GH-088 | [OptiKey/OptiKey](https://github.com/OptiKey/OptiKey) | 4,401 | Provide large targets, dwell/switch alternatives, and workflows that do not require precise pointing. |
+| GH-086 | [nvaccess/nvda](https://github.com/nvaccess/nvda) | 2,603 | Test real focus, name, role, value, live updates, and list navigation with an actual screen reader. |
+| GH-087 | [dequelabs/axe-core](https://github.com/dequelabs/axe-core) | 7,315 | Encode deterministic accessibility rules, while retaining manual assistive-technology review. |
+| GH-088 | [OptiKey/OptiKey](https://github.com/OptiKey/OptiKey) | 4,402 | Provide large targets, dwell/switch alternatives, and workflows that do not require precise pointing. |
 | GH-089 | [houmain/keymapper](https://github.com/houmain/keymapper) | 1,123 | Test layout-independent keys, held modifiers, device changes, and synthetic-input edge cases. |
-| GH-090 | [microsoft/playwright](https://github.com/microsoft/playwright) | 92,750 | Copy deterministic isolation, tracing, retries as diagnostics, and artifact-rich failure reports. |
-| GH-091 | [appium/appium](https://github.com/appium/appium) | 21,751 | Drive real native surfaces through stable semantic selectors instead of pixel coordinates. |
-| GH-092 | [google/oss-fuzz](https://github.com/google/oss-fuzz) | 12,426 | Run parsers continuously with sanitizer coverage and retain minimized regression inputs. |
-| GH-093 | [rust-fuzz/cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) | 1,845 | Keep focused fuzz targets for every untrusted clipboard and archive parser. |
-| GH-094 | [EmbarkStudios/cargo-deny](https://github.com/EmbarkStudios/cargo-deny) | 2,367 | Make license, advisory, source, and duplicate-version policy executable in CI. |
-| GH-095 | [rustsec/rustsec](https://github.com/rustsec/rustsec) | 1,920 | Track advisories continuously and record why any exception is acceptable. |
-| GH-096 | [mozilla/cargo-vet](https://github.com/mozilla/cargo-vet) | 964 | Apply review criteria by dependency risk instead of treating every crate as equally trusted. |
-| GH-097 | [axodotdev/cargo-dist](https://github.com/axodotdev/cargo-dist) | 2,068 | Standardize signed artifacts, installers, checksums, manifests, and release smoke inputs. |
-| GH-098 | [taiki-e/cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) | 1,419 | Measure branch coverage on privacy, migration, and recovery paths, not only aggregate line coverage. |
+| GH-090 | [microsoft/playwright](https://github.com/microsoft/playwright) | 93,034 | Copy deterministic isolation, tracing, retries as diagnostics, and artifact-rich failure reports. |
+| GH-091 | [appium/appium](https://github.com/appium/appium) | 21,775 | Drive real native surfaces through stable semantic selectors instead of pixel coordinates. |
+| GH-092 | [google/oss-fuzz](https://github.com/google/oss-fuzz) | 12,441 | Run parsers continuously with sanitizer coverage and retain minimized regression inputs. |
+| GH-093 | [rust-fuzz/cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) | 1,851 | Keep focused fuzz targets for every untrusted clipboard and archive parser. |
+| GH-094 | [EmbarkStudios/cargo-deny](https://github.com/EmbarkStudios/cargo-deny) | 2,369 | Make license, advisory, source, and duplicate-version policy executable in CI. |
+| GH-095 | [rustsec/rustsec](https://github.com/rustsec/rustsec) | 1,925 | Track advisories continuously and record why any exception is acceptable. |
+| GH-096 | [mozilla/cargo-vet](https://github.com/mozilla/cargo-vet) | 965 | Apply review criteria by dependency risk instead of treating every crate as equally trusted. |
+| GH-097 | [axodotdev/cargo-dist](https://github.com/axodotdev/cargo-dist) | 2,070 | Standardize signed artifacts, installers, checksums, manifests, and release smoke inputs. |
+| GH-098 | [taiki-e/cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) | 1,423 | Measure branch coverage on privacy, migration, and recovery paths, not only aggregate line coverage. |
 | GH-099 | [sourcefrog/cargo-mutants](https://github.com/sourcefrog/cargo-mutants) | 1,220 | Prove that tests fail when capture policy, retention, or redaction decisions are inverted. |
-| GH-100 | [release-plz/release-plz](https://github.com/release-plz/release-plz) | 1,415 | Make dependency/release changes reviewable PRs with generated changelog evidence. |
+| GH-100 | [release-plz/release-plz](https://github.com/release-plz/release-plz) | 1,420 | Make dependency/release changes reviewable PRs with generated changelog evidence. |
 
 ## Primary Research and Standards
 

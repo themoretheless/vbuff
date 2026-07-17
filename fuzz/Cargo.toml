@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 vbuff-ipc = { path = "../crates/vbuff-ipc" }
 vbuff-plugin = { path = "../crates/vbuff-plugin" }
+vbuff-platform = { path = "../crates/vbuff-platform" }
 vbuff-types = { path = "../crates/vbuff-types" }
 
 [[bin]]
@@ -31,6 +32,20 @@ bench = false
 [[bin]]
 name = "flavor_json"
 path = "fuzz_targets/flavor_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cf_html"
+path = "fuzz_targets/cf_html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_map"
+path = "fuzz_targets/format_map.rs"
 test = false
 doc = false
 bench = false

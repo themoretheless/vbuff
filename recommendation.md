@@ -6,7 +6,7 @@
 >
 > Sourcing note: the task referenced a separate "decision spine" file and a "pitfalls JSON" with `pitfallsExec`/`topMistakesSummary` keys. Those literal artifacts do not exist in the repo. The positioning, pillars, non-goals, roadmap phases, and success metrics are grounded in `architecture.md` (goals/non-goals, the four backend traits, the four-phase roadmap, the risks table) and `docs/competitive-analysis.md` (the four-corner wedge). Competitor mistakes and differentiators are grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the 122-item `docs/competitor-extras.md`. Feature tiers (MVP/v1/v2/future) come from `docs/features-top-500.md` (640 items) and the extras catalog.
 >
-> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, and `vbuff-plugin` are tested foundations, not live network or extension features. Engineering items 1-100 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md) and [batch 051-100](docs/implementation-batch-051-100.md).
+> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, `vbuff-plugin`, and most of `vbuff-update` are tested foundations, not live network, extension, sync, or auto-update features. Items 1-150 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), and [batch 101-150](docs/implementation-batch-101-150.md). The third ledger records the live Trust/seed/config/verify paths separately from foundations and resolves conflicting pricing/licensing ideas in [one decision record](docs/product-strategy-decisions.md).
 
 ---
 
@@ -286,6 +286,8 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `plan.md` - phased implementation plan / milestones
 - `docs/implementation-batch-001-050.md` - engineering items 1-50, current status, remaining native/transport dependencies, and three review passes
 - `docs/implementation-batch-051-100.md` - engineering items 51-100, current runtime/foundation status, remaining native/security/runtime dependencies, and review evidence
+- `docs/implementation-batch-101-150.md` - engineering/product items 101-150, Trust/release/migration/sync evidence, policy decisions, and three review passes
+- `docs/product-strategy-decisions.md` - one coherent resolution for mutually exclusive licensing, pricing, and governance proposals 128-140
 - `docs/competitive-analysis.md` - competitor landscape and the four-corner wedge
 - `docs/competitor-extras.md` - the 122-item feature-gap sweep used in section 4
 - `docs/features-top-500.md` - the 640-feature catalog with MVP/v1/v2/future tiers
@@ -307,9 +309,10 @@ Execution follows the user's requested groups of 50. The strategy layer does not
 |---|---|---|
 | 1-50 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-001-050.md); local runtime improvements are active, sync/native contracts are not advertised as finished features |
 | 51-100 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-051-100.md); reliability/security runtime work is active, while native, encrypted-store, daemon, and WASM dependencies remain explicit |
-| 101-600 | Queued | Preserve the canonical priority and evidence links below |
+| 101-150 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-101-150.md); Trust/config/verify/CI paths are active, while updater, native conformance, migration, sync, and AI remain bounded foundations |
+| 151-600 | Queued | Preserve the canonical priority and evidence links below |
 
-The product cut line after the second batch is unchanged: finish trustworthy encrypted single-machine storage and native capture before enabling network replication or third-party code execution. The sync/IPC/plugin foundations reduce later protocol risk; they do not justify turning on a network listener or WASM host early.
+The product cut line after the third batch is unchanged: finish trustworthy encrypted single-machine storage and native capture before enabling network replication, third-party code execution, or updater installation. The sync/IPC/plugin/update foundations reduce later protocol risk; they do not justify turning on a network listener, WASM host, relay, or update fetcher early.
 
 ---
 

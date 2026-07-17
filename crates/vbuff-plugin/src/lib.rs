@@ -5,16 +5,24 @@ pub mod adapter;
 pub mod bundle;
 pub mod component;
 pub mod manifest;
+pub mod migration;
+pub mod offline;
 pub mod pipeline;
 pub mod recognizer;
+pub mod snippet_pack;
 
 use thiserror::Error;
 
 pub use adapter::{ExportAdapter, ExportRecord, ImportAdapter, ImportRecord};
 pub use bundle::{LockedPlugin, PluginBundle, PluginLock, SignedBundle};
 pub use manifest::{CapabilityGrant, PluginCapability, PluginManifest};
+pub use migration::{
+    ImportBatchJournal, LiveMigrationTracker, MigrationPreflight, MigrationRecord, RollbackPlan,
+};
+pub use offline::{OfflineRunEvidence, SignedOfflineAttestation};
 pub use pipeline::{Pipeline, PipelinePreview, TransformSpec, TypedValue, ValueType};
 pub use recognizer::{ActionCandidate, Recognizer, RecognizerInput, TypedAction, run_recognizer};
+pub use snippet_pack::{SignedSnippetPack, SnippetDefinition, SnippetPack};
 
 pub type Result<T> = std::result::Result<T, PluginError>;
 

@@ -43,3 +43,5 @@ jobs:
           cargo +nightly fuzz run api_token -- -max_total_time=30
           cargo +nightly fuzz run plugin_manifest -- -max_total_time=30
           cargo +nightly fuzz run flavor_json -- -max_total_time=30
+          cargo +nightly fuzz run cf_html -- -max_total_time=30
+          cargo +nightly fuzz run format_map -- -max_total_time=30

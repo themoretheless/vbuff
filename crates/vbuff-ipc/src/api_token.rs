@@ -186,15 +186,12 @@ mod tests {
             issuer.verify(&token, ApiScope::ReadHistory, 99),
             Err(ApiTokenError::NotYetValid)
         );
-        let mut tampered = token.into_bytes();
-        let last = tampered.len() - 1;
-        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        let parts = token.split('.').collect::<Vec<_>>();
+        let mut payload = parts[1].as_bytes().to_vec();
+        payload[0] = if payload[0] == b'A' { b'B' } else { b'A' };
+        let tampered = format!("v1.{}.{}", std::str::from_utf8(&payload).unwrap(), parts[2]);
         assert_eq!(
-            issuer.verify(
-                std::str::from_utf8(&tampered).unwrap(),
-                ApiScope::ReadHistory,
-                120
-            ),
+            issuer.verify(&tampered, ApiScope::ReadHistory, 120),
             Err(ApiTokenError::InvalidSignature)
         );
         assert_eq!(

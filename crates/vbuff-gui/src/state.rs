@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vbuff_types::{
-    CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel,
-    SecurityPostureSummary,
+    CapabilityView, CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel,
+    PrivacyLedgerSummary, SecurityPostureSummary, SloStatusSummary,
 };
 
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
@@ -22,6 +22,12 @@ pub struct AppState {
     pub capture_stats: CaptureSessionStats,
     /// Capability-honest security state derived by the platform layer.
     pub security_posture: SecurityPostureSummary,
+    /// Detailed capability evidence; no inferred green states.
+    pub capabilities: Vec<CapabilityView>,
+    /// Content-free, hash-chained capture decisions.
+    pub privacy_ledger: PrivacyLedgerSummary,
+    /// Release SLO status; unavailable measurements remain unknown.
+    pub slo_status: SloStatusSummary,
     /// A recent privacy skip may be explicitly re-read from the live clipboard.
     pub recoverable_skip_until: Option<Instant>,
     /// Latest redacted command result, dismissible from the popup.
@@ -106,6 +112,13 @@ impl AppState {
 /// A thread-safe handle to [`AppState`].
 pub type SharedState = Arc<Mutex<AppState>>;
 
+/// Optional, local-only examples offered when history is empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StarterPack {
+    Developer,
+    Writing,
+}
+
 /// A high-level user action emitted by the GUI, drained and handled by the app
 /// wiring (which owns the store, clipboard, and paste backends).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +135,8 @@ pub enum UiAction {
     TogglePause,
     /// Explicitly keep the current clipboard after a recent privacy skip.
     RecoverSkipped,
+    /// Install a small, explicit set of local example clips.
+    InstallStarterPack(StarterPack),
     /// Dismiss the current command result.
     DismissNotice,
     /// Hide the popup (Esc / focus loss).

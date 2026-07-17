@@ -21,7 +21,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev mesa-vulkan-drivers
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -31,3 +31,26 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Core-only build
         run: cargo test -p vbuff --no-default-features --locked
+
+  session-model:
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [x11, wayland]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+      - name: Test session capability model
+        shell: bash
+        run: |
+          if [[ "${{ matrix.session }}" == "wayland" ]]; then
+            WAYLAND_DISPLAY=wayland-ci XDG_SESSION_TYPE=wayland cargo test -p vbuff-platform --locked wayland
+          else
+            env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 cargo test -p vbuff-platform --locked lifecycle
+          fi
+      - name: Hard zero-loss generation model
+        run: cargo test -p vbuff-core --test zero_loss_capture --locked

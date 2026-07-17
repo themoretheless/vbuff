@@ -19,6 +19,7 @@ vbuff-gui = { path = "crates/vbuff-gui", version = "0.1.0" }
 vbuff-sync = { path = "crates/vbuff-sync", version = "0.1.0" }
 vbuff-ipc = { path = "crates/vbuff-ipc", version = "0.1.0" }
 vbuff-plugin = { path = "crates/vbuff-plugin", version = "0.1.0" }
+vbuff-update = { path = "crates/vbuff-update", version = "0.1.0" }
 
 # Data / serialization
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +30,7 @@ blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 url = "2"
+semver = { version = "1", features = ["serde"] }
 
 # Storage
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
@@ -42,6 +44,7 @@ eframe = { version = "0.32", default-features = false, features = [
 ] }
 egui = "0.32"
 egui_extras = { version = "0.32", features = ["image"] }
+egui_kittest = { version = "=0.32.3", features = ["eframe", "snapshot", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 # Platform integrations
@@ -97,6 +100,7 @@ vbuff-core.workspace = true
 vbuff-store.workspace = true
 vbuff-platform.workspace = true
 vbuff-gui.workspace = true
+vbuff-update.workspace = true
 
 eframe.workspace = true
 egui.workspace = true

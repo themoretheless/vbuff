@@ -1,0 +1,38 @@
+name: Mutation Testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "29 2 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  critical-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - vbuff-core
+          - vbuff-platform
+          - vbuff-ipc
+          - vbuff-sync
+          - vbuff-update
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version 27.1.0
+      - name: Mutation gate
+        run: cargo mutants --package "${{ matrix.package }}" --timeout 120 --jobs 2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutants-${{ matrix.package }}
+          path: mutants.out
+          if-no-files-found: warn

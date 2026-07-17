@@ -18,9 +18,11 @@ mod maintenance;
 mod memory_pressure;
 mod paste;
 mod runtime_metrics;
+mod seed_pack;
 mod single_instance;
 #[cfg(feature = "tray")]
 mod tray;
+mod verify;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -30,7 +32,9 @@ use vbuff_core::capture::SelfWriteLedger;
 use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
-use vbuff_types::{ClientIntent, SecurityPostureLevel, SecurityPostureSummary};
+use vbuff_types::{
+    CapabilityView, CapabilityViewLevel, ClientIntent, SecurityPostureLevel, SecurityPostureSummary,
+};
 
 use config::Config;
 use diagnostics::Diagnostics;
@@ -52,6 +56,14 @@ fn main() -> anyhow::Result<()> {
             .map(|config| config.strict_security_mode)
             .unwrap_or(false);
         return doctor::run(format, process_hardening, strict_mode);
+    }
+
+    if let Some(command) = config::requested()? {
+        return config::run(command);
+    }
+
+    if let Some(command) = verify::requested()? {
+        return verify::run(command);
     }
 
     let (_instance_guard, instance_intents) =
@@ -84,6 +96,7 @@ fn main() -> anyhow::Result<()> {
     let mut initial_state = AppState::with_clips(recent);
     initial_state.paused = strict_capture_blocked;
     initial_state.security_posture = summarize_security_posture(&security_posture);
+    initial_state.capabilities = summarize_capabilities(&security_posture);
     let shared: SharedState = Arc::new(Mutex::new(initial_state));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
     let diagnostics = Diagnostics::new(Arc::clone(&shared));
@@ -132,6 +145,23 @@ fn main() -> anyhow::Result<()> {
         strict_capture_blocked,
     };
     app::run(app_services, hotkey_backend, hotkey_id)
+}
+
+fn summarize_capabilities(posture: &vbuff_platform::SecurityPosture) -> Vec<CapabilityView> {
+    posture
+        .capabilities
+        .iter()
+        .map(|capability| CapabilityView {
+            feature: capability.feature.clone(),
+            level: match capability.level {
+                CapabilityLevel::Active => CapabilityViewLevel::Active,
+                CapabilityLevel::Degraded => CapabilityViewLevel::Degraded,
+                CapabilityLevel::Unavailable => CapabilityViewLevel::Unavailable,
+                CapabilityLevel::NotApplicable => CapabilityViewLevel::NotApplicable,
+            },
+            detail: capability.detail.clone(),
+        })
+        .collect()
 }
 
 fn summarize_security_posture(posture: &vbuff_platform::SecurityPosture) -> SecurityPostureSummary {

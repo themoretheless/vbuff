@@ -12,16 +12,21 @@
 pub mod bloom;
 pub mod capture;
 pub mod classify;
+pub mod clock;
 pub mod eviction;
 pub mod facets;
 pub mod filter;
 pub mod fingerprint;
+pub mod format_fidelity;
 pub mod hash;
 pub mod history_tier;
 pub mod observability;
+pub mod onboarding;
+pub mod privacy;
 pub mod reliability;
 pub mod secret;
 pub mod security_audit;
+pub mod slo;
 
 pub use classify::detect_kind;
 pub use eviction::{EvictionPolicy, evict};
