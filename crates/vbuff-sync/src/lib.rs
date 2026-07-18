@@ -1,6 +1,7 @@
 //! OS- and transport-independent E2E sync protocol primitives.
 #![forbid(unsafe_code)]
 
+pub mod artifact;
 pub mod bootstrap;
 pub mod burn;
 pub mod capability;
@@ -19,4 +20,5 @@ pub mod wire;
 
 mod error;
 
+pub use artifact::{EmbeddingArtifact, seal_embedding_if_allowed};
 pub use error::{Result, SyncError};

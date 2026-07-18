@@ -121,4 +121,8 @@ atomic-write-file.workspace = true
 crossbeam-queue.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+regex.workspace = true
 memory-stats.workspace = true
+
+[dev-dependencies]
+vbuff-ipc.workspace = true

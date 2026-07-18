@@ -395,6 +395,7 @@ fn run_worker(
                 action: CaptureAction::Capture,
                 sensitive: true,
                 sync_eligible: false,
+                ai_allowed: false,
                 expires_after: None,
             }
         } else {
@@ -405,6 +406,7 @@ fn run_worker(
             action,
             sensitive,
             sync_eligible,
+            ai_allowed,
             expires_after,
         } = decision
         else {
@@ -518,6 +520,7 @@ fn run_worker(
             stored_hash,
             sensitive,
             sync_eligible,
+            ai_allowed,
             expires_after,
         );
         let fields = RedactedClipFields::from(&clip);
@@ -725,7 +728,10 @@ fn capture_policy(config: &Config) -> CapturePolicy {
                 rule.url_host_suffix.clone(),
             )
             .map_err(|error| {
-                tracing::warn!(pattern = ?rule.title_regex, "invalid capture-rule regex: {error}");
+                tracing::warn!(
+                    pattern_bytes = rule.title_regex.as_ref().map_or(0, String::len),
+                    "invalid capture-rule regex: {error}"
+                );
             })
             .ok()?;
             let action = match rule.action {
@@ -840,6 +846,7 @@ fn build_clip(
     content_hash: [u8; 32],
     sensitive: bool,
     sync_eligible: bool,
+    ai_allowed: bool,
     expires_after: Option<Duration>,
 ) -> Clip {
     let kind = detect_kind(&captured.flavors);
@@ -856,6 +863,7 @@ fn build_clip(
     meta.lineage = captured.lineage;
     meta.sensitive = sensitive;
     meta.sync_eligible = sync_eligible;
+    meta.ai_allowed = ai_allowed;
     meta.expires_at = expires_after
         .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
         .map(|ttl| chrono::Utc::now() + ttl);
@@ -969,7 +977,14 @@ mod tests {
     fn build_clip_preserves_source_and_byte_count() {
         let captured = captured("hello", Some("editor.app"));
         let hash = content_hash_from_flavors(&captured.flavors);
-        let clip = build_clip(captured, hash, true, false, Some(Duration::from_secs(90)));
+        let clip = build_clip(
+            captured,
+            hash,
+            true,
+            false,
+            false,
+            Some(Duration::from_secs(90)),
+        );
 
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));

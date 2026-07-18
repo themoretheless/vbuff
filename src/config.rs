@@ -4,16 +4,18 @@
 //! and created with defaults if missing. Policy (hotkey, intervals, exclusions)
 //! lives here, not in the database.
 
-use std::io::Read as _;
+use std::fmt;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 const SHAREABLE_CONFIG_SCHEMA: u16 = 1;
+const HANDOFF_CONFIG_SCHEMA: u16 = 1;
 const MAX_SHAREABLE_CONFIG_BYTES: usize = 256 * 1024;
 
 /// User-tunable configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Global show/hide hotkey, e.g. `"Cmd+Shift+V"` or `"Ctrl+Shift+V"`.
@@ -51,6 +53,30 @@ pub struct Config {
     pub launch_at_login: bool,
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("hotkey", &self.hotkey)
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("max_history", &self.max_history)
+            .field("paste_modifier", &self.paste_modifier)
+            .field("excluded_app_count", &self.excluded_apps.len())
+            .field("source_rule_count", &self.source_rules.len())
+            .field("skip_whitespace_only", &self.skip_whitespace_only)
+            .field("detect_secrets", &self.detect_secrets)
+            .field("secret_ttl_seconds", &self.secret_ttl_seconds)
+            .field("capture_soft_limit_bytes", &self.capture_soft_limit_bytes)
+            .field("capture_hard_limit_bytes", &self.capture_hard_limit_bytes)
+            .field("capture_preview_bytes", &self.capture_preview_bytes)
+            .field("memory_soft_limit_mb", &self.memory_soft_limit_mb)
+            .field("memory_hard_limit_mb", &self.memory_hard_limit_mb)
+            .field("strict_security_mode", &self.strict_security_mode)
+            .field("launch_at_login", &self.launch_at_login)
+            .finish()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -74,13 +100,25 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceRuleConfig {
     pub app_contains: Option<String>,
     pub title_regex: Option<String>,
     pub url_host_suffix: Option<String>,
     pub action: SourceRuleAction,
+}
+
+impl fmt::Debug for SourceRuleConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceRuleConfig")
+            .field("has_app_matcher", &self.app_contains.is_some())
+            .field("has_title_matcher", &self.title_regex.is_some())
+            .field("has_host_matcher", &self.url_host_suffix.is_some())
+            .field("action", &self.action)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -115,10 +153,47 @@ pub struct ShareableConfig {
     pub launch_at_login: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigHandoff {
+    schema: u16,
+    source_platform: String,
+    config: Config,
+    payload_hash: String,
+}
+
+impl fmt::Debug for ConfigHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigHandoff")
+            .field("schema", &self.schema)
+            .field("source_platform", &self.source_platform)
+            .field("config", &self.config)
+            .field("payload_hash", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum ConfigCommand {
     Export(Option<PathBuf>),
     Apply(PathBuf),
+    HandoffExport(PathBuf),
+    HandoffApply(PathBuf),
+}
+
+impl fmt::Debug for ConfigCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Export(path) => formatter
+                .debug_tuple("Export")
+                .field(&path.as_ref().map(|_| "[redacted path]"))
+                .finish(),
+            Self::Apply(_) => formatter.write_str("Apply([redacted path])"),
+            Self::HandoffExport(_) => formatter.write_str("HandoffExport([redacted path])"),
+            Self::HandoffApply(_) => formatter.write_str("HandoffApply([redacted path])"),
+        }
+    }
 }
 
 /// The default hotkey string for the current OS.
@@ -166,7 +241,7 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text)?;
+        write_private(&path, &text)?;
         Ok(())
     }
 
@@ -255,6 +330,74 @@ impl ShareableConfig {
     }
 }
 
+impl ConfigHandoff {
+    fn new(config: Config) -> anyhow::Result<Self> {
+        let payload_hash = hash_config(&config)?;
+        Ok(Self {
+            schema: HANDOFF_CONFIG_SCHEMA,
+            source_platform: std::env::consts::OS.into(),
+            config,
+            payload_hash,
+        })
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema == HANDOFF_CONFIG_SCHEMA,
+            "unsupported handoff schema"
+        );
+        anyhow::ensure!(
+            !self.source_platform.is_empty()
+                && self.source_platform.len() <= 64
+                && self
+                    .source_platform
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "invalid source platform"
+        );
+        anyhow::ensure!(
+            self.payload_hash == hash_config(&self.config)?,
+            "handoff checksum mismatch"
+        );
+        self.config.shareable().validate()?;
+        anyhow::ensure!(
+            self.config.excluded_apps.len() <= 1_024,
+            "too many excluded apps"
+        );
+        for app in &self.config.excluded_apps {
+            anyhow::ensure!(
+                !app.is_empty() && app.len() <= 512 && !app.chars().any(char::is_control),
+                "invalid excluded app"
+            );
+        }
+        anyhow::ensure!(
+            self.config.source_rules.len() <= 1_024,
+            "too many source rules"
+        );
+        for rule in &self.config.source_rules {
+            for value in [&rule.app_contains, &rule.url_host_suffix]
+                .into_iter()
+                .flatten()
+            {
+                anyhow::ensure!(
+                    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control),
+                    "invalid source rule"
+                );
+            }
+            if let Some(pattern) = &rule.title_regex {
+                anyhow::ensure!(pattern.len() <= 4_096, "source rule regex is too long");
+                regex::Regex::new(pattern)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hash_config(config: &Config) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(config)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
 pub(crate) fn requested() -> anyhow::Result<Option<ConfigCommand>> {
     parse_requested(std::env::args().skip(1))
 }
@@ -286,7 +429,36 @@ fn parse_requested(
             );
             Ok(Some(ConfigCommand::Apply(path)))
         }
-        _ => anyhow::bail!("usage: vbuff config export [file] | vbuff config apply <file|->"),
+        Some("handoff") => {
+            match arguments.next().as_deref() {
+                Some("export") => {
+                    let path = arguments.next().map(PathBuf::from).ok_or_else(|| {
+                        anyhow::anyhow!("usage: vbuff config handoff export <file>")
+                    })?;
+                    anyhow::ensure!(
+                        arguments.next().is_none(),
+                        "usage: vbuff config handoff export <file>"
+                    );
+                    Ok(Some(ConfigCommand::HandoffExport(path)))
+                }
+                Some("apply") => {
+                    let path = arguments.next().map(PathBuf::from).ok_or_else(|| {
+                        anyhow::anyhow!("usage: vbuff config handoff apply <file>")
+                    })?;
+                    anyhow::ensure!(
+                        arguments.next().is_none(),
+                        "usage: vbuff config handoff apply <file>"
+                    );
+                    Ok(Some(ConfigCommand::HandoffApply(path)))
+                }
+                _ => anyhow::bail!(
+                    "usage: vbuff config handoff export <file> | vbuff config handoff apply <file>"
+                ),
+            }
+        }
+        _ => anyhow::bail!(
+            "usage: vbuff config export [file] | vbuff config apply <file|-> | vbuff config handoff <export|apply> <file>"
+        ),
     }
 }
 
@@ -318,7 +490,39 @@ pub(crate) fn run(command: ConfigCommand) -> anyhow::Result<()> {
             config.save()?;
             println!("vbuff config: applied shareable settings");
         }
+        ConfigCommand::HandoffExport(path) => {
+            let handoff = ConfigHandoff::new(Config::load_for_inspection()?)?;
+            write_private(&path, &toml::to_string_pretty(&handoff)?)?;
+            println!("vbuff config: wrote full setup handoff");
+        }
+        ConfigCommand::HandoffApply(path) => {
+            let text = read_bounded(std::fs::File::open(path)?)?;
+            let handoff: ConfigHandoff = toml::from_str(&text)?;
+            handoff.validate()?;
+            handoff.config.save()?;
+            println!("vbuff config: applied full setup handoff");
+        }
     }
+    Ok(())
+}
+
+fn write_private(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = atomic_write_file::AtomicWriteFile::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.commit()?;
     Ok(())
 }
 
@@ -379,6 +583,41 @@ mod tests {
             config.source_rules[0].app_contains.as_deref(),
             Some("private-app")
         );
+    }
+
+    #[test]
+    fn full_handoff_is_checksummed_and_keeps_private_rules_explicit() {
+        let config = Config {
+            excluded_apps: vec!["private-app".into()],
+            source_rules: vec![SourceRuleConfig {
+                title_regex: Some("(?i)bank".into()),
+                ..SourceRuleConfig::default()
+            }],
+            ..Config::default()
+        };
+        let handoff = ConfigHandoff::new(config).unwrap();
+        handoff.validate().unwrap();
+        let text = toml::to_string(&handoff).unwrap();
+        assert!(text.contains("private-app"));
+        let mut tampered: ConfigHandoff = toml::from_str(&text).unwrap();
+        tampered.config.max_history += 1;
+        assert!(tampered.validate().is_err());
+        assert!(!format!("{handoff:?}").contains("private-app"));
+    }
+
+    #[test]
+    fn handoff_cli_requires_an_explicit_file_and_verb() {
+        assert_eq!(
+            parse_requested([
+                "config".into(),
+                "handoff".into(),
+                "export".into(),
+                "setup.toml".into(),
+            ])
+            .unwrap(),
+            Some(ConfigCommand::HandoffExport(PathBuf::from("setup.toml")))
+        );
+        assert!(parse_requested(["config".into(), "handoff".into()]).is_err());
     }
 
     #[test]

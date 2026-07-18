@@ -1,5 +1,6 @@
 //! Shared state and action types exchanged between the GUI and the app wiring.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,10 +122,12 @@ pub enum StarterPack {
 
 /// A high-level user action emitted by the GUI, drained and handled by the app
 /// wiring (which owns the store, clipboard, and paste backends).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum UiAction {
     /// Paste the given clip back into the previously focused app.
     Paste(ClipId),
+    /// Paste an explicitly edited local composition draft.
+    PasteText(String),
     /// Pin or unpin a clip.
     SetPinned(ClipId, bool),
     /// Delete a single clip.
@@ -141,6 +144,33 @@ pub enum UiAction {
     DismissNotice,
     /// Hide the popup (Esc / focus loss).
     Hide,
+}
+
+impl fmt::Debug for UiAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Paste(id) => formatter.debug_tuple("Paste").field(id).finish(),
+            Self::PasteText(text) => formatter
+                .debug_struct("PasteText")
+                .field("text", &format_args!("[redacted; {} bytes]", text.len()))
+                .finish(),
+            Self::SetPinned(id, pinned) => formatter
+                .debug_tuple("SetPinned")
+                .field(id)
+                .field(pinned)
+                .finish(),
+            Self::Delete(id) => formatter.debug_tuple("Delete").field(id).finish(),
+            Self::ClearHistory => formatter.write_str("ClearHistory"),
+            Self::TogglePause => formatter.write_str("TogglePause"),
+            Self::RecoverSkipped => formatter.write_str("RecoverSkipped"),
+            Self::InstallStarterPack(pack) => formatter
+                .debug_tuple("InstallStarterPack")
+                .field(pack)
+                .finish(),
+            Self::DismissNotice => formatter.write_str("DismissNotice"),
+            Self::Hide => formatter.write_str("Hide"),
+        }
+    }
 }
 
 #[cfg(test)]

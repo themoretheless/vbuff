@@ -12,12 +12,17 @@ use vbuff_types::{
 };
 
 #[test]
-fn popup_golden_matrix_covers_themes_dpi_and_trust_states() {
+fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
     let snapshots = SnapshotOptions::new()
         .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
     for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
         for (dpi_name, pixels_per_point) in [("1x", 1.0_f32), ("2x", 2.0_f32)] {
-            for surface in [Surface::Empty, Surface::Populated, Surface::Trust] {
+            for surface in [
+                Surface::Empty,
+                Surface::Populated,
+                Surface::Trust,
+                Surface::Compose,
+            ] {
                 let name = format!("popup_{theme_name}_{dpi_name}_{}", surface.name());
                 let state = Arc::new(Mutex::new(snapshot_state(surface)));
                 let mut harness = Harness::builder()
@@ -29,6 +34,16 @@ fn popup_golden_matrix_covers_themes_dpi_and_trust_states() {
                 if surface == Surface::Trust {
                     let ctx = harness.ctx.clone();
                     harness.state_mut().request_trust_view(&ctx);
+                    harness.run_steps(2);
+                } else if surface == Surface::Compose {
+                    let ctx = harness.ctx.clone();
+                    harness
+                        .state_mut()
+                        .add_compose_item("Command", "cargo test --workspace --locked");
+                    harness
+                        .state_mut()
+                        .add_compose_item("URL", "https://github.com/themoretheless/vbuff");
+                    harness.state_mut().request_compose_view(&ctx);
                     harness.run_steps(2);
                 }
                 harness.snapshot_options(name, &snapshots);
@@ -42,6 +57,7 @@ enum Surface {
     Empty,
     Populated,
     Trust,
+    Compose,
 }
 
 impl Surface {
@@ -50,6 +66,7 @@ impl Surface {
             Self::Empty => "empty",
             Self::Populated => "populated",
             Self::Trust => "trust",
+            Self::Compose => "compose",
         }
     }
 }

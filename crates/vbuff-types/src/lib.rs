@@ -340,6 +340,10 @@ pub struct ClipMeta {
     /// False means the clip must never enter a sync envelope.
     #[serde(default = "default_true")]
     pub sync_eligible: bool,
+    /// True only when the capture gate explicitly permits local inference.
+    /// Missing values from older databases fail closed.
+    #[serde(default)]
+    pub ai_allowed: bool,
 }
 
 impl ClipMeta {
@@ -360,6 +364,7 @@ impl ClipMeta {
             expires_at: None,
             sensitive: false,
             sync_eligible: true,
+            ai_allowed: false,
         }
     }
 }

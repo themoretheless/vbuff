@@ -5,6 +5,7 @@
 //! eframe loop each live in a focused module.
 
 mod app;
+mod ask;
 mod autostart;
 mod capture;
 mod commands;
@@ -64,6 +65,10 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(command) = verify::requested()? {
         return verify::run(command);
+    }
+
+    if let Some(command) = ask::requested()? {
+        return ask::run(command);
     }
 
     let (_instance_guard, instance_intents) =

@@ -16,7 +16,7 @@ The shippable MVP is a deliberate **single-process subset** of that workspace. T
 
 - `vbuff-types` (plain data: `Clip`, `Flavor`, `ContentKind`, `ClipMeta`, ids)
 - `vbuff-core` (engine: dedup, eviction, retention, capture-gate policy, search, classify)
-- `vbuff-store` (currently bundled SQLite schema v4 + FTS5 + migrations + blob CAS + WAL; SQLCipher and OS-keystore integration are still required)
+- `vbuff-store` (currently bundled SQLite schema v5 + FTS5 + migrations + blob CAS + eligible local embeddings + WAL; SQLCipher and OS-keystore integration are still required)
 - `vbuff-platform` (the four backend traits + per-OS impls + `MockBackend`)
 - `vbuff-gui` (eframe popup + settings viewports, the egui hot path)
 - `vbuff-update` (signed release contracts and the offline checksum verifier; network fetch/install remains deferred)
@@ -28,7 +28,7 @@ The later crates are explicitly deferred:
 - `vbuff-ipc` - the framed control-socket protocol and client/server; deferred to M7. The MVP still needs a single-instance guard (bind-or-forward) but its forwarded intent is minimal (just "show popup"), not the full IPC verb surface.
 - `vbuff-cli` - the `vbuff` verb surface (`list`/`get`/`copy`/`add`/`search`/`delete`, `--json`, completions); deferred to M8. It is a pure IPC client, so it cannot exist before `vbuff-ipc`.
 - `vbuff-sync` runtime integration - the crate now contains tested CRDT/HLC, envelope, membership, policy, anti-entropy, recovery, receipt, capability, and padding foundations. Discovery, authenticated transport, pairing UI, durable replication, and app wiring remain deferred to M9 (v1) and M11 (v2 transports).
-- `vbuff-plugin` runtime integration - manifests, typed transforms, migrations, offline evidence, and signed packs are tested foundations; Wasmtime execution and installation remain deferred.
+- `vbuff-plugin` runtime integration - manifests, typed transforms, migrations, offline evidence, signed packs, and four curated bounded recipes are tested foundations; Wasmtime execution and installation remain deferred.
 
 This means: in MVP, the root binary is both daemon and GUI host in one process, exactly as `architecture.md` describes ("the GUI runs inside the daemon process on the main thread, while capture/store/sync run on background threads"). The "daemon" is a *role*, not yet a separate crate. The crate split into `vbuff-daemon`/`vbuff-ipc` is a refactor we perform once the single-process loop is proven, precisely so the CLI and sync have something to talk to.
 
@@ -36,7 +36,7 @@ This means: in MVP, the root binary is both daemon and GUI host in one process, 
 
 ## 1. Milestone-sequence overview
 
-Phases follow the spine roadmap exactly: Phase 0 (foundations/scaffolding) -> MVP -> v1 -> v2; "future" features (AI, mobile, teams/collaboration, off-LAN cloud relay) are out of scope for this plan and listed only as the v2-exit horizon.
+Phases follow the spine roadmap exactly: Phase 0 (foundations/scaffolding) -> MVP -> v1 -> v2. Bounded AI/integration contracts may land early to freeze privacy and compatibility boundaries, but enabling models, MCP, mobile, teams/collaboration, or off-LAN relay remains outside the current runtime milestones.
 
 | Milestone | Name | Spine phase | Goal in one line | Primary crates | Single-process MVP? |
 |---|---|---|---|---|---|
@@ -68,7 +68,7 @@ The expanded 600-idea backlog is reference material, not an implicit scope incre
 
 The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 
-Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `seed_pack`, `verify`, `heartbeat`, `maintenance`, `memory_pressure`, `doctor`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, detailed capabilities, a content-free hash-chained privacy ledger, explicit SLO states, notices, expiry/local/incomplete state, and saved/skipped/lost totals. The golden-tested popup keeps History and Trust as two compact surfaces, and empty history offers only explicit local seed packs. Hotkey, tray, and second-instance messages wake egui directly, while tiered capture supervision, byte/RSS pressure policy, secret clawback, and maintenance budgets protect the resident loop. Store schema v4 owns FTS5 health/merge, facets, fingerprints, keyset sessions, transactional batches, CAS, migration verification, expiry, and audits. `vbuff-ipc`, `vbuff-plugin`, `vbuff-sync`, and `vbuff-update` own tested future-facing contracts, but no daemon listener, Wasmtime host, sync transport, or auto-update install loop is enabled. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, live dispatch for the full IPC verb surface, and moves stable modules behind daemon/IPC contracts.
+Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `ask`, `seed_pack`, `verify`, `heartbeat`, `maintenance`, `memory_pressure`, `doctor`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, capabilities, a content-free privacy ledger, explicit SLO states, notices, expiry/local/incomplete state, and saved/skipped/lost totals. The golden-tested popup keeps History, Trust, and Compose compact; empty history offers explicit local seed packs. Compose owns an ephemeral stack, safe named steps, and merge templates. Hotkey, tray, and second-instance messages wake egui directly, while tiered capture supervision, byte/RSS pressure policy, secret clawback, pre-injection clipboard verification, and maintenance budgets protect the resident loop. Store schema v5 owns FTS5, facets/fingerprints, keyset sessions, transactions, CAS, migration verification, expiry/audits, and fail-closed content-hash-keyed local embeddings. IPC/plugin/sync/update integration contracts are tested, but no daemon listener, third-party Wasmtime host, browser/editor/mobile client, sync transport, or auto-update install loop is enabled. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, live dispatch, and moves stable modules behind daemon/IPC contracts.
 
 ### Batch execution overlay
 
@@ -79,9 +79,12 @@ The 600-item list is now executed in sequential batches of 50 without rewriting 
 | 001-050 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-001-050.md) |
 | 051-100 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-051-100.md); native APIs, SQLCipher, daemon dispatch, and Wasmtime remain milestone gates |
 | 101-150 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-101-150.md); native OS conformance, release credentials, live updater/sync/plugin paths, and SQLCipher remain gates |
-| 151-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
+| 151-200 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-151-200.md); models, native integrations, daemon dispatch, SQLCipher, real compositor evidence, dogfood, and live sync remain gates |
+| 201-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
 
-Batch completion does not override milestone acceptance. For example, item 035 can have a tested membership/SAS/rekey foundation while M9 remains open until pairing, authenticated transport, persistence, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite the broader schema v4 work already landed.
+Batch completion does not override milestone acceptance. For example, item 163 can seal an embedding artifact while M9 remains open until pairing, authenticated transport, persistence, policy, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite the broader schema v5 work already landed. Batch 151-200 adds [registered decision gates](docs/decision-gates-151-200.md) and a [v1 data-contract freeze](docs/data-contract-v1.md); missing real-world evidence remains Unknown rather than passing by documentation.
+
+From the first resident milestone onward, every milestone records the same SLO budget: zero unaccounted loss, search p99 at or below 16 ms, idle CPU at or below 0.5%, and login-ready at or below 500 ms. `Unknown` is a release blocker. Scope is similarly mechanical: more than nine current workspace crates, more than one added MVP milestone, or one milestone open beyond 42 days forces a cut-line review before new work starts.
 
 ---
 
@@ -203,25 +206,26 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 
 **Crates/modules touched.** `vbuff-platform` (`lib.rs` trait defs; the active per-OS impl; `mock`); the `cfg`/runtime `backends()` selector; `error`.
 
-**Decision to confirm.** The first concrete backend is **macOS** (NSPasteboard changeCount polling is the simplest event model to reason about, and it forces the polling-discipline decisions early). This is a build-order choice, not a spine value; swap to Windows or Linux if that better matches who builds first. The MockBackend and the conformance battery are OS-agnostic regardless.
+**Decision.** Retire the highest-risk backend first: Linux Wayland. The production probe covers sway/wlroots data control, KDE, and the GNOME capture-on-summon degradation path before an easier backend expands the matrix. This does not manufacture parity from capability models: the real-session gate in [decision-gates-151-200.md](docs/decision-gates-151-200.md) must produce an explicit support decision. The MockBackend and conformance battery remain OS-agnostic.
 
 **Task checklist.**
 - [ ] Finalize the four traits verbatim from architecture.md: `ClipboardBackend` (`run(sink, ctl)` / `read_all` / `write` / `is_concealed` / `capabilities`), `HotkeyBackend` (`register`/`unregister`/`events`/`is_available`), `PasteBackend` (`capture_focus` -> `FocusToken`, `paste_into`, `type_text`, `capabilities`), `TrayBackend` (`install`/`update`/`events`). Add the adjacent `SecretStoreBackend` and `AutostartBackend` traits.
 - [ ] Define the shared event/value types: `CaptureEvent`, `Flavor`/`FormatKey`, `Sensitivity`, `SourceApp`, `Control { Pause|Resume|SnapshotNow|Shutdown }`, `PasteCaps`, `Conflict`, `Capabilities`.
-- [ ] Implement the **format-mapping table** (UTI / CF_* / MIME <-> `FormatKey`) with `Custom(id)` preservation for unknown identifiers; table-driven round-trip tests including the CF_HTML header parser.
-- [ ] Implement the macOS `ClipboardBackend`: changeCount polling at 150-250 ms with idle backoff to ~500 ms; read all flavors in one pass; honor `org.nspasteboard.ConcealedType`/`TransientType`/`AutoGeneratedType`; source app via `NSWorkspace.frontmostApplication`; the changeCount re-check after read; self-write sentinel suppression. Use `objc2`/`objc2-app-kit`/`objc2-foundation`.
-- [ ] Implement the macOS `HotkeyBackend` (Carbon `RegisterEventHotKey`, avoiding Input Monitoring), `PasteBackend` (`capture_focus` FIRST, then `CGEvent` Cmd+V; `AXIsProcessTrusted` gating with copy-only degradation), `TrayBackend` (`NSStatusItem` via `tray-icon`), `SecretStoreBackend` (Keychain via `keyring`), `AutostartBackend` (LaunchAgent/SMAppService).
+- [ ] Keep the **format-mapping table** and checked-in `format-fidelity-v1` corpus as the shared pre-backend oracle (UTI / CF_* / MIME <-> `FormatKey`), preserving unknown custom identifiers and byte-identical round trips.
+- [ ] Run `scripts/wayland-reality-check.sh` plus manual copy/hotkey/focused-paste checks on real GNOME, KDE, and sway sessions; record `full`, `capture_on_summon`, or `unsupported` per environment before claiming first-class support.
+- [ ] Implement the selected Linux `ClipboardBackend`: native data-control where exposed, XWayland coexistence and dedup, eager multi-flavor realization, explicit unknown provenance, and capture-on-summon rather than fabricated background capture on GNOME.
+- [ ] Implement Wayland hotkey/paste capability ladders: GlobalShortcuts portal where available, safe injection only when proven, otherwise visible manual summon or copy-only behavior. Keep tray/autostart/key-provider decisions behind narrow adapters.
 - [ ] Implement `MockBackend`: a scriptable `ClipboardBackend`/`PasteBackend`/`HotkeyBackend`/`TrayBackend` emitting scripted `CaptureEvent`s and recording writes, with zero OS dependency, for driving daemon policy in CI.
 - [ ] Write the **trait-conformance battery**: a parameterized `#[test]` suite runnable against any backend impl (Mock now, real backends as they land), asserting read-all returns every offered flavor, self-writes are suppressed, capabilities are reported honestly, and `capture_focus` precedes `write` on paste.
-- [ ] Run the **crate-maturity spike** from architecture.md's risk table: verify `tray-icon` SNI behavior, `global-hotkey` Wayland gap, `keyring` v3 surface, current SQLCipher PRAGMA defaults, and the `objc2`/`windows-rs` signatures against the versions pinned in M0. Lock the stack only after this passes.
+- [ ] Execute the documented **build-versus-buy ladder**: verify `tray-icon`, the `global-hotkey` Wayland gap, portal support, keyring/SQLCipher integration, and the native crates against pinned versions; use/wrap/fork/degrade only at the registered trigger.
 
 **Acceptance criteria.**
-- The conformance battery passes against `MockBackend` and against the macOS backend in the macOS CI lane.
+- The conformance battery passes against `MockBackend` and the selected Wayland backend; real GNOME/KDE/sway evidence is attached and capability-model CI remains supplemental.
 - Format round-trip tests pass; an unknown UTI survives as `Custom(id)` byte-for-byte.
-- macOS idle CPU is near 0% over a multi-hour run; a rapid-copy loop yields one entry per distinct change (no misses, no echo duplicates).
+- First-session idle CPU is within budget over a multi-hour run; a rapid-copy loop yields one entry per distinct change with no misses or echo duplicates.
 - The crate-maturity spike report is committed; any swapped crate is reflected in pinned versions.
 
-**Feature tiers delivered.** MVP platform set (first OS): capture monitoring, hotkey registration, paste-back, tray UI, macOS Accessibility request, secret-store key access, autostart-on-login - on one platform.
+**Feature tiers delivered.** MVP platform set (first risk-retiring Linux scope): honest capture monitoring or capture-on-summon, portal/manual hotkey behavior, proven paste or copy-only fallback, tray UI, key access, and autostart on one documented session class.
 
 **Pitfalls guarded.**
 - Fixed-interval polling misses copies / re-reading content every tick / idle CPU burn (`mistakes-top-500.md` 1, 2, 32; architecture table #1, #2): poll only the integer changeCount, read content once per edge, adaptive backoff.
@@ -233,9 +237,9 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 
 ---
 
-### M4 - First end-to-end loop on one OS
+### M4 - First end-to-end loop on one OS/session scope
 
-**Goal.** The product's core loop - copy -> store -> hotkey -> popup -> paste-back - works end-to-end on the first OS (macOS), encrypted at rest, fully keyboard-driven, in a single process.
+**Goal.** The product's core loop - copy -> store -> hotkey -> popup -> paste-back - works end-to-end on the first explicitly supported OS/session scope, encrypted at rest, fully keyboard-driven, in a single process.
 
 **Phase.** MVP.
 
@@ -249,9 +253,10 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - [ ] Wire the global hotkey to capture focus then summon/toggle the popup; cold-start so the hotkey and tray are live within a few hundred ms of process start.
 - [ ] Connect the capture path: watcher emits `CaptureEvent` -> core gate -> store upsert (transactional) -> popup sees new items via the store.
 - [ ] Dark/light themes; DPI scaling; accesskit tree for the list.
+- [ ] Pull packaging left: install the first artifact on a clean environment and run doctor/verification before backend fan-out; source-checkout-only success does not pass M4.
 
 **Acceptance criteria.**
-- On macOS: copy in app A, press hotkey, popup appears near cursor, type to filter, Enter, content lands in app A. Demonstrated end-to-end.
+- On the selected first scope: copy in app A, summon the popup through the documented capability path, filter, press Enter, and content lands in app A or the UI explicitly selects copy-only behavior.
 - The whole flow is mouse-free.
 - Cold-start: hotkey live < a few hundred ms after launch.
 - Search-as-you-type stays under ~16 ms/frame at 50,000+ seeded items (virtualized, keyset-paged, no `SELECT *`).
@@ -275,8 +280,11 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 
 **Crates/modules touched.** `vbuff-core` (gate wiring to live config, transforms), `vbuff-gui` (settings viewport, organization UI, snippet editor, quick-action palette), `vbuff-store` (snippet/collection tables in use, pin/permanent flags), `vbuff-platform` (secure-input detection, autostart, screen-lock signals).
 
+**Order gate.** Privacy is the non-cuttable first half: capture/AI eligibility, visible health, deny rules, secure deletion, and retention must pass before snippets, recipes, or transform breadth can consume schedule. Convenience is the explicit cuttable tail.
+
 **Task checklist.**
 - [ ] Wire the live capture gate to runtime config read via `Arc<RwLock<…>>`: pause/resume, incognito, per-app exclusion (with a default deny-list of known password managers), whitespace skip, secure-input skip (macOS `IsSecureEventInputEnabled`), concealed-flag honoring already in core.
+- [ ] Keep `ai_allowed` affirmative and fail closed across capture, embedding, search, explanation/caption/PII backends, sync artifacts, and later external endpoints; legacy/unknown eligibility is denied.
 - [ ] Organization: pin-to-top, star favorite, promote-to-permanent (out of the auto-prune pool), persistent-vs-ephemeral, type filter chips, pinned/favorites filter, pin-protected-from-clear; manual reorder via fractional `sort_index`.
 - [ ] Clear-all (pin-protected) + delete-item; secure-delete path for sensitive items; "wipe all incl. pinned" panic option.
 - [ ] Settings window: launch-at-login (`AutostartBackend`), start-minimized, retention limits (count cap, per-item cap), the hotkey editor with bind-time conflict detection (`HotkeyBackend::is_available`), storage-location display with cloud-folder warning, onboarding/permissions flow (deep-link to macOS Accessibility), and a visible capture-health/persistence indicator.
@@ -290,6 +298,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Binding a taken hotkey is refused with a visible conflict message.
 - An abbreviation expands; a clip promotes to a snippet; a transform applies on paste without mutating the stored clip.
 - The capture-health indicator shows "capturing / paused" so silent loss is visible.
+- Before M6 fan-out, complete a 14-day first-scope dogfood window as the only clipboard manager with zero silent-loss incidents and zero wrong-target pastes; missing evidence blocks fan-out.
 
 **Feature tiers delivered.** MVP security/privacy set (encrypt-at-rest, skip password fields, honor concealed markers, per-app exclusion, incognito, auto-clear-on-timer, wipe-on-demand, local-by-default, zero telemetry); MVP organization set; MVP settings set; MVP snippets set; MVP transforms set. Extras items tagged `[MVP]`: 34 (strip formatting), 49 (set phrases/snippet bank), 57 (app exclusion), 59 (auto-search quick paste), 69 (paste-as), 79 (per-app exclusion rules), 80 (type-ahead picker), 106 (paste as plain text), 122 (pinned persisting as snippet bank).
 
@@ -303,9 +312,9 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 
 ---
 
-### M6 - Remaining OS backends (Windows, X11, Wayland-wlr, GNOME fallback)
+### M6 - Remaining OS/session backends and parity
 
-**Goal.** Bring the same end-to-end loop and MVP feature set to Windows, Linux/X11, and Linux/Wayland (wlr-data-control), with the honest GNOME-Wayland degradation path, and pass the full per-OS CI matrix.
+**Goal.** Bring the proven first-scope loop and MVP feature set to the remaining macOS, Windows, X11, and Wayland session classes, retaining the honest GNOME degradation path, and pass the full per-OS matrix.
 
 **Phase.** MVP.
 
@@ -342,6 +351,8 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Image arrives as html not pixels (14): prefer the binary image type on Wayland.
 
 **>>> MVP COMPLETION GATE here (see section 5).**
+
+**M6 -> M7 data-contract gate.** Before daemon/CLI/sync consumers attach, freeze the on-disk schema, content-hash vector, native format keys, and IPC serde representation through [data-contract-v1.md](docs/data-contract-v1.md) and executable golden fixtures. Any later break requires a new version, migration/negotiation behavior, and old-reader tests.
 
 ---
 

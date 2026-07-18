@@ -264,6 +264,13 @@ impl Runtime {
                 }
             }
             AppCommand::Paste(id) => self.start_paste(id, ctx),
+            AppCommand::PasteText(text) => {
+                let flavors = [vbuff_types::Flavor::inline(
+                    "text/plain;charset=utf-8",
+                    text.into_bytes(),
+                )];
+                self.start_paste_flavors(&flavors, ctx);
+            }
             #[cfg(feature = "tray")]
             AppCommand::CopyLatest => match self.history.latest() {
                 Ok(Some(clip)) => match self.paste.copy(&clip.flavors) {
@@ -345,7 +352,11 @@ impl Runtime {
             }
         };
 
-        match self.paste.schedule(&clip.flavors, Instant::now()) {
+        self.start_paste_flavors(&clip.flavors, ctx);
+    }
+
+    fn start_paste_flavors(&mut self, flavors: &[vbuff_types::Flavor], ctx: &egui::Context) {
+        match self.paste.schedule(flavors, Instant::now()) {
             Ok(outcome) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 if outcome == PasteOutcome::CopiedOnly {

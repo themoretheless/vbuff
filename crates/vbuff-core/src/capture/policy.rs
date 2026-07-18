@@ -192,6 +192,7 @@ pub enum CaptureDecision {
         action: CaptureAction,
         sensitive: bool,
         sync_eligible: bool,
+        ai_allowed: bool,
         expires_after: Option<Duration>,
     },
     Skip(DropReason),
@@ -299,6 +300,7 @@ impl CapturePolicy {
             action,
             sensitive: otp || secret || forced_sensitive,
             sync_eligible: !otp && !secret && !forced_sensitive,
+            ai_allowed: !otp && !secret && !forced_sensitive,
             expires_after: if otp {
                 Some(self.otp_ttl)
             } else if secret {
@@ -353,6 +355,7 @@ mod tests {
                 action: CaptureAction::Capture,
                 sensitive: true,
                 sync_eligible: false,
+                ai_allowed: false,
                 expires_after: Some(Duration::from_secs(90)),
             }
         );
@@ -371,6 +374,7 @@ mod tests {
                 action: CaptureAction::Capture,
                 sensitive: true,
                 sync_eligible: false,
+                ai_allowed: false,
                 expires_after: Some(Duration::from_secs(10 * 60)),
             }
         );
@@ -432,6 +436,7 @@ mod tests {
                 action: CaptureAction::CaptureSensitive,
                 sensitive: true,
                 sync_eligible: false,
+                ai_allowed: false,
                 expires_after: None,
             }
         );

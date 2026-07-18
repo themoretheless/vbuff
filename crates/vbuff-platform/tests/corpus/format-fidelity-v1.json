@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "cf-html-with-utf8-bom",
+      "family": "windows",
+      "native": "HTML Format",
+      "expected": "html",
+      "mime": "text/html",
+      "payload_hex": "efbbbf3c68746d6c3e3c626f64793e3c623e636f70793c2f623e3c2f626f64793e3c2f68746d6c3e"
+    },
+    {
+      "name": "flat-rtfd",
+      "family": "mac_uti",
+      "native": "public.flat-rtfd",
+      "expected": "rtf",
+      "mime": "application/rtf",
+      "payload_hex": "7b5c727466315c616e736920636f70797d"
+    },
+    {
+      "name": "file-promise",
+      "family": "mac_uti",
+      "native": "com.apple.filepromise",
+      "expected": "other",
+      "mime": "application/x-apple-file-promise",
+      "payload_hex": "66696c652d70726f6d6973652d7631"
+    },
+    {
+      "name": "excel-ooxml",
+      "family": "windows",
+      "native": "XML Spreadsheet",
+      "expected": "other",
+      "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "payload_hex": "504b03046f6f786d6c2d636c6970626f617264"
+    },
+    {
+      "name": "png-image",
+      "family": "mime",
+      "native": "image/png",
+      "expected": "png",
+      "mime": "image/png",
+      "payload_hex": "89504e470d0a1a0a"
+    },
+    {
+      "name": "html-image-reference",
+      "family": "mime",
+      "native": "text/html;charset=utf-8",
+      "expected": "html",
+      "mime": "text/html;charset=utf-8",
+      "payload_hex": "3c696d67207372633d226369643a696d6167652d31223e"
+    },
+    {
+      "name": "gnome-file-list",
+      "family": "mime",
+      "native": "x-special/gnome-copied-files",
+      "expected": "file_list",
+      "mime": "x-special/gnome-copied-files",
+      "payload_hex": "636f70790a66696c653a2f2f2f746d702f612e7478740a"
+    },
+    {
+      "name": "custom-app-format",
+      "family": "mime",
+      "native": "application/x-vendor-private-v3",
+      "expected": "other",
+      "mime": "application/x-vendor-private-v3",
+      "payload_hex": "00010203fefdfc"
+    }
+  ]
+}

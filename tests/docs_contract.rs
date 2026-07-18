@@ -101,6 +101,10 @@ fn top_docs_link_every_complete_implementation_batch() {
             "docs/implementation-batch-101-150.md",
             (101..=150).collect::<Vec<_>>(),
         ),
+        (
+            "docs/implementation-batch-151-200.md",
+            (151..=200).collect::<Vec<_>>(),
+        ),
     ] {
         for file in TOP_DOCS {
             assert!(
@@ -212,6 +216,9 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("read `src/diagnostics.rs`"));
     assert!(readme.contains("read `src/single_instance/mod.rs`"));
     assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
+    assert!(readme.contains("Sixteen checked-in golden images"));
+    assert!(readme.contains("docs/decision-gates-151-200.md"));
+    assert!(readme.contains("docs/data-contract-v1.md"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -221,12 +228,15 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("`crates/vbuff-types/src/status.rs`"));
     assert!(architecture.contains("| `src/single_instance/` |"));
     assert!(architecture.contains("`CaptureHealth::Stalled`"));
+    assert!(architecture.contains("schema v5"));
+    assert!(architecture.contains("History/Trust/Compose"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
     assert!(recommendation.contains("The SOLID/DRY product rule"));
     assert!(recommendation.contains("one typed capture-health vocabulary"));
     assert!(recommendation.contains("pause-aware heartbeat/watchdog"));
+    assert!(recommendation.contains("batch 151-200"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
@@ -234,6 +244,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("Serializable status contracts live in `vbuff-types`"));
     assert!(plan.contains("Bootstrap already landed in the root app"));
     assert!(plan.contains("native hook re-subscribe/auto-restart"));
+    assert!(plan.contains("M6 -> M7 data-contract gate"));
+    assert!(plan.contains("Unknown` is a release blocker"));
 }
 
 #[test]
@@ -251,6 +263,9 @@ fn local_markdown_links_resolve() {
         "docs/implementation-batch-001-050.md",
         "docs/implementation-batch-051-100.md",
         "docs/implementation-batch-101-150.md",
+        "docs/implementation-batch-151-200.md",
+        "docs/decision-gates-151-200.md",
+        "docs/data-contract-v1.md",
         "docs/product-strategy-decisions.md",
     ];
 

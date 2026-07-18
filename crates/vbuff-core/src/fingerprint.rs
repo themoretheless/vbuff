@@ -73,10 +73,23 @@ pub fn dhash_rgba(bytes: &[u8], width: usize, height: usize) -> Option<u64> {
     Some(hash)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct QuantizedEmbedding {
     pub scale: f32,
     pub values: Vec<i8>,
+}
+
+impl std::fmt::Debug for QuantizedEmbedding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuantizedEmbedding")
+            .field("scale", &self.scale)
+            .field(
+                "values",
+                &format_args!("[redacted; {} values]", self.values.len()),
+            )
+            .finish()
+    }
 }
 
 impl QuantizedEmbedding {
@@ -116,6 +129,52 @@ pub trait EmbeddingProvider {
     fn embed(&self, text: &str) -> QuantizedEmbedding;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingLocality {
+    Local,
+    External,
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EmbeddingError {
+    #[error("embedding backend is disabled")]
+    Disabled,
+    #[error("embedding input exceeds the backend contract")]
+    InputTooLarge,
+    #[error("embedding backend returned an invalid vector")]
+    InvalidVector,
+}
+
+/// Hot-swappable model boundary. Callers persist `id()` with a vector so
+/// embeddings from incompatible models are never compared accidentally.
+pub trait EmbeddingBackend: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn locality(&self) -> EmbeddingLocality;
+    fn dimensions(&self) -> usize;
+    fn embed(&self, text: &str) -> Result<QuantizedEmbedding, EmbeddingError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisabledEmbeddingBackend;
+
+impl EmbeddingBackend for DisabledEmbeddingBackend {
+    fn id(&self) -> &'static str {
+        "disabled"
+    }
+
+    fn locality(&self) -> EmbeddingLocality {
+        EmbeddingLocality::Local
+    }
+
+    fn dimensions(&self) -> usize {
+        0
+    }
+
+    fn embed(&self, _text: &str) -> Result<QuantizedEmbedding, EmbeddingError> {
+        Err(EmbeddingError::Disabled)
+    }
+}
+
 /// Zero-download local feature hashing provider. An ONNX MiniLM provider can
 /// implement the same trait without changing storage or ranking contracts.
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,6 +205,32 @@ impl EmbeddingProvider for LocalFeatureEmbedding {
             }
         }
         QuantizedEmbedding::from_f32(&vector)
+    }
+}
+
+impl EmbeddingBackend for LocalFeatureEmbedding {
+    fn id(&self) -> &'static str {
+        "local-feature-hash-v1"
+    }
+
+    fn locality(&self) -> EmbeddingLocality {
+        EmbeddingLocality::Local
+    }
+
+    fn dimensions(&self) -> usize {
+        EMBEDDING_DIMS
+    }
+
+    fn embed(&self, text: &str) -> Result<QuantizedEmbedding, EmbeddingError> {
+        const MAX_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
+        if text.len() > MAX_EMBEDDING_INPUT_BYTES {
+            return Err(EmbeddingError::InputTooLarge);
+        }
+        let embedding = <Self as EmbeddingProvider>::embed(self, text);
+        if embedding.values.len() != EMBEDDING_DIMS || !embedding.scale.is_finite() {
+            return Err(EmbeddingError::InvalidVector);
+        }
+        Ok(embedding)
     }
 }
 
@@ -188,12 +273,26 @@ mod tests {
     #[test]
     fn quantized_local_features_preserve_lexical_similarity() {
         let provider = LocalFeatureEmbedding;
-        let rust = provider.embed("rust sqlite clipboard history");
-        let similar = provider.embed("rust clipboard history search");
-        let unrelated = provider.embed("banana recipe tropical fruit");
-        assert_eq!(rust.values.len(), provider.dimensions());
+        let rust = EmbeddingProvider::embed(&provider, "rust sqlite clipboard history");
+        let similar = EmbeddingProvider::embed(&provider, "rust clipboard history search");
+        let unrelated = EmbeddingProvider::embed(&provider, "banana recipe tropical fruit");
+        assert_eq!(rust.values.len(), EmbeddingProvider::dimensions(&provider));
         assert!(
             rust.cosine_similarity(&similar).unwrap() > rust.cosine_similarity(&unrelated).unwrap()
         );
+    }
+
+    #[test]
+    fn backend_contract_is_identified_bounded_and_disableable() {
+        let backend = LocalFeatureEmbedding;
+        assert_eq!(backend.id(), "local-feature-hash-v1");
+        assert_eq!(backend.locality(), EmbeddingLocality::Local);
+        assert!(EmbeddingBackend::embed(&backend, "hello").is_ok());
+        assert_eq!(
+            DisabledEmbeddingBackend.embed("hello"),
+            Err(EmbeddingError::Disabled)
+        );
+        let embedding = EmbeddingBackend::embed(&backend, "private phrase").unwrap();
+        assert!(!format!("{embedding:?}").contains("[1,"));
     }
 }

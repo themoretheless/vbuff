@@ -1,6 +1,23 @@
 name: Performance Budgets
 
 on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "crates/**"
+      - "tests/**"
+      - ".github/workflows/performance.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "crates/**"
+      - "tests/**"
+      - ".github/workflows/performance.yml"
   workflow_dispatch:
   schedule:
     - cron: "43 3 * * 3"
