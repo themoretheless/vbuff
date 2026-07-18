@@ -26,9 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install WASM target for the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Compile fake-data popup demo
         run: cargo check -p vbuff-gui --bin wasm_popup --target wasm32-unknown-unknown --locked
