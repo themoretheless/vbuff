@@ -21,3 +21,7 @@ rlimit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 prctl.workspace = true
+
+[dev-dependencies]
+vbuff-core.workspace = true
+serde_json.workspace = true

@@ -1,5 +1,7 @@
 //! Deterministic release SLO evaluation with explicit unknown states.
 
+use std::collections::BTreeMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SloState {
     Met,
@@ -21,8 +23,46 @@ impl Default for SloBudget {
             max_lost_captures: 0,
             max_search_p99_us: 16_000,
             max_idle_cpu_basis_points: 50,
-            max_login_ready_ms: 1_500,
+            max_login_ready_ms: 500,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MilestoneSloLedger {
+    reports: BTreeMap<String, SloReport>,
+}
+
+impl MilestoneSloLedger {
+    pub fn record(
+        &mut self,
+        milestone: impl Into<String>,
+        budget: &SloBudget,
+        sample: &SloSample,
+    ) -> bool {
+        let milestone = milestone.into();
+        if milestone.trim().is_empty() || self.reports.contains_key(&milestone) {
+            return false;
+        }
+        self.reports.insert(milestone, budget.evaluate(sample));
+        true
+    }
+
+    pub fn report(&self, milestone: &str) -> Option<SloReport> {
+        self.reports.get(milestone).copied()
+    }
+
+    pub fn has_release_blocker(&self) -> bool {
+        self.reports.values().any(|report| {
+            [
+                report.zero_loss,
+                report.search_latency,
+                report.idle_cpu,
+                report.login_ready,
+            ]
+            .into_iter()
+            .any(|state| state != SloState::Met)
+        })
     }
 }
 
@@ -105,5 +145,26 @@ mod tests {
         assert_eq!(report.zero_loss, SloState::Breached);
         assert_eq!(report.search_latency, SloState::Breached);
         assert_eq!(report.login_ready, SloState::Breached);
+    }
+
+    #[test]
+    fn every_milestone_record_is_immutable_and_unknown_blocks_release() {
+        let mut ledger = MilestoneSloLedger::default();
+        assert!(ledger.record("M5", &SloBudget::default(), &SloSample::default()));
+        assert!(!ledger.record("M5", &SloBudget::default(), &SloSample::default()));
+        assert!(ledger.has_release_blocker());
+
+        let mut passing = MilestoneSloLedger::default();
+        assert!(passing.record(
+            "M6",
+            &SloBudget::default(),
+            &SloSample {
+                lost_captures: Some(0),
+                search_latencies_us: vec![1_000],
+                idle_cpu_basis_points: Some(10),
+                login_ready_ms: Some(300),
+            },
+        ));
+        assert!(!passing.has_release_blocker());
     }
 }

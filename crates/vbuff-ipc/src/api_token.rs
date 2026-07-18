@@ -8,6 +8,8 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::integration::ClipAccessFilter;
+
 type HmacSha256 = Hmac<Sha256>;
 const MAX_TOKEN_BYTES: usize = 2_048;
 const MAX_TOKEN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -29,6 +31,8 @@ pub struct ApiTokenClaims {
     pub scopes: BTreeSet<ApiScope>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    #[serde(default)]
+    pub filter: ClipAccessFilter,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -72,6 +76,16 @@ impl ApiTokenIssuer {
         issued_at_ms: u64,
         ttl_ms: u64,
     ) -> Result<String, ApiTokenError> {
+        self.issue_filtered(scopes, ClipAccessFilter::default(), issued_at_ms, ttl_ms)
+    }
+
+    pub fn issue_filtered(
+        &self,
+        scopes: BTreeSet<ApiScope>,
+        filter: ClipAccessFilter,
+        issued_at_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<String, ApiTokenError> {
         if scopes.is_empty() {
             return Err(ApiTokenError::EmptyScopes);
         }
@@ -87,6 +101,7 @@ impl ApiTokenIssuer {
             expires_at_ms: issued_at_ms
                 .checked_add(ttl_ms)
                 .ok_or(ApiTokenError::TtlTooLong)?,
+            filter,
         };
         self.encode(&claims)
     }
@@ -124,8 +139,15 @@ impl ApiTokenIssuer {
                 .map_err(|_| ApiTokenError::InvalidToken)?,
         )
         .map_err(|_| ApiTokenError::InvalidToken)?;
-        if claims.expires_at_ms <= claims.issued_at_ms {
+        let lifetime_ms = claims
+            .expires_at_ms
+            .checked_sub(claims.issued_at_ms)
+            .ok_or(ApiTokenError::InvalidToken)?;
+        if lifetime_ms == 0 {
             return Err(ApiTokenError::InvalidToken);
+        }
+        if lifetime_ms > MAX_TOKEN_TTL_MS {
+            return Err(ApiTokenError::TtlTooLong);
         }
         if now_ms < claims.issued_at_ms {
             return Err(ApiTokenError::NotYetValid);
@@ -166,6 +188,7 @@ impl Drop for ApiTokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vbuff_types::ContentKind;
 
     #[test]
     fn tokens_are_scoped_signed_and_expiring() {
@@ -210,5 +233,35 @@ mod tests {
             ),
             Err(ApiTokenError::TtlTooLong)
         );
+
+        let overlong_claims = ApiTokenClaims {
+            token_id: [9; 16],
+            scopes: BTreeSet::from([ApiScope::ReadHistory]),
+            issued_at_ms: 100,
+            expires_at_ms: 100 + MAX_TOKEN_TTL_MS + 1,
+            filter: ClipAccessFilter::default(),
+        };
+        let overlong = issuer.encode(&overlong_claims).unwrap();
+        assert_eq!(
+            issuer.verify(&overlong, ApiScope::ReadHistory, 101),
+            Err(ApiTokenError::TtlTooLong)
+        );
+
+        let filtered = issuer
+            .issue_filtered(
+                BTreeSet::from([ApiScope::ReadHistory]),
+                ClipAccessFilter {
+                    kinds: BTreeSet::from([ContentKind::Text]),
+                    tags: BTreeSet::from(["shareable".into()]),
+                    collections: BTreeSet::new(),
+                },
+                100,
+                50,
+            )
+            .unwrap();
+        let claims = issuer
+            .verify(&filtered, ApiScope::ReadHistory, 120)
+            .unwrap();
+        assert!(claims.filter.kinds.contains(&ContentKind::Text));
     }
 }

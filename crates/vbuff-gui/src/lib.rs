@@ -6,11 +6,13 @@
 //! This keeps the view unit-friendly and lets the wiring own all side effects.
 
 mod app;
+mod demo;
 mod design;
 mod state;
 mod view;
 
 pub use app::PopupApp;
+pub use demo::demo_state;
 pub use state::{AppState, SharedState, StarterPack, UiAction};
 
 /// Preferred popup size used by the root composition layer.

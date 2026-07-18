@@ -21,9 +21,10 @@ use vbuff_core::bloom::BloomFilter;
 use vbuff_core::capture::CaptureOutcome;
 use vbuff_core::facets::extract_facets;
 use vbuff_core::fingerprint::{
-    EmbeddingProvider, LocalFeatureEmbedding, QuantizedEmbedding, fingerprint_bands,
-    hamming_distance, simhash64,
+    EmbeddingBackend, EmbeddingLocality, LocalFeatureEmbedding, QuantizedEmbedding,
+    fingerprint_bands, hamming_distance, simhash64,
 };
+use vbuff_core::intelligence::{AiGate, AiOperation};
 use vbuff_types::{
     CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta, ContentKind,
     Flavor,
@@ -42,7 +43,7 @@ pub use error::StoreError;
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// The current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StoreOpenProfile {
@@ -384,6 +385,41 @@ impl Store {
                 "#,
             )?;
         }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash)",
+            [],
+        )?;
+        let legacy_embedding_schema: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clip_embeddings') WHERE name = 'clip_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if (1..5).contains(&version) && legacy_embedding_schema {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE clip_embeddings RENAME TO clip_embeddings_legacy;
+                CREATE TABLE clip_embeddings (
+                    content_hash BLOB NOT NULL REFERENCES clips(content_hash)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    backend_id TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    scale REAL NOT NULL,
+                    vector BLOB NOT NULL,
+                    PRIMARY KEY (content_hash, backend_id)
+                ) WITHOUT ROWID;
+                INSERT OR IGNORE INTO clip_embeddings(
+                    content_hash, backend_id, dimensions, scale, vector
+                )
+                    SELECT c.content_hash, 'local-feature-hash-v1',
+                           e.dimensions, e.scale, e.vector
+                    FROM clip_embeddings_legacy AS e
+                    JOIN clips AS c ON c.id = e.clip_id
+                    WHERE COALESCE(json_extract(c.metadata_json, '$.ai_allowed'), 0) = 1
+                      AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0;
+                DROP TABLE clip_embeddings_legacy;
+                "#,
+            )?;
+        }
         conn.execute_batch(
             r#"
             DROP TRIGGER IF EXISTS clips_blob_ai;
@@ -408,11 +444,14 @@ impl Store {
                 ON clip_facets(key, value, clip_id);
 
             CREATE TABLE IF NOT EXISTS clip_embeddings (
-                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                content_hash BLOB NOT NULL REFERENCES clips(content_hash)
+                    ON UPDATE CASCADE ON DELETE CASCADE,
+                backend_id TEXT NOT NULL,
                 dimensions INTEGER NOT NULL,
                 scale REAL NOT NULL,
-                vector BLOB NOT NULL
-            );
+                vector BLOB NOT NULL,
+                PRIMARY KEY (content_hash, backend_id)
+            ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS blob_refs (
                 hash TEXT NOT NULL,
@@ -526,8 +565,33 @@ impl Store {
             END;
             "#,
         )?;
+        conn.execute_batch(
+            r#"
+            UPDATE clips
+            SET preview = '[sensitive]', item_text = '',
+                simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
+                simhash_b2 = NULL, simhash_b3 = NULL,
+                dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
+                dhash_b2 = NULL, dhash_b3 = NULL
+            WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1;
+            DELETE FROM clip_facets
+            WHERE clip_id IN (
+                SELECT id FROM clips
+                WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1
+            );
+            DELETE FROM clip_embeddings
+            WHERE content_hash IN (
+                SELECT content_hash FROM clips
+                WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1
+            );
+            "#,
+        )?;
         conn.execute(
-            "UPDATE clips SET item_text = preview WHERE item_text = ''",
+            r#"
+            UPDATE clips SET item_text = preview
+            WHERE item_text = ''
+              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
+            "#,
             [],
         )?;
         let fts_in_sync: bool = conn.query_row(
@@ -584,8 +648,9 @@ impl Store {
             r#"
             SELECT id, kind, item_text, flavors
             FROM clips
-            WHERE (simhash IS NULL AND kind != 3 AND item_text != '')
-               OR (dhash IS NULL AND kind = 3)
+            WHERE ((simhash IS NULL AND kind != 3 AND item_text != '')
+               OR (dhash IS NULL AND kind = 3))
+              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
             LIMIT ?1
             "#,
         )?;
@@ -657,38 +722,86 @@ impl Store {
     pub fn insert(&self, clip: &Clip) -> Result<ClipId> {
         self.purge_expired()?;
         let now = now_millis();
-        let metadata_json = serde_json::to_string(&StoredMetadata::from(&clip.meta))?;
-        let expires_at = clip.meta.expires_at.map(|value| value.timestamp_millis());
-        let preview = clip.preview(512);
-        let item_text = searchable_projection(clip, 1_048_576);
-        let simhash = clip.primary_text().map(simhash64);
-        let simhash_bands = simhash.map(fingerprint_bands);
-        let dhash = image_fingerprint::clip_dhash(clip);
-        let dhash_bands = dhash.map(fingerprint_bands);
-        let facets = clip
-            .primary_text()
-            .map(|text| extract_facets(text, clip.meta.kind, clip.meta.sensitive))
-            .unwrap_or_default();
         let might_exist = self
             .dedup_filter
             .borrow()
             .might_contain(clip.content_hash.as_slice());
-        let transaction = self.conn.unchecked_transaction()?;
-
-        // Dedup: does this content already exist?
-        let existing: Option<String> = if might_exist {
-            transaction
+        let existing: Option<(String, String)> = if might_exist {
+            self.conn
                 .query_row(
-                    "SELECT id FROM clips WHERE content_hash = ?1",
+                    "SELECT id, metadata_json FROM clips WHERE content_hash = ?1",
                     params![clip.content_hash.as_slice()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
         } else {
             None
         };
+        let existing = existing
+            .map(|(id, metadata_json)| {
+                serde_json::from_str::<StoredMetadata>(&metadata_json)
+                    .map(|metadata| (id, metadata))
+            })
+            .transpose()?;
 
-        if let Some(id_str) = existing {
+        // A re-copy can tighten privacy, but never silently downgrade a row
+        // previously classified as sensitive.
+        let mut effective_meta = clip.meta.clone();
+        if let Some((_, stored)) = &existing
+            && stored.sensitive
+        {
+            effective_meta.sensitive = true;
+            if !clip.meta.sensitive {
+                effective_meta.expires_at = stored.expires_at;
+            }
+        }
+        if effective_meta.sensitive {
+            effective_meta.sync_eligible = false;
+            effective_meta.ai_allowed = false;
+        }
+        let metadata_json = serde_json::to_string(&StoredMetadata::from(&effective_meta))?;
+        let expires_at = effective_meta
+            .expires_at
+            .map(|value| value.timestamp_millis());
+        let preview = if effective_meta.sensitive {
+            "[sensitive]".to_owned()
+        } else {
+            clip.preview(512)
+        };
+        let item_text = if effective_meta.sensitive {
+            String::new()
+        } else {
+            searchable_projection(clip, 1_048_576)
+        };
+        let embedding_backend = LocalFeatureEmbedding;
+        let embedding = (AiGate::default()
+            .authorize(&effective_meta, AiOperation::Embed, false)
+            .is_ok()
+            && !item_text.is_empty())
+        .then(|| {
+            embedding_backend
+                .embed(&item_text)
+                .map_err(|error| StoreError::Maintenance(error.to_string()))
+        })
+        .transpose()?;
+        let simhash = (!effective_meta.sensitive)
+            .then(|| clip.primary_text().map(simhash64))
+            .flatten();
+        let simhash_bands = simhash.map(fingerprint_bands);
+        let dhash = (!effective_meta.sensitive)
+            .then(|| image_fingerprint::clip_dhash(clip))
+            .flatten();
+        let dhash_bands = dhash.map(fingerprint_bands);
+        let facets = if effective_meta.sensitive {
+            Vec::new()
+        } else {
+            clip.primary_text()
+                .map(|text| extract_facets(text, clip.meta.kind, false))
+                .unwrap_or_default()
+        };
+        let transaction = self.conn.unchecked_transaction()?;
+
+        if let Some((id_str, _)) = existing {
             // Bump both updated_at and seq so the deduped clip floats to the top
             // even when several inserts share the same millisecond.
             transaction.execute(
@@ -698,11 +811,55 @@ impl Store {
                     seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM clips),
                     metadata_json = ?2,
                     expires_at = ?3,
-                    source_app = ?4
-                WHERE id = ?5
+                    source_app = ?4,
+                    preview = ?5,
+                    item_text = ?6,
+                    simhash = ?7, simhash_b0 = ?8, simhash_b1 = ?9,
+                    simhash_b2 = ?10, simhash_b3 = ?11,
+                    dhash = ?12, dhash_b0 = ?13, dhash_b1 = ?14,
+                    dhash_b2 = ?15, dhash_b3 = ?16
+                WHERE id = ?17
                 "#,
-                params![now, metadata_json, expires_at, clip.meta.source_app, id_str],
+                params![
+                    now,
+                    metadata_json,
+                    expires_at,
+                    clip.meta.source_app,
+                    preview,
+                    item_text,
+                    simhash.map(|value| value as i64),
+                    simhash_bands.map(|bands| i64::from(bands[0])),
+                    simhash_bands.map(|bands| i64::from(bands[1])),
+                    simhash_bands.map(|bands| i64::from(bands[2])),
+                    simhash_bands.map(|bands| i64::from(bands[3])),
+                    dhash.map(|value| value as i64),
+                    dhash_bands.map(|bands| i64::from(bands[0])),
+                    dhash_bands.map(|bands| i64::from(bands[1])),
+                    dhash_bands.map(|bands| i64::from(bands[2])),
+                    dhash_bands.map(|bands| i64::from(bands[3])),
+                    id_str,
+                ],
             )?;
+            transaction.execute("DELETE FROM clip_facets WHERE clip_id = ?1", [&id_str])?;
+            for facet in &facets {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO clip_facets(clip_id, key, value) VALUES (?1, ?2, ?3)",
+                    params![id_str, facet.key, facet.value],
+                )?;
+            }
+            if let Some(embedding) = &embedding {
+                persist_embedding(
+                    &transaction,
+                    &clip.content_hash,
+                    &embedding_backend,
+                    embedding,
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM clip_embeddings WHERE content_hash = ?1",
+                    [clip.content_hash.as_slice()],
+                )?;
+            }
             transaction.commit()?;
             return ClipId::parse(&id_str)
                 .map_err(|_| StoreError::Corrupt("bad ulid in db".into()));
@@ -754,10 +911,18 @@ impl Store {
                 clip.favorite as i64,
             ],
         )?;
-        for facet in facets {
+        for facet in &facets {
             transaction.execute(
                 "INSERT OR IGNORE INTO clip_facets(clip_id, key, value) VALUES (?1, ?2, ?3)",
                 params![clip.id.to_string_repr(), facet.key, facet.value],
+            )?;
+        }
+        if let Some(embedding) = &embedding {
+            persist_embedding(
+                &transaction,
+                &clip.content_hash,
+                &embedding_backend,
+                embedding,
             )?;
         }
         transaction.commit()?;
@@ -821,6 +986,7 @@ impl Store {
                    c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
             FROM clips c
             WHERE (c.expires_at IS NULL OR c.expires_at > ?)
+              AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
             "#,
         );
         let mut values = vec![Value::Integer(now_millis())];
@@ -941,6 +1107,7 @@ impl Store {
                    byte_size, source_app, metadata_json, pinned, favorite, {column}
             FROM clips
             WHERE {column} IS NOT NULL
+              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
               {band_filter}
             ORDER BY updated_at DESC, seq DESC
             "#
@@ -988,38 +1155,50 @@ impl Store {
 
     /// Lazily build compact local feature vectors during an idle window.
     pub fn backfill_embeddings(&self, limit: usize) -> Result<usize> {
-        let provider = LocalFeatureEmbedding;
+        self.backfill_embeddings_with(&LocalFeatureEmbedding, limit)
+    }
+
+    pub fn backfill_embeddings_with(
+        &self,
+        backend: &dyn EmbeddingBackend,
+        limit: usize,
+    ) -> Result<usize> {
+        validate_local_embedding_backend(backend)?;
+        let limit = limit.min(512);
+        if limit == 0 {
+            return Ok(0);
+        }
         let mut statement = self.conn.prepare(
             r#"
-            SELECT c.id, c.item_text
+            SELECT c.content_hash, c.item_text
             FROM clips c
-            LEFT JOIN clip_embeddings e ON e.clip_id = c.id
-            WHERE e.clip_id IS NULL
+            LEFT JOIN clip_embeddings e
+              ON e.content_hash = c.content_hash AND e.backend_id = ?1
+            WHERE e.content_hash IS NULL
               AND c.item_text != ''
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
-            LIMIT ?1
+              AND COALESCE(json_extract(c.metadata_json, '$.ai_allowed'), 0) = 1
+            ORDER BY c.updated_at DESC, c.seq DESC
+            LIMIT ?2
             "#,
         )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let rows = statement.query_map(params![backend.id(), limit as i64], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
         })?;
         let pending = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
+        let embeddings = pending
+            .iter()
+            .map(|(content_hash, text)| {
+                backend
+                    .embed(text)
+                    .map(|embedding| (content_hash, embedding))
+                    .map_err(|error| StoreError::Maintenance(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let transaction = self.conn.unchecked_transaction()?;
-        for (id, text) in &pending {
-            let embedding = provider.embed(text);
-            let bytes = embedding
-                .values
-                .iter()
-                .map(|value| *value as u8)
-                .collect::<Vec<_>>();
-            transaction.execute(
-                r#"
-                INSERT OR REPLACE INTO clip_embeddings(clip_id, dimensions, scale, vector)
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-                params![id, embedding.values.len() as i64, embedding.scale, bytes],
-            )?;
+        for (content_hash, embedding) in embeddings {
+            persist_embedding(&transaction, content_hash, backend, &embedding)?;
         }
         transaction.commit()?;
         Ok(pending.len())
@@ -1028,44 +1207,65 @@ impl Store {
     /// Hybrid local similarity search: narrow lexically, then rerank at most
     /// 512 candidates with compact feature vectors.
     pub fn local_similarity_search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
+        self.local_similarity_search_with(&LocalFeatureEmbedding, query, limit)
+    }
+
+    pub fn local_similarity_search_with(
+        &self,
+        backend: &dyn EmbeddingBackend,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Clip>> {
+        validate_local_embedding_backend(backend)?;
         let output_limit = limit.min(512);
         if output_limit == 0 {
             return Ok(Vec::new());
         }
-        let provider = LocalFeatureEmbedding;
-        let query_embedding = provider.embed(query);
+        let query_embedding = backend
+            .embed(query)
+            .map_err(|error| StoreError::Maintenance(error.to_string()))?;
         let candidate_limit = output_limit.saturating_mul(8).min(512).max(output_limit);
         let mut candidates = self.search(query, candidate_limit)?;
         if candidates.is_empty() {
             candidates = self.list(candidate_limit)?;
         }
-        let mut statement = self
-            .conn
-            .prepare("SELECT dimensions, scale, vector FROM clip_embeddings WHERE clip_id = ?1")?;
-        let mut scored = candidates
-            .into_iter()
-            .map(|clip| {
-                let embedding = statement
-                    .query_row(params![clip.id.to_string_repr()], |row| {
-                        let dimensions = row.get::<_, i64>(0)? as usize;
-                        let scale = row.get::<_, f32>(1)?;
-                        let bytes = row.get::<_, Vec<u8>>(2)?;
-                        if dimensions != bytes.len() {
-                            return Err(rusqlite::Error::InvalidQuery);
-                        }
-                        Ok(QuantizedEmbedding {
-                            scale,
-                            values: bytes.into_iter().map(|byte| byte as i8).collect(),
-                        })
-                    })
-                    .optional()?;
-                let score = embedding
-                    .as_ref()
-                    .and_then(|embedding| query_embedding.cosine_similarity(embedding))
-                    .unwrap_or(f32::NEG_INFINITY);
-                Ok::<_, StoreError>((clip, score))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        candidates.retain(|clip| clip.meta.ai_allowed && !clip.meta.sensitive);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT dimensions, scale, vector FROM clip_embeddings
+            WHERE content_hash = ?1 AND backend_id = ?2
+            "#,
+        )?;
+        let mut scored = Vec::with_capacity(candidates.len());
+        for clip in candidates {
+            let embedding = statement
+                .query_row(params![clip.content_hash, backend.id()], |row| {
+                    let dimensions = row.get::<_, i64>(0)?;
+                    let scale = row.get::<_, f32>(1)?;
+                    let bytes = row.get::<_, Vec<u8>>(2)?;
+                    Ok((dimensions, scale, bytes))
+                })
+                .optional()?;
+            let Some((dimensions, scale, bytes)) = embedding else {
+                continue;
+            };
+            if dimensions != backend.dimensions() as i64
+                || bytes.len() != backend.dimensions()
+                || !scale.is_finite()
+                || scale <= 0.0
+            {
+                return Err(StoreError::Corrupt(
+                    "stored embedding violates its backend contract".into(),
+                ));
+            }
+            let embedding = QuantizedEmbedding {
+                scale,
+                values: bytes.into_iter().map(|byte| byte as i8).collect(),
+            };
+            if let Some(score) = query_embedding.cosine_similarity(&embedding) {
+                scored.push((clip, score));
+            }
+        }
         scored.sort_by(|left, right| right.1.total_cmp(&left.1));
         scored.truncate(output_limit);
         Ok(scored.into_iter().map(|(clip, _)| clip).collect())
@@ -1247,11 +1447,16 @@ impl Store {
             let mut metadata: StoredMetadata = serde_json::from_str(&metadata_json)?;
             metadata.sensitive = true;
             metadata.sync_eligible = Some(false);
+            metadata.ai_allowed = false;
             metadata.expires_at = Some(expires_at);
             transaction.execute(
                 r#"
                 UPDATE clips SET metadata_json = ?1, expires_at = ?2,
-                    preview = '[sensitive]', item_text = ''
+                    preview = '[sensitive]', item_text = '',
+                    simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
+                    simhash_b2 = NULL, simhash_b3 = NULL,
+                    dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
+                    dhash_b2 = NULL, dhash_b3 = NULL
                 WHERE id = ?3
                 "#,
                 params![
@@ -1261,7 +1466,10 @@ impl Store {
                 ],
             )?;
             transaction.execute("DELETE FROM clip_facets WHERE clip_id = ?1", [&id])?;
-            transaction.execute("DELETE FROM clip_embeddings WHERE clip_id = ?1", [&id])?;
+            transaction.execute(
+                "DELETE FROM clip_embeddings WHERE content_hash = (SELECT content_hash FROM clips WHERE id = ?1)",
+                [&id],
+            )?;
             report.reclassified += 1;
         }
         transaction.execute(
@@ -1752,6 +1960,7 @@ struct StoredMetadata {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     sensitive: bool,
     sync_eligible: Option<bool>,
+    ai_allowed: bool,
 }
 
 impl From<&ClipMeta> for StoredMetadata {
@@ -1763,6 +1972,7 @@ impl From<&ClipMeta> for StoredMetadata {
             expires_at: meta.expires_at,
             sensitive: meta.sensitive,
             sync_eligible: Some(meta.sync_eligible),
+            ai_allowed: meta.ai_allowed,
         }
     }
 }
@@ -1775,6 +1985,7 @@ impl StoredMetadata {
         meta.expires_at = self.expires_at;
         meta.sensitive = self.sensitive;
         meta.sync_eligible = self.sync_eligible.unwrap_or(true);
+        meta.ai_allowed = self.ai_allowed;
     }
 }
 
@@ -1789,6 +2000,63 @@ fn elapsed_ms(duration: Duration) -> u64 {
 fn query_count(connection: &Connection, sql: &str) -> Result<usize> {
     let count: i64 = connection.query_row(sql, [], |row| row.get(0))?;
     Ok(count.max(0) as usize)
+}
+
+fn persist_embedding(
+    connection: &Connection,
+    content_hash: &[u8],
+    backend: &dyn EmbeddingBackend,
+    embedding: &QuantizedEmbedding,
+) -> Result<()> {
+    validate_local_embedding_backend(backend)?;
+    if embedding.values.is_empty()
+        || embedding.values.len() != backend.dimensions()
+        || embedding.values.len() > 8_192
+        || !embedding.scale.is_finite()
+        || embedding.scale <= 0.0
+    {
+        return Err(StoreError::Maintenance(
+            "embedding backend returned an invalid vector".into(),
+        ));
+    }
+    let bytes = embedding
+        .values
+        .iter()
+        .map(|value| *value as u8)
+        .collect::<Vec<_>>();
+    connection.execute(
+        r#"
+        INSERT OR REPLACE INTO clip_embeddings(
+            content_hash, backend_id, dimensions, scale, vector
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            content_hash,
+            backend.id(),
+            embedding.values.len() as i64,
+            embedding.scale,
+            bytes
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_local_embedding_backend(backend: &dyn EmbeddingBackend) -> Result<()> {
+    let id = backend.id();
+    if backend.locality() != EmbeddingLocality::Local
+        || id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !(1..=8_192).contains(&backend.dimensions())
+    {
+        return Err(StoreError::Maintenance(
+            "embedding backend is not safe for local persistence".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn searchable_projection(clip: &Clip, max_bytes: usize) -> String {
@@ -1910,6 +2178,84 @@ mod tests {
         // The deduped clip should now be on top (most recently updated).
         let listed = store.list(10).unwrap();
         assert_eq!(listed[0].primary_text(), Some("dup"));
+    }
+
+    #[test]
+    fn sensitive_rows_never_create_search_or_fingerprint_projections() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("private search needle");
+        clip.meta.sensitive = true;
+        clip.meta.sync_eligible = true;
+        clip.meta.ai_allowed = true;
+
+        store.insert(&clip).unwrap();
+
+        assert!(store.search("private", 10).unwrap().is_empty());
+        assert!(
+            store
+                .find_near_text("private search needle", 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let (preview, item_text, simhash): (String, String, Option<i64>) = store
+            .conn
+            .query_row("SELECT preview, item_text, simhash FROM clips", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(preview, "[sensitive]");
+        assert!(item_text.is_empty());
+        assert!(simhash.is_none());
+        assert_eq!(
+            query_count(&store.conn, "SELECT COUNT(*) FROM clip_facets").unwrap(),
+            0
+        );
+        assert_eq!(
+            query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
+            0
+        );
+        let stored = store.list(1).unwrap().pop().unwrap();
+        assert!(stored.meta.sensitive);
+        assert!(!stored.meta.sync_eligible);
+        assert!(!stored.meta.ai_allowed);
+    }
+
+    #[test]
+    fn sensitive_dedup_upgrade_scrubs_derivatives_and_cannot_be_downgraded() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ordinary = make_clip("upgrade privacy needle");
+        ordinary.meta.ai_allowed = true;
+        let original_id = store.insert(&ordinary).unwrap();
+        assert_eq!(store.search("upgrade", 10).unwrap().len(), 1);
+        assert_eq!(
+            query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
+            1
+        );
+
+        let mut sensitive = make_clip("upgrade privacy needle");
+        sensitive.meta.sensitive = true;
+        sensitive.meta.ai_allowed = true;
+        sensitive.meta.sync_eligible = true;
+        sensitive.meta.expires_at = Some(chrono::Utc::now() + Duration::minutes(10));
+        assert_eq!(store.insert(&sensitive).unwrap(), original_id);
+        assert!(store.search("upgrade", 10).unwrap().is_empty());
+        assert_eq!(
+            query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
+            0
+        );
+
+        let mut ordinary_again = make_clip("upgrade privacy needle");
+        ordinary_again.meta.ai_allowed = true;
+        assert_eq!(store.insert(&ordinary_again).unwrap(), original_id);
+        let stored = store.list(1).unwrap().pop().unwrap();
+        assert!(stored.meta.sensitive);
+        assert!(!stored.meta.sync_eligible);
+        assert!(!stored.meta.ai_allowed);
+        assert!(store.search("upgrade", 10).unwrap().is_empty());
+        assert_eq!(
+            query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2270,13 +2616,23 @@ mod tests {
     }
 
     #[test]
-    fn local_embeddings_are_lazy_and_rerank_candidates() {
+    fn local_embeddings_share_capture_transaction_and_backfill_legacy_rows() {
         let store = Store::open_in_memory().unwrap();
-        store
-            .insert(&make_clip("rust sqlite clipboard search"))
+        let mut rust = make_clip("rust sqlite clipboard search");
+        rust.meta.ai_allowed = true;
+        let mut banana = make_clip("banana tropical fruit recipe");
+        banana.meta.ai_allowed = true;
+        store.insert(&rust).unwrap();
+        store.insert(&banana).unwrap();
+        store.insert(&make_clip("legacy private row")).unwrap();
+        let indexed: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM clip_embeddings", [], |row| row.get(0))
             .unwrap();
+        assert_eq!(indexed, 2);
         store
-            .insert(&make_clip("banana tropical fruit recipe"))
+            .conn
+            .execute("DELETE FROM clip_embeddings", [])
             .unwrap();
         assert_eq!(store.backfill_embeddings(10).unwrap(), 2);
         assert_eq!(store.backfill_embeddings(10).unwrap(), 0);
@@ -2289,6 +2645,53 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM clip_embeddings WHERE content_hash = ?1",
+                [rust.content_hash.as_slice()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .local_similarity_search("rust sqlite", 10)
+                .unwrap()
+                .is_empty(),
+            "a lexical candidate without a vector must not masquerade as a similarity result"
+        );
+
+        struct ExternalBackend;
+        impl EmbeddingBackend for ExternalBackend {
+            fn id(&self) -> &'static str {
+                "external-test"
+            }
+
+            fn locality(&self) -> EmbeddingLocality {
+                EmbeddingLocality::External
+            }
+
+            fn dimensions(&self) -> usize {
+                1
+            }
+
+            fn embed(
+                &self,
+                _text: &str,
+            ) -> std::result::Result<QuantizedEmbedding, vbuff_core::fingerprint::EmbeddingError>
+            {
+                panic!("external backend must be refused before inference")
+            }
+        }
+        assert!(
+            store
+                .backfill_embeddings_with(&ExternalBackend, 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .local_similarity_search_with(&ExternalBackend, "query", 10)
+                .is_err()
         );
     }
 
@@ -2457,7 +2860,8 @@ mod tests {
     #[test]
     fn rolling_audit_repairs_unique_hash_mismatch() {
         let store = Store::open_in_memory().unwrap();
-        let clip = make_clip("repair my hash");
+        let mut clip = make_clip("repair my hash");
+        clip.meta.ai_allowed = true;
         store.insert(&clip).unwrap();
         store
             .conn
@@ -2470,6 +2874,13 @@ mod tests {
         let report = store.audit_content_hashes(10).unwrap();
         assert_eq!(report.repaired, 1);
         assert_eq!(store.list(1).unwrap()[0].content_hash, clip.content_hash);
+        let embedding_hash: Vec<u8> = store
+            .conn
+            .query_row("SELECT content_hash FROM clip_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(embedding_hash, clip.content_hash);
     }
 
     #[test]

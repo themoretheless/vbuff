@@ -21,6 +21,13 @@ pub(crate) enum Icon {
     Close,
     Shield,
     History,
+    Compose,
+    Feedback,
+    Add,
+    Paste,
+    Up,
+    Down,
+    Duplicate,
 }
 
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -58,6 +65,13 @@ pub(crate) fn icon_button(
         Icon::Close => draw_close(ui, center, stroke),
         Icon::Shield => draw_shield(ui, center, stroke),
         Icon::History => draw_history(ui, center, stroke),
+        Icon::Compose => draw_compose(ui, center, stroke),
+        Icon::Feedback => draw_feedback(ui, center, stroke),
+        Icon::Add => draw_add(ui, center, stroke),
+        Icon::Paste => draw_paste(ui, center, stroke),
+        Icon::Up => draw_chevron(ui, center, stroke, -1.0),
+        Icon::Down => draw_chevron(ui, center, stroke, 1.0),
+        Icon::Duplicate => draw_duplicate(ui, center, stroke),
     }
 
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), tooltip));
@@ -186,4 +200,85 @@ fn draw_history(ui: &Ui, center: Pos2, stroke: Stroke) {
         .line_segment([center, center + egui::vec2(0.0, -3.5)], stroke);
     ui.painter()
         .line_segment([center, center + egui::vec2(3.0, 1.5)], stroke);
+}
+
+fn draw_compose(ui: &Ui, center: Pos2, stroke: Stroke) {
+    for offset in [-4.0, 0.0, 4.0] {
+        ui.painter()
+            .circle_stroke(center + egui::vec2(-5.0, offset), 1.0, stroke);
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-2.0, offset),
+                center + egui::vec2(6.0, offset),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn draw_feedback(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let bubble = Rect::from_center_size(center + egui::vec2(0.0, -1.0), egui::vec2(13.0, 10.0));
+    ui.painter()
+        .rect_stroke(bubble, 3.0, stroke, StrokeKind::Inside);
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-2.0, 4.0),
+            center + egui::vec2(-4.0, 7.0),
+        ],
+        stroke,
+    );
+}
+
+fn draw_add(ui: &Ui, center: Pos2, stroke: Stroke) {
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-5.0, 0.0),
+            center + egui::vec2(5.0, 0.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(0.0, -5.0),
+            center + egui::vec2(0.0, 5.0),
+        ],
+        stroke,
+    );
+}
+
+fn draw_paste(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let board = Rect::from_center_size(center + egui::vec2(0.0, 1.0), egui::vec2(10.0, 12.0));
+    ui.painter()
+        .rect_stroke(board, 2.0, stroke, StrokeKind::Inside);
+    let clip = Rect::from_center_size(center + egui::vec2(0.0, -5.0), egui::vec2(5.0, 3.0));
+    ui.painter()
+        .rect_stroke(clip, 1.0, stroke, StrokeKind::Inside);
+}
+
+fn draw_chevron(ui: &Ui, center: Pos2, stroke: Stroke, direction: f32) {
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-4.0, 2.0 * direction),
+            center + egui::vec2(0.0, -2.0 * direction),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(0.0, -2.0 * direction),
+            center + egui::vec2(4.0, 2.0 * direction),
+        ],
+        stroke,
+    );
+}
+
+fn draw_duplicate(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let back = Rect::from_center_size(center + egui::vec2(-2.0, -2.0), egui::vec2(8.0, 8.0));
+    let front = Rect::from_center_size(center + egui::vec2(2.0, 2.0), egui::vec2(8.0, 8.0));
+    ui.painter()
+        .rect_stroke(back, 1.0, stroke, StrokeKind::Inside);
+    ui.painter()
+        .rect_filled(front, 1.0, ui.visuals().panel_fill);
+    ui.painter()
+        .rect_stroke(front, 1.0, stroke, StrokeKind::Inside);
 }

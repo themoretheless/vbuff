@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
+use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
+use vbuff_core::feedback::FeedbackEnvironment;
 use vbuff_core::{SearchResult, search};
 use vbuff_types::{
     Body, CapabilityView, CapabilityViewLevel, CaptureHealth, Clip, ClipId, CommandNotice,
@@ -31,7 +33,24 @@ const MAX_THUMBNAIL_RGBA_BYTES: u64 = 128 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PopupSurface {
     History,
+    Compose,
     Trust,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ComposeMode {
+    #[default]
+    Stack,
+    Form,
+    Merge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackRowAction {
+    Up(PasteStackItemId),
+    Down(PasteStackItemId),
+    Duplicate(PasteStackItemId),
+    Delete(PasteStackItemId),
 }
 
 /// The eframe application driving the popup.
@@ -65,6 +84,11 @@ pub struct PopupApp {
     confirm_delete: Option<ClipId>,
     /// Compact history and inspectable trust surfaces share one popup.
     surface: PopupSurface,
+    /// Ephemeral, local-only composition scratchpad.
+    paste_stack: PasteStack,
+    compose_mode: ComposeMode,
+    merge_template: MergeTemplate,
+    feedback_preview: bool,
 }
 
 impl PopupApp {
@@ -84,6 +108,10 @@ impl PopupApp {
             confirm_clear_history: false,
             confirm_delete: None,
             surface: PopupSurface::History,
+            paste_stack: PasteStack::default(),
+            compose_mode: ComposeMode::Stack,
+            merge_template: MergeTemplate::Bullets,
+            feedback_preview: false,
         }
     }
 
@@ -100,6 +128,7 @@ impl PopupApp {
         self.confirm_clear_history = false;
         self.confirm_delete = None;
         self.surface = PopupSurface::History;
+        self.feedback_preview = false;
         self.shown_at = Some(Instant::now());
         self.request_focus_next_frame = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -117,6 +146,18 @@ impl PopupApp {
         self.show(ctx);
         self.surface = PopupSurface::Trust;
         self.request_focus_next_frame = false;
+    }
+
+    /// Open the popup directly on the composition scratchpad.
+    pub fn request_compose_view(&mut self, ctx: &egui::Context) {
+        self.show(ctx);
+        self.surface = PopupSurface::Compose;
+        self.request_focus_next_frame = false;
+    }
+
+    /// Add one explicit text draft to the local composition scratchpad.
+    pub fn add_compose_item(&mut self, label: impl Into<String>, text: impl Into<String>) -> bool {
+        self.paste_stack.add(label, text).is_ok()
     }
 
     /// Hide the popup.
@@ -367,6 +408,7 @@ impl eframe::App for PopupApp {
                             });
                     }
                 }
+                PopupSurface::Compose => self.render_compose_surface(ui),
                 PopupSurface::Trust => self.render_trust_surface(
                     ui,
                     security_posture,
@@ -379,6 +421,7 @@ impl eframe::App for PopupApp {
 
         self.render_clear_history_confirmation(ctx);
         self.render_delete_confirmation(ctx);
+        self.render_feedback_preview(ctx, &capabilities);
 
         // Input events repaint immediately; one low-frequency visible refresh
         // keeps expiry labels and background capture state current.
@@ -396,7 +439,7 @@ impl PopupApp {
                     "Search…"
                 };
                 let search_width =
-                    (ui.available_width() - design::ICON_BUTTON_SIZE - 8.0).max(160.0);
+                    (ui.available_width() - design::ICON_BUTTON_SIZE * 2.0 - 16.0).max(160.0);
                 let edit = egui::TextEdit::singleline(&mut self.query).hint_text(hint);
                 let response = ui.add_sized([search_width, design::ICON_BUTTON_SIZE], edit);
                 if self.request_focus_next_frame {
@@ -408,10 +451,28 @@ impl PopupApp {
                 if design::icon_button(ui, Icon::Shield, "Trust and privacy", false).clicked() {
                     self.surface = PopupSurface::Trust;
                 }
+                if design::icon_button(ui, Icon::Compose, "Compose clips", false).clicked() {
+                    self.surface = PopupSurface::Compose;
+                }
+            }
+            PopupSurface::Compose => {
+                let title_width =
+                    (ui.available_width() - design::ICON_BUTTON_SIZE * 2.0 - 16.0).max(160.0);
+                ui.add_sized(
+                    [title_width, design::ICON_BUTTON_SIZE],
+                    egui::Label::new(RichText::new("Compose").strong()),
+                );
+                if design::icon_button(ui, Icon::Shield, "Trust and privacy", false).clicked() {
+                    self.surface = PopupSurface::Trust;
+                }
+                if design::icon_button(ui, Icon::History, "Clipboard history", false).clicked() {
+                    self.surface = PopupSurface::History;
+                    self.request_focus_next_frame = true;
+                }
             }
             PopupSurface::Trust => {
                 let title_width =
-                    (ui.available_width() - design::ICON_BUTTON_SIZE - 8.0).max(160.0);
+                    (ui.available_width() - design::ICON_BUTTON_SIZE * 3.0 - 24.0).max(160.0);
                 ui.add_sized(
                     [title_width, design::ICON_BUTTON_SIZE],
                     egui::Label::new(RichText::new("Trust and privacy").strong()),
@@ -419,6 +480,14 @@ impl PopupApp {
                 if design::icon_button(ui, Icon::History, "Clipboard history", false).clicked() {
                     self.surface = PopupSurface::History;
                     self.request_focus_next_frame = true;
+                }
+                if design::icon_button(ui, Icon::Compose, "Compose clips", false).clicked() {
+                    self.surface = PopupSurface::Compose;
+                }
+                if design::icon_button(ui, Icon::Feedback, "Preview feedback report", false)
+                    .clicked()
+                {
+                    self.feedback_preview = true;
                 }
             }
         });
@@ -465,6 +534,261 @@ impl PopupApp {
         );
     }
 
+    fn render_compose_surface(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.compose_mode, ComposeMode::Stack, "Stack");
+            ui.selectable_value(&mut self.compose_mode, ComposeMode::Form, "Form");
+            ui.selectable_value(&mut self.compose_mode, ComposeMode::Merge, "Merge");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(!self.paste_stack.items().is_empty(), |ui| {
+                    if design::icon_button(ui, Icon::Delete, "Clear paste stack", false).clicked() {
+                        self.paste_stack.clear();
+                    }
+                });
+                ui.small(format!("{} items", self.paste_stack.items().len()));
+            });
+        });
+        ui.separator();
+
+        if self.paste_stack.items().is_empty() {
+            ui.add_space(72.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Paste stack is empty").strong());
+            });
+            return;
+        }
+
+        match self.compose_mode {
+            ComposeMode::Stack => self.render_stack_editor(ui, false),
+            ComposeMode::Form => self.render_stack_editor(ui, true),
+            ComposeMode::Merge => self.render_merge_editor(ui),
+        }
+    }
+
+    fn render_stack_editor(&mut self, ui: &mut egui::Ui, named_slots: bool) {
+        let item_ids = self
+            .paste_stack
+            .items()
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let mut row_actions = Vec::new();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (index, id) in item_ids.iter().copied().enumerate() {
+                    let Ok(item) = self.paste_stack.item(id).cloned() else {
+                        continue;
+                    };
+                    let mut label = item.label.clone();
+                    let mut text = item.text.clone();
+                    egui::Frame::new()
+                        .inner_margin(6.0)
+                        .fill(if index % 2 == 0 {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .show(ui, |ui| {
+                            if named_slots {
+                                let response = ui.add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::TextEdit::singleline(&mut label).char_limit(80),
+                                );
+                                if response.changed() {
+                                    let _ = self.paste_stack.rename(item.id, label.clone());
+                                }
+                            } else {
+                                ui.label(RichText::new(&item.label).small().weak());
+                            }
+                            let editor_height = if named_slots { 28.0 } else { 52.0 };
+                            let response = if named_slots {
+                                ui.add_sized(
+                                    [ui.available_width(), editor_height],
+                                    egui::TextEdit::singleline(&mut text).char_limit(262_144),
+                                )
+                            } else {
+                                ui.add_sized(
+                                    [ui.available_width(), editor_height],
+                                    egui::TextEdit::multiline(&mut text)
+                                        .desired_rows(2)
+                                        .char_limit(262_144),
+                                )
+                            };
+                            if response.changed() {
+                                let _ = self.paste_stack.edit(item.id, text.clone());
+                            }
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if design::icon_button(
+                                            ui,
+                                            Icon::Delete,
+                                            "Remove item",
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            row_actions.push(StackRowAction::Delete(item.id));
+                                        }
+                                        if design::icon_button(
+                                            ui,
+                                            Icon::Duplicate,
+                                            "Duplicate item",
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            row_actions.push(StackRowAction::Duplicate(item.id));
+                                        }
+                                        ui.add_enabled_ui(index + 1 < item_ids.len(), |ui| {
+                                            if design::icon_button(
+                                                ui,
+                                                Icon::Down,
+                                                "Move down",
+                                                false,
+                                            )
+                                            .clicked()
+                                            {
+                                                row_actions.push(StackRowAction::Down(item.id));
+                                            }
+                                        });
+                                        ui.add_enabled_ui(index > 0, |ui| {
+                                            if design::icon_button(ui, Icon::Up, "Move up", false)
+                                                .clicked()
+                                            {
+                                                row_actions.push(StackRowAction::Up(item.id));
+                                            }
+                                        });
+                                        if design::icon_button(
+                                            ui,
+                                            Icon::Paste,
+                                            "Paste this item",
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.actions
+                                                .push_back(UiAction::PasteText(text.clone()));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                }
+            });
+        for action in row_actions {
+            match action {
+                StackRowAction::Up(id) => {
+                    let _ = self.paste_stack.move_up(id);
+                }
+                StackRowAction::Down(id) => {
+                    let _ = self.paste_stack.move_down(id);
+                }
+                StackRowAction::Duplicate(id) => {
+                    let _ = self.paste_stack.duplicate(id);
+                }
+                StackRowAction::Delete(id) => {
+                    let _ = self.paste_stack.remove(id);
+                }
+            }
+        }
+    }
+
+    fn render_merge_editor(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("compose_merge_template")
+                .selected_text(merge_template_label(self.merge_template))
+                .show_ui(ui, |ui| {
+                    for template in [
+                        MergeTemplate::Bullets,
+                        MergeTemplate::NumberedCitations,
+                        MergeTemplate::CsvRows,
+                        MergeTemplate::MarkdownTable,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.merge_template,
+                            template,
+                            merge_template_label(template),
+                        );
+                    }
+                });
+        });
+        let values = self
+            .paste_stack
+            .items()
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>();
+        let Ok(mut merged) = merge_text(&values, self.merge_template) else {
+            ui.colored_label(ui.visuals().error_fg_color, "Merge exceeds the size limit");
+            return;
+        };
+        ui.add(
+            egui::TextEdit::multiline(&mut merged)
+                .desired_rows(16)
+                .interactive(false),
+        );
+        ui.horizontal(|ui| {
+            if design::icon_button(ui, Icon::Paste, "Paste merged text", false).clicked() {
+                self.actions.push_back(UiAction::PasteText(merged.clone()));
+            }
+            if design::icon_button(ui, Icon::Add, "Add merged text to stack", false).clicked() {
+                let _ = self.paste_stack.add("Merged", merged);
+                self.compose_mode = ComposeMode::Stack;
+            }
+        });
+    }
+
+    fn render_feedback_preview(&mut self, ctx: &egui::Context, capabilities: &[CapabilityView]) {
+        if !self.feedback_preview {
+            return;
+        }
+        let environment = FeedbackEnvironment {
+            version: env!("CARGO_PKG_VERSION").into(),
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            session: std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+            capabilities: capabilities
+                .iter()
+                .map(|capability| {
+                    (
+                        capability.feature.clone(),
+                        format!("{} - {}", capability.level.label(), capability.detail),
+                    )
+                })
+                .collect(),
+        };
+        let mut preview = environment.redacted_preview();
+        let response = egui::Modal::new(egui::Id::new("feedback_preview")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Feedback report preview");
+            ui.add(
+                egui::TextEdit::multiline(&mut preview)
+                    .desired_rows(16)
+                    .interactive(false),
+            );
+            ui.horizontal(|ui| {
+                let cancel = ui.button("Cancel").clicked();
+                let open = ui.button("Open issue draft").clicked();
+                (cancel, open)
+            })
+            .inner
+        });
+        let (cancel, open) = response.inner;
+        if open {
+            if let Some(url) = environment
+                .github_issue_draft_url("themoretheless/vbuff", "Feedback / capture report")
+            {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            }
+            self.feedback_preview = false;
+        } else if cancel || response.should_close() {
+            self.feedback_preview = false;
+        }
+    }
+
     fn render_trust_surface(
         &mut self,
         ui: &mut egui::Ui,
@@ -503,7 +827,7 @@ impl PopupApp {
                         render_slo_row(ui, "Zero lost captures", slo.zero_loss, "budget 0");
                         render_slo_row(ui, "Search p99", slo.search_latency, "budget 16 ms");
                         render_slo_row(ui, "Idle CPU", slo.idle_cpu, "budget 0.5%");
-                        render_slo_row(ui, "Login ready", slo.login_ready, "budget 1.5 s");
+                        render_slo_row(ui, "Login ready", slo.login_ready, "budget 500 ms");
                     });
 
                 ui.add_space(12.0);
@@ -663,7 +987,7 @@ impl PopupApp {
                     );
                 }
 
-                let action_width = design::ICON_BUTTON_SIZE * 2.0 + 12.0;
+                let action_width = design::ICON_BUTTON_SIZE * 3.0 + 20.0;
                 let content_width = (ui.available_width() - action_width).max(120.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(content_width, design::THUMBNAIL_SIZE),
@@ -731,6 +1055,18 @@ impl PopupApp {
                         self.actions
                             .push_back(UiAction::SetPinned(clip.id, !clip.pinned));
                     }
+                    ui.add_enabled_ui(
+                        !clip.meta.sensitive && clip.primary_text().is_some(),
+                        |ui| {
+                            if design::icon_button(ui, Icon::Add, "Add to paste stack", false)
+                                .clicked()
+                                && let Some(text) = clip.primary_text()
+                            {
+                                let label = format!("{} {}", clip.meta.kind.label(), row + 1);
+                                let _ = self.paste_stack.add(label, text);
+                            }
+                        },
+                    );
                 });
             });
         });
@@ -1033,6 +1369,15 @@ fn parse_rgba_dims(mime: &str) -> Option<(usize, usize)> {
         }
     }
     Some((width?, height?))
+}
+
+fn merge_template_label(template: MergeTemplate) -> &'static str {
+    match template {
+        MergeTemplate::Bullets => "Bullets",
+        MergeTemplate::NumberedCitations => "Numbered citations",
+        MergeTemplate::CsvRows => "CSV rows",
+        MergeTemplate::MarkdownTable => "Markdown table",
+    }
 }
 
 #[cfg(test)]

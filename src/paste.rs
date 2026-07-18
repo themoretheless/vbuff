@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, anyhow};
 use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::content_hash_from_flavors;
+use vbuff_core::intelligence::{PasteGuardDecision, PasteGuardFingerprint};
 use vbuff_platform::{
     ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, EnigoPaste,
     PasteBackend,
@@ -26,6 +27,7 @@ pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = EnigoPaste> {
     clipboard: Option<C>,
     paste: Option<P>,
     pending_at: Option<Instant>,
+    pending_guard: Option<PasteGuardFingerprint>,
     self_writes: Arc<Mutex<SelfWriteLedger>>,
 }
 
@@ -63,6 +65,7 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
             clipboard,
             paste,
             pending_at: None,
+            pending_guard: None,
             self_writes,
         }
     }
@@ -73,6 +76,7 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         // guarantees that a failed replacement write cannot leave an older
         // keystroke armed against stale clipboard contents.
         self.pending_at = None;
+        self.pending_guard = None;
         let hash = content_hash_from_flavors(flavors);
         let nonce = ClipId::new().to_string_repr();
         let lineage = CaptureLineage {
@@ -106,9 +110,18 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         flavors: &[Flavor],
         now: Instant,
     ) -> anyhow::Result<PasteOutcome> {
+        let guard = self
+            .paste
+            .is_some()
+            .then(|| {
+                PasteGuardFingerprint::from_flavors(flavors)
+                    .ok_or_else(|| anyhow!("selected clip cannot be verified before paste"))
+            })
+            .transpose()?;
         self.copy(flavors)?;
 
-        if self.paste.is_some() {
+        if let Some(guard) = guard {
+            self.pending_guard = Some(guard);
             self.pending_at = Some(now + PASTE_DELAY);
             Ok(PasteOutcome::Scheduled)
         } else {
@@ -125,6 +138,29 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         }
 
         self.pending_at = None;
+        let expected = self.pending_guard.take();
+        let observed = self
+            .clipboard
+            .as_mut()
+            .ok_or_else(|| anyhow!("clipboard writer unavailable"))
+            .and_then(|clipboard| {
+                clipboard
+                    .read()
+                    .map_err(anyhow::Error::from)
+                    .context("verifying clipboard before paste")
+            })
+            .ok()
+            .and_then(|captured| PasteGuardFingerprint::from_flavors(&captured.flavors));
+        let decision = expected
+            .as_ref()
+            .map_or(PasteGuardDecision::BlockUnreadable, |expected| {
+                expected.compare(observed.as_ref())
+            });
+        if decision != PasteGuardDecision::Allow {
+            return Some(Err(anyhow!(
+                "paste guard blocked changed clipboard: {decision:?}"
+            )));
+        }
         Some(
             self.paste
                 .as_mut()
@@ -147,18 +183,23 @@ mod tests {
     struct FakeClipboard {
         fail: bool,
         writes: usize,
+        current: Vec<Flavor>,
     }
 
     impl ClipboardBackend for FakeClipboard {
         fn read(&mut self) -> PlatformResult<CapturedClipboard> {
-            Ok(CapturedClipboard::default())
+            Ok(CapturedClipboard {
+                flavors: self.current.clone(),
+                ..CapturedClipboard::default()
+            })
         }
 
-        fn write(&mut self, _flavors: &[Flavor]) -> PlatformResult<()> {
+        fn write(&mut self, flavors: &[Flavor]) -> PlatformResult<()> {
             self.writes += 1;
             if self.fail {
                 Err(PlatformError::Clipboard("test failure".into()))
             } else {
+                self.current = flavors.to_vec();
                 Ok(())
             }
         }
@@ -190,6 +231,7 @@ mod tests {
             Some(FakeClipboard {
                 fail: false,
                 writes: 0,
+                current: Vec::new(),
             }),
             Some(FakePaste::default()),
         );
@@ -208,6 +250,7 @@ mod tests {
             Some(FakeClipboard {
                 fail: false,
                 writes: 0,
+                current: Vec::new(),
             }),
             Some(FakePaste::default()),
         );
@@ -228,6 +271,7 @@ mod tests {
             Some(FakeClipboard {
                 fail: false,
                 writes: 0,
+                current: Vec::new(),
             }),
             None,
         );
@@ -236,5 +280,43 @@ mod tests {
             coordinator.schedule(&flavors(), Instant::now()).unwrap(),
             PasteOutcome::CopiedOnly
         );
+    }
+
+    #[test]
+    fn changed_clipboard_blocks_the_injection_keystroke() {
+        let mut coordinator = PasteCoordinator::with_backends(
+            Some(FakeClipboard {
+                fail: false,
+                writes: 0,
+                current: Vec::new(),
+            }),
+            Some(FakePaste::default()),
+        );
+        let now = Instant::now();
+        coordinator.schedule(&flavors(), now).unwrap();
+        coordinator.clipboard.as_mut().unwrap().current = vec![Flavor::inline(
+            "text/plain",
+            b"0x2222222222222222222222222222222222222222".to_vec(),
+        )];
+
+        assert!(coordinator.poll(now + PASTE_DELAY).unwrap().is_err());
+        assert_eq!(coordinator.paste.as_ref().unwrap().calls, 0);
+    }
+
+    #[test]
+    fn unverifiable_payload_is_rejected_before_clipboard_write() {
+        let mut coordinator = PasteCoordinator::with_backends(
+            Some(FakeClipboard {
+                fail: false,
+                writes: 0,
+                current: Vec::new(),
+            }),
+            Some(FakePaste::default()),
+        );
+        let opaque = vec![Flavor::inline("application/octet-stream", vec![0xff, 0xfe])];
+
+        assert!(coordinator.schedule(&opaque, Instant::now()).is_err());
+        assert_eq!(coordinator.clipboard.as_ref().unwrap().writes, 0);
+        assert!(coordinator.pending_at.is_none());
     }
 }
