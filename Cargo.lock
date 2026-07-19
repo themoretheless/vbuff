@@ -3472,6 +3472,7 @@ name = "vbuff-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chrono",
  "thiserror 2.0.18",
  "ulid",
  "vbuff-types",

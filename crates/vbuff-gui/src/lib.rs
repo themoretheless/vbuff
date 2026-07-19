@@ -6,7 +6,12 @@
 //! This keeps the view unit-friendly and lets the wiring own all side effects.
 
 mod app;
+mod color;
+mod input;
+mod render;
 mod state;
+mod theme;
+mod thumbnail;
 mod view;
 
 pub use app::PopupApp;

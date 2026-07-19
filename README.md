@@ -18,6 +18,12 @@ That is the four-corner gap vbuff is built to close: **be truly cross-platform (
 
 vbuff is one codebase with native, per-OS backends behind common Rust traits. The popup, search and storage are identical everywhere; only the clipboard, hotkey, paste-back and tray plumbing differ per platform.
 
+> **Target design, not current state.** The table below is the per-OS native backend architecture vbuff is being
+> built toward. The current repository ships exactly one cross-platform clipboard backend (`arboard`, polling,
+> text + single-image only, no concealed-hint support) and one hotkey backend (`global-hotkey`, which does not
+> cover Wayland). None of the native XFIXES/`wlr-data-control`/`AddClipboardFormatListener` paths, and none of the
+> concealed-hint honoring, exist yet. See [docs/code-audit-top-50.md](docs/code-audit-top-50.md) items #11-#20.
+
 | Platform | Clipboard capture | Global hotkey | Paste-back | Notes |
 |---|---|---|---|---|
 | **macOS** | `NSPasteboard` `changeCount` polling (~150-250 ms, adaptive idle backoff) | Carbon `RegisterEventHotKey` | Focus restore + synthetic Cmd+V | Paste-back needs **Accessibility** permission (granted in System Settings). Honors `org.nspasteboard.ConcealedType` / `TransientType`. |
@@ -35,14 +41,19 @@ Source-app attribution and per-app exclusion rely on knowing the foreground app,
 
 Curated from the project's feature catalog (the strongest MVP and v1 items, not the full 640). Items beyond the MVP are marked with their target phase.
 
+> **Reading this section.** These are the *target* MVP/v1 feature set, not all shipped yet. Bullets marked
+> **(target)** describe design intent with no corresponding code in the repo today; see
+> [docs/code-audit-top-50.md](docs/code-audit-top-50.md) for the full, file-and-line-grounded gap list between this
+> page and the current binary.
+
 ### Capture everything, byte-for-byte
 
-- Background watcher captures **every** clipboard change automatically, idling near 0% CPU.
-- Stores **plain text, rich text/HTML, RTF and images** out of the box; files/folders, custom MIME types and color clips follow in v1/v2.
-- **Captures all flavors of a single copy atomically** (a web copy keeps HTML + plain text + image together) so you choose the representation at paste time.
+- Background watcher captures clipboard changes via a fixed-interval `arboard` poll today (target: event-driven per-OS backends, near-0%-idle CPU - **target**, see audit #11-13).
+- Currently captures **plain text and a single raster image** per copy via `arboard`; rich text/HTML, RTF, files/folders, custom MIME types and color clips are **target** (audit #14-15).
+- Atomic multi-flavor capture (HTML + plain text + image together) is **target**; today only one flavor is ever stored per copy (audit #14).
 - **Byte-for-byte fidelity**: no whitespace, newline or encoding normalization, so editor selections and exact payloads round-trip.
 - **Deduplicates** re-copied content (move-to-top instead of a duplicate row) via a BLAKE3 content hash.
-- **Pause / resume**, **incognito mode**, and a **manual capture-on-demand** hotkey.
+- **Pause / resume** works today. Incognito mode and a manual capture-on-demand hotkey are **target** (audit #7-8).
 
 ### Instant keyboard-driven recall
 
@@ -50,54 +61,54 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 - Fully keyboard-driven: navigate, filter, paste-back and pin without touching the mouse.
 - **Number-key quick-pick** for the top items, and per-action shortcuts (paste, paste-plain, pin, delete).
 - Type / pinned / favorite filters, empty and no-results states, dark/light themes, image thumbnails, per-type icons.
-- Virtualized list keeps search-as-you-type fluid over very large histories; FTS5 indexed search is enabled in v1 for 100k+ items.
+- Search today is a client-side substring filter over the most recent 1,000 clips; FTS5 indexed search for 100k+ items is **target**, and no FTS5 schema exists yet (audit #21-23).
 
 ### Reliable paste-back
 
 - Restores focus to the previously active app and injects a real paste, so the clip lands where you were typing.
 - **Plain vs keep-formatting** paste, with a one-shot paste-as-plain action.
 - **Enter** to paste-back, double-click to paste, or a number key for quick-pick; **copy-only** fallback when paste injection is unavailable.
-- Self-write suppression so vbuff never re-captures its own paste.
+- Self-write suppression is **target**; today a paste triggers a harmless but needless re-insert cycle on the next capture-thread poll (audit #44).
 
 ### Organization that survives restarts
 
 - **Pin to top** and **star as favorite**; pinned items are exempt from eviction and persist across restarts as a reusable snippet bank.
 - Promote a clip to a **permanent** item that never auto-prunes.
 - Tags, folders/collections, named tabs, pinboards, notes, color labels and manual drag-reorder arrive in v1.
-- Configurable retention: count cap, total-size cap, time expiry, or unlimited mode (pins/favorites always exempt).
+- Configurable retention: count cap, total-size cap, time expiry, or unlimited mode (pins/favorites always exempt). Today only a count cap is implemented; total-size cap and time expiry are **target**.
 
 ### Snippets and quick transforms (growing through v1)
 
-- Saved snippets with abbreviation expansion, insert-by-hotkey, folders and a built-in editor; date/time placeholders in the MVP set.
-- Promote any clip into a snippet in one keystroke.
-- Quick-action palette with change-case, trim whitespace, strip formatting and literal find-and-replace; programmer-case, regex replace, base64/URL encode-decode and JSON pretty-print expand the set in v1.
+- Saved snippets with abbreviation expansion, insert-by-hotkey, folders and a built-in editor; date/time placeholders in the MVP set. **(target - not in this repo yet)**
+- Promote any clip into a snippet in one keystroke. **(target)**
+- Quick-action palette with change-case, trim whitespace, strip formatting and literal find-and-replace; programmer-case, regex replace, base64/URL encode-decode and JSON pretty-print expand the set in v1. **(target - no transform code exists yet)**
 - One product instead of a separate clipboard manager *and* a separate text expander.
 
 ### Private and trustworthy by construction
 
-- **Encrypted at rest** with the key held in the OS secret store, not beside the database.
-- **Honors OS concealed/secure markers** and password-field hints, skips designated apps, supports regex/keyword exclusion rules and built-in secret detection.
-- **Local by default, zero telemetry, no network calls** out of the box.
-- Auto-clear-on-timer, wipe-on-demand, and shorter retention for sensitive clips.
+- **Encrypted at rest** is a **target**, not shipped: the current store is a plain, unencrypted SQLite database with no key or secret-store integration of any kind (audit #1-2).
+- **Honors OS concealed/secure markers**: **target**, not implemented (audit #3). Per-app exclusion rules exist in config but never actually trigger today because the source app is never captured (audit #4); there is no default deny-list (audit #5), and regex/keyword rules and secret detection do not exist yet (audit #6).
+- **Local by default, zero telemetry, no network calls** out of the box - true today; there is no networking code in the repo at all.
+- Auto-clear-on-timer, wipe-on-demand, and shorter retention for sensitive clips are **target** (audit #9).
 - Cross-device, end-to-end encrypted sync is planned and opt-in (v1 foundation, v2 breadth), never the default path and never a backend that can read your data.
 
 ---
 
 ## Target privacy and security
 
-vbuff is designed around a single hard rule: **fail closed.** Every uncertainty in "should we capture this?" should resolve to *do not capture*, and the decision must run before any byte touches durable storage. The current repository has the first pieces of that model (pause, app exclusion, whitespace skipping, dedup, local SQLite history); the full target adds OS concealed/transient hints, a default secret-tool deny-list, regex/keyword rules, built-in secret detectors, encrypted-at-rest storage with the key in the OS secret store, secure delete, and opt-in end-to-end encrypted sync. vbuff defends against stolen disks, other unprivileged local users and on-the-wire interception once those target controls land; it does not claim to defend against a root/admin attacker, a debugger attached to its own process, or a kernel-level attacker on the same machine.
+vbuff is designed around a single hard rule: **fail closed.** Every uncertainty in "should we capture this?" should resolve to *do not capture*, and the decision must run before any byte touches durable storage. The current repository has the first pieces of that model (pause, whitespace skipping, dedup, local SQLite history) - **not yet app exclusion**, which is implemented and unit-tested but never actually triggers today because the capture backend never reports which app a copy came from (see [docs/code-audit-top-50.md](docs/code-audit-top-50.md) #4). The full target adds OS concealed/transient hints, a working default secret-tool deny-list, regex/keyword rules, built-in secret detectors, encrypted-at-rest storage with the key in the OS secret store, secure delete, and opt-in end-to-end encrypted sync - none of which exist in the repository yet. Until those target controls land, vbuff does not defend against anything beyond accidental disclosure to another process reading the same plaintext SQLite file; it does not claim to defend against a root/admin attacker, a debugger attached to its own process, or a kernel-level attacker on the same machine.
 
 ---
 
 ## Status
 
-vbuff is in active early development. The repository already contains a Cargo workspace with `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and a root single-process binary. The current executable polls the clipboard through `arboard`, captures text/images, stores history in a compact `rusqlite` schema, opens an `egui` popup through a global hotkey, and writes the selected clip back before invoking an `enigo` paste keystroke. Native all-flavor clipboard backends, SQLCipher encryption, full per-OS parity, the formal daemon/IPC split, CLI, and sync remain target work tracked in [architecture.md](architecture.md) and [plan.md](plan.md).
+vbuff is in active early development. The repository already contains a Cargo workspace with `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and a root single-process binary. The current executable polls the clipboard through `arboard` on a fixed timer, captures text or a single image, stores history in a compact unencrypted `rusqlite` schema (no SQLCipher, no FTS5), opens an `egui` popup through a global hotkey, and writes the selected clip back before invoking an `enigo` paste keystroke. There is no CI configuration and no mock platform backends yet, so the OS-facing code paths (clipboard, hotkey, paste) are untested. Native all-flavor clipboard backends, SQLCipher encryption, full per-OS parity, the formal daemon/IPC split, CLI, and sync remain target work tracked in [architecture.md](architecture.md) and [plan.md](plan.md); see [docs/code-audit-top-50.md](docs/code-audit-top-50.md) for the full, evidence-grounded list of what's missing or diverges from the docs today.
 
 ---
 
 ## Architecture at a glance
 
-vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit- and property-testable on any host with mock backends.
+vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit-testable on any host without touching the OS. Mock implementations of the four `vbuff-platform` traits are a **target** (not present in the repo yet - [docs/code-audit-top-50.md](docs/code-audit-top-50.md) #34), so today only pure logic is tested; the real clipboard/hotkey/paste code paths have no automated test coverage.
 
 | Crate | Role | In MVP? |
 |---|---|---|
@@ -106,13 +117,13 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | `vbuff-store` | SQLite + SQLCipher persistence, FTS5, migrations, blob spill, at-rest crypto | Yes |
 | `vbuff-platform` | The four backend trait definitions + per-OS impls (clipboard, hotkey, paste, tray) | Yes |
 | `vbuff-gui` | `eframe` app: popup + settings viewports | Yes |
-| *(root binary)* | `src/main.rs`: launches the single-process app, owns the watcher/store/GUI | Yes |
+| *(root binary)* | `src/`: thin startup wiring (`main.rs`) plus one file per concern - `capture.rs`, `actions.rs`, `gui.rs`, `tray.rs`, `config.rs` | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
 | `vbuff-ipc` | Framed protocol over Unix socket / named pipe | Later |
 | `vbuff-sync` | mDNS discovery, Noise/TLS transport, pairing, LAN P2P replication | Later |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
-The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. Storage is **SQLite** via `rusqlite` (bundled, with SQLCipher and FTS5); dedup uses **BLAKE3**; large payloads spill to an out-of-row, content-addressable blob store. See [architecture.md](architecture.md) for the full design, data model and crate dependency table.
+The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. Storage is **SQLite** via `rusqlite` (bundled; SQLCipher and FTS5 are **target**, not yet wired in - see [docs/code-audit-top-50.md](docs/code-audit-top-50.md) #1 and #21); dedup uses **BLAKE3**; large payloads spilling to an out-of-row, content-addressable blob store is also **target** (the `Body::Spilled` variant exists but nothing constructs it yet). See [architecture.md](architecture.md) for the full design, data model and crate dependency table, and its "Current module map" section for a file-by-file breakdown of every crate - each source file was split to hold one Single-Responsibility-Principle-sized job, so the whole codebase can be read one small file at a time instead of a handful of 400+ line files.
 
 ---
 
@@ -217,6 +228,8 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/ideas-top-300.md](docs/ideas-top-300.md) - ideas 198-300 in the extended backlog.
 - [docs/ideas-301-400.md](docs/ideas-301-400.md) - ideas 301-400 extending the backlog to 400.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
+- [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in *this repo's own code* today, each grounded in a file and line, cross-referenced against the claims made in this README, `architecture.md`, and `recommendation.md`.
+- [docs/problems-improvements-top-500.md](docs/problems-improvements-top-500.md) - 506 more, extending the 50 above (items 51-556 combined): SOLID/DRY architecture, security, platform parity, storage, concurrency, performance, testing, Rust idiom, config UX, GUI/visual design, docs, and dependency/supply-chain findings, generated by a 16-lens multi-agent pass and cross-checked (`cargo audit` independently confirmed every advisory it cites).
 
 ---
 

@@ -15,6 +15,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+mod rgba;
+
+pub use rgba::{RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
+
 /// A ULID-based identifier for a clip.
 ///
 /// ULIDs are lexicographically sortable by creation time and are friendly to
@@ -204,6 +208,12 @@ impl Flavor {
 pub struct ClipMeta {
     /// When the clip was first captured.
     pub created_at: DateTime<Utc>,
+    /// When the clip was last touched: bumped on a dedup re-copy (the store's
+    /// "move to top" behavior). Equal to `created_at` until the first bump.
+    /// This is the field eviction/recency policy should sort by, never
+    /// `created_at` alone and never the clip id, since a clip's id is fixed
+    /// at first capture and does not change when a repeat copy bumps it.
+    pub updated_at: DateTime<Utc>,
     /// Total byte size across all flavors.
     pub byte_size: u64,
     /// Source application identifier, if known (bundle id / exe / WM_CLASS).
@@ -215,8 +225,10 @@ pub struct ClipMeta {
 impl ClipMeta {
     /// Build metadata stamped at the current time for the given kind/size.
     pub fn now(kind: ContentKind, byte_size: u64, source_app: Option<String>) -> Self {
+        let now = Utc::now();
         ClipMeta {
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             byte_size,
             source_app,
             kind,

@@ -1,30 +1,31 @@
 //! SQLite-backed persistence for vbuff's clip history.
 //!
-//! The MVP schema is deliberately compact: a single `clips` table whose
-//! `flavors` column holds the flavor set as a JSON blob. This keeps reads to a
-//! single row fetch and avoids a join on the hot path; the full normalized
-//! `item`/`flavor` split from the architecture can be migrated to later.
-//!
 //! The database lives at `dirs::data_dir()/vbuff/history.db`, runs in WAL mode,
 //! and is opened by a single owner. Inserts are dedup-aware: re-copying
 //! identical content bumps the existing row to the top instead of inserting a
 //! duplicate.
+//!
+//! This crate is deliberately split by responsibility: [`schema`] owns the
+//! table definition and migrations, [`paths`] resolves the on-disk location,
+//! [`row`] maps between SQL rows and [`Clip`], and this module ([`Store`])
+//! only orchestrates queries against an open connection.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
+use vbuff_types::{Clip, ClipId};
 
 mod error;
+mod paths;
+mod row;
+mod schema;
 mod serde_clip;
 
 pub use error::StoreError;
+pub use paths::default_db_path;
 
 /// Result type for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
-
-/// The current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
 
 /// A handle to the clip-history database.
 pub struct Store {
@@ -58,42 +59,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let mut store = Store { conn };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    /// Apply forward-only migrations based on `user_version`.
-    fn migrate(&mut self) -> Result<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 1 {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS clips (
-                    seq          INTEGER PRIMARY KEY AUTOINCREMENT, -- definitive recency tiebreaker
-                    id           TEXT NOT NULL UNIQUE,    -- ULID string
-                    content_hash BLOB NOT NULL,           -- 32-byte BLAKE3 digest
-                    flavors      TEXT NOT NULL,           -- JSON array of flavors
-                    kind         INTEGER NOT NULL,        -- ContentKind discriminant
-                    created_at   INTEGER NOT NULL,        -- epoch millis (UTC)
-                    updated_at   INTEGER NOT NULL,        -- bumped on re-copy (move to top)
-                    byte_size    INTEGER NOT NULL,
-                    source_app   TEXT,
-                    preview      TEXT NOT NULL DEFAULT '',-- cached search/preview text
-                    pinned       INTEGER NOT NULL DEFAULT 0,
-                    favorite     INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash);
-                CREATE INDEX IF NOT EXISTS idx_clips_updated ON clips(updated_at DESC, seq DESC);
-                CREATE INDEX IF NOT EXISTS idx_clips_pinned ON clips(updated_at DESC) WHERE pinned = 1;
-                "#,
-            )?;
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
-        Ok(())
+        schema::migrate(&conn)?;
+        Ok(Store { conn })
     }
 
     /// Insert a clip, deduplicating by content hash.
@@ -140,7 +107,7 @@ impl Store {
                 clip.id.to_string_repr(),
                 clip.content_hash.as_slice(),
                 flavors_json,
-                kind_to_int(clip.meta.kind),
+                row::kind_to_int(clip.meta.kind),
                 created,
                 now,
                 clip.meta.byte_size as i64,
@@ -164,36 +131,13 @@ impl Store {
             LIMIT ?1
             "#,
         )?;
-        let rows = stmt.query_map(params![limit as i64], row_to_clip)?;
-        collect_clips(rows)
+        let rows = stmt.query_map(params![limit as i64], row::row_to_clip)?;
+        row::collect_clips(rows)
     }
 
     /// Load the most recent clips (alias used at startup to hydrate the GUI).
     pub fn load_recent(&self, limit: usize) -> Result<Vec<Clip>> {
         self.list(limit)
-    }
-
-    /// Search clips by a case-insensitive substring over the cached preview.
-    ///
-    /// Ranking is left to `vbuff-core::search` on the caller side; this method
-    /// just narrows the candidate set with SQL `LIKE`.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
-        if query.trim().is_empty() {
-            return self.list(limit);
-        }
-        let pattern = format!("%{}%", escape_like(query));
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, pinned, favorite
-            FROM clips
-            WHERE preview LIKE ?1 ESCAPE '\' OR source_app LIKE ?1 ESCAPE '\'
-            ORDER BY pinned DESC, updated_at DESC, seq DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], row_to_clip)?;
-        collect_clips(rows)
     }
 
     /// Set (or clear) the pinned flag on a clip.
@@ -246,7 +190,14 @@ impl Store {
 
     /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
     ///
-    /// Returns the number of clips evicted.
+    /// Returns the number of clips evicted. This mirrors the policy in
+    /// [`vbuff_core::eviction::evict`] but is implemented directly in SQL so a
+    /// cap enforcement never has to load the full `Clip` rows (flavor bytes
+    /// included) into memory just to compute which ids to drop. The two
+    /// implementations are kept honest against each other by
+    /// `enforce_cap_matches_pure_eviction_policy` below rather than merged,
+    /// since merging would force this hot path back through an in-memory
+    /// `Vec<Clip>` fetch.
     pub fn enforce_cap(&self, max_history: usize) -> Result<usize> {
         let total = self.count()?;
         if total <= max_history {
@@ -268,156 +219,8 @@ impl Store {
     }
 }
 
-/// The default database path: `<data_dir>/vbuff/history.db`.
-pub fn default_db_path() -> Result<PathBuf> {
-    let dir = dirs_data_dir().ok_or_else(|| StoreError::NoDataDir)?;
-    Ok(dir.join("vbuff").join("history.db"))
-}
-
-/// Resolve the platform data directory.
-fn dirs_data_dir() -> Option<PathBuf> {
-    dirs_next_data_dir()
-}
-
-// Avoid a hard `dirs` dependency in this crate by re-implementing the small bit
-// we need via std + env fallbacks. The app crate uses `dirs` directly; here we
-// keep the store dependency-light.
-fn dirs_next_data_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|h| h.join("Library").join("Application Support"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            return Some(PathBuf::from(xdg));
-        }
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|h| h.join(".local").join("share"))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
-}
-
-fn collect_clips(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawRow>>,
-) -> Result<Vec<Clip>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(raw_to_clip(row?)?);
-    }
-    Ok(out)
-}
-
-/// Intermediate row representation before JSON decoding.
-struct RawRow {
-    id: String,
-    content_hash: Vec<u8>,
-    flavors_json: String,
-    kind: i64,
-    created_at: i64,
-    byte_size: i64,
-    source_app: Option<String>,
-    pinned: bool,
-    favorite: bool,
-}
-
-fn row_to_clip(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
-    Ok(RawRow {
-        id: row.get(0)?,
-        content_hash: row.get(1)?,
-        flavors_json: row.get(2)?,
-        kind: row.get(3)?,
-        created_at: row.get(4)?,
-        // index 5 (updated_at) is used for ordering only.
-        byte_size: row.get(6)?,
-        source_app: row.get(7)?,
-        pinned: row.get::<_, i64>(8)? != 0,
-        favorite: row.get::<_, i64>(9)? != 0,
-    })
-}
-
-fn raw_to_clip(raw: RawRow) -> Result<Clip> {
-    let id = ClipId::parse(&raw.id).map_err(|_| StoreError::Corrupt("bad ulid in db".into()))?;
-    let flavors: Vec<Flavor> = serde_clip::flavors_from_json(&raw.flavors_json)?;
-    let mut content_hash = [0u8; 32];
-    if raw.content_hash.len() == 32 {
-        content_hash.copy_from_slice(&raw.content_hash);
-    } else {
-        return Err(StoreError::Corrupt("content_hash not 32 bytes".into()));
-    }
-    let created_at =
-        chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
-    let meta = ClipMeta {
-        created_at,
-        byte_size: raw.byte_size as u64,
-        source_app: raw.source_app,
-        kind: kind_from_int(raw.kind),
-    };
-    Ok(Clip {
-        id,
-        flavors,
-        content_hash,
-        meta,
-        pinned: raw.pinned,
-        favorite: raw.favorite,
-    })
-}
-
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-/// Escape `%`, `_`, and `\` for a SQL `LIKE` pattern using `\` as the escape.
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '%' | '_' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn kind_to_int(kind: ContentKind) -> i64 {
-    match kind {
-        ContentKind::Text => 0,
-        ContentKind::Rtf => 1,
-        ContentKind::Html => 2,
-        ContentKind::Image => 3,
-        ContentKind::File => 4,
-        ContentKind::Color => 5,
-        ContentKind::Url => 6,
-        ContentKind::Code => 7,
-        ContentKind::Other => 8,
-    }
-}
-
-fn kind_from_int(v: i64) -> ContentKind {
-    match v {
-        0 => ContentKind::Text,
-        1 => ContentKind::Rtf,
-        2 => ContentKind::Html,
-        3 => ContentKind::Image,
-        4 => ContentKind::File,
-        5 => ContentKind::Color,
-        6 => ContentKind::Url,
-        7 => ContentKind::Code,
-        _ => ContentKind::Other,
-    }
 }
 
 #[cfg(test)]
@@ -475,16 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn pin_search_delete_clear() {
+    fn pin_delete_clear() {
         let store = Store::open_in_memory().unwrap();
         let c = make_clip("findme please");
         let id = store.insert(&c).unwrap();
         store.insert(&make_clip("unrelated")).unwrap();
-
-        // search
-        let hits = store.search("findme", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].primary_text(), Some("findme please"));
 
         // pin then clear keeps pinned
         store.set_pinned(id, true).unwrap();
@@ -512,5 +310,55 @@ mod tests {
         assert_eq!(store.count().unwrap(), 3);
         // Pinned survived.
         assert!(store.list(10).unwrap().iter().any(|c| c.pinned));
+    }
+
+    /// Guards against `enforce_cap`'s hand-written SQL policy silently
+    /// drifting from `vbuff_core::eviction::evict`'s pure-logic policy, since
+    /// the two are intentionally kept as separate implementations (SQL avoids
+    /// loading full `Clip` rows just to compute a cap) rather than merged.
+    ///
+    /// Inserts are spaced by a couple of milliseconds on purpose: `updated_at`
+    /// is stored at millisecond resolution, and ties within the same
+    /// millisecond cannot be broken identically by both sides - SQL has the
+    /// `seq` autoincrement column to fall back on, but `Clip` deliberately
+    /// does not expose a storage-internal sequence number (it stays
+    /// storage-agnostic), so a same-millisecond tie is an accepted limit of
+    /// the pure policy, not something this test should chase.
+    #[test]
+    fn enforce_cap_matches_pure_eviction_policy() {
+        use vbuff_core::eviction::{EvictionPolicy, evict};
+
+        for max_history in [0usize, 1, 3, 5, 10] {
+            let store = Store::open_in_memory().unwrap();
+            let mut inserted = Vec::new();
+            for i in 0..10 {
+                let clip = make_clip(&format!("clip {i}"));
+                store.insert(&clip).unwrap();
+                inserted.push(clip);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // Pin two arbitrary clips so the exempt-from-eviction path is
+            // exercised by both implementations too.
+            store.set_pinned(inserted[2].id, true).unwrap();
+            store.set_pinned(inserted[7].id, true).unwrap();
+
+            let before = store.list(100).unwrap();
+            let expected_evicted: std::collections::HashSet<_> =
+                evict(&before, &EvictionPolicy { max_history })
+                    .into_iter()
+                    .collect();
+
+            store.enforce_cap(max_history).unwrap();
+            let after: std::collections::HashSet<_> =
+                store.list(100).unwrap().into_iter().map(|c| c.id).collect();
+            let before_ids: std::collections::HashSet<_> = before.iter().map(|c| c.id).collect();
+            let actually_evicted: std::collections::HashSet<_> =
+                before_ids.difference(&after).copied().collect();
+
+            assert_eq!(
+                actually_evicted, expected_evicted,
+                "SQL enforce_cap({max_history}) diverged from the pure eviction policy"
+            );
+        }
     }
 }

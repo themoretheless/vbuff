@@ -8,17 +8,10 @@
 use std::borrow::Cow;
 
 use arboard::{Clipboard, ImageData};
-use vbuff_types::{Body, Flavor};
+use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
 
 use crate::traits::{CapturedClipboard, ClipboardBackend};
 use crate::{PlatformError, Result};
-
-/// MIME used for raw RGBA image payloads captured via arboard.
-///
-/// arboard hands us raw RGBA8 pixels plus width/height, not an encoded PNG, so
-/// we tag it with a vbuff-specific MIME that records the dimensions. The GUI and
-/// paste-back paths understand this format.
-pub const RGBA_MIME_PREFIX: &str = "image/x-vbuff-rgba";
 
 /// An `arboard`-backed clipboard.
 pub struct ArboardClipboard {
@@ -53,10 +46,7 @@ impl ClipboardBackend for ArboardClipboard {
         if flavors.is_empty()
             && let Ok(img) = self.clipboard.get_image()
         {
-            let mime = format!(
-                "{RGBA_MIME_PREFIX};width={};height={}",
-                img.width, img.height
-            );
+            let mime = rgba_mime(img.width, img.height);
             flavors.push(Flavor::inline(mime, img.bytes.into_owned()));
         }
 
@@ -99,35 +89,5 @@ impl ClipboardBackend for ArboardClipboard {
         }
 
         Err(PlatformError::Empty)
-    }
-}
-
-/// Parse `width=W;height=H` out of an RGBA MIME string.
-fn parse_rgba_dims(mime: &str) -> Option<(usize, usize)> {
-    let mut width = None;
-    let mut height = None;
-    for part in mime.split(';') {
-        if let Some(v) = part.trim().strip_prefix("width=") {
-            width = v.parse().ok();
-        } else if let Some(v) = part.trim().strip_prefix("height=") {
-            height = v.parse().ok();
-        }
-    }
-    Some((width?, height?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_rgba_dims() {
-        let mime = "image/x-vbuff-rgba;width=4;height=2";
-        assert_eq!(parse_rgba_dims(mime), Some((4, 2)));
-    }
-
-    #[test]
-    fn missing_dims_is_none() {
-        assert_eq!(parse_rgba_dims("image/x-vbuff-rgba"), None);
     }
 }

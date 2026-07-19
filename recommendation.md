@@ -222,7 +222,7 @@ Building on the architecture's risks table, with two feasibility spikes called o
 | **Wayland hides foreground-app identity** -> per-app exclusion and private-browser skip cannot function. | High / Medium | Make fail-closed-where-required configurable; show capability badges so users are not lulled into false safety; content/regex/secret rules still work and are surfaced as the active protection. |
 | **Encryption silently not engaged** (wrong PRAGMA, fallback to plain SQLite, blob written before sealing). | Low / Critical | Canary-grep at-rest test on all three platforms in CI; pin cipher params in a config record; a canary hit is a release blocker. |
 | **Sensitive content leaks** because a source app sets no concealed hint. | Medium / High | Defense in depth: hints + secure-field detection + app exclusion + secret detectors + regex + incognito; sensitive items masked, shorter retention, sync-excluded. |
-| **Crate-maturity assumptions wrong** (`tray-icon` SNI, `global-hotkey` Wayland gap, `keyring` v3, SQLCipher PRAGMA defaults, objc2/windows-rs signatures). | Medium / Medium | Verify every platform crate against pinned versions in the Phase-0 spike before locking the stack; the trait boundaries make swapping an impl cheap. |
+| **Crate-maturity assumptions wrong** (`tray-icon` SNI, `global-hotkey` Wayland gap, `keyring` v3, SQLCipher PRAGMA defaults, objc2/windows-rs signatures). **Confirmed, not hypothetical:** `cargo audit` against the actual `Cargo.lock` today reports 10 live RUSTSEC advisories - 7 "unmaintained" for the GTK3 chain (`gtk`/`gdk`/`atk` 0.18.2 and their `-sys`/`-macros` crates) pulled in transitively by `tray-icon`'s default-on Linux backend, plus `proc-macro-error` and `ttf-parser` unmaintained, plus an actual **unsoundness** advisory (RUSTSEC-2024-0429) in `glib` 0.18.5's iterator impls, also via the GTK3 chain. See `docs/problems-improvements-top-500.md` #71-73. | Medium / Medium (now: confirmed present) | Verify every platform crate against pinned versions in the Phase-0 spike before locking the stack; the trait boundaries make swapping an impl cheap. Add `cargo audit` to the pre-PR checklist and CI now (`docs/problems-improvements-top-500.md` #75) rather than deferring dependency-risk discovery to a future spike - the GTK3 chain in particular is worth evaluating for a lighter Linux tray backend before v1. |
 | **Self-write feedback loop** re-captures our own paste or a restored sensitive clip. | High if unhandled / Medium | Sentinel format + own-ownership tracking + short-TTL content-hash flag; debounce swallows the echo; gate #0 ignores tagged writes. |
 | **DB corruption / power loss.** | Low / High | WAL + `synchronous=NORMAL`, txn-per-capture, `integrity_check` at startup, quarantine-and-restart on unrecoverable corruption, online-backup before migrations. |
 | **Scope sprawl** across a 640-feature catalog + 122 extras. | High / Medium | Strict single-process MVP -> v1 -> v2 phasing with per-milestone exit criteria; sync/team features deliberately last so the private single-machine core ships and stabilizes first. Pull text expansion out of MVP (section 2). |
@@ -231,7 +231,23 @@ Building on the architecture's risks table, with two feasibility spikes called o
 
 ---
 
-## 6. If we only do 10 things for the MVP (dependency-ordered)
+## 6. Where the shipped code has already diverged from this document
+
+This section exists because section 2 makes explicit "non-negotiable" calls that the current single-process MVP
+binary does not follow, and because some items below were stated as settled fact when they are not yet true in the
+repository. Full evidence (file + line) lives in [docs/code-audit-top-50.md](docs/code-audit-top-50.md); this is the
+short version so the divergence isn't silently lost between documents.
+
+- **Section 2 calls `arboard`-based polling "the wrong tool" and native event-driven capture "non-negotiable."** The shipped `main.rs` polls `arboard` on a fixed timer on every OS, exactly the pattern this document rejects (audit #11).
+- **Step 2 of "the 10 things" (below) states "FTS5 schema present (substring is the shipped tier)" as fact.** No FTS5 table exists in the schema; only three plain B-tree indexes do (audit #21).
+- **Step 1 of "the 10 things" calls for `MockBackend` implementations of the four platform traits.** None exist; `vbuff-platform` ships only real OS-backed implementations, so the OS-facing code has no automated tests (audit #34).
+- **Step 8 ("Privacy floor") and Theme B above assume encryption, concealed-hint honoring, and a working default deny-list land alongside the MVP.** None of the three exist yet, and the app-exclusion feature that does exist never triggers because the capture backend never reports the source app (audit #1-6).
+- **This list should shrink, not grow.** As each gap actually closes in the code, strike the corresponding line here and in `docs/code-audit-top-50.md` rather than letting both silently drift from reality again. First entries struck: audit #22/#23/#28 (the dead `Store::search` path was deleted rather than left to rot) and #24 (the eviction-policy duplication was not merged, but a parity test now guards it - and immediately caught a real bug: `vbuff_core::eviction::evict` was silently sorting by `ClipId` instead of last-touched time, so a re-copied clip could be evicted ahead of a genuinely stale one; fixed by adding `ClipMeta::updated_at`, which the type never carried before).
+- **The codebase was also split by SOLID/DRY** (see `architecture.md`'s "Current module map" section and `docs/problems-improvements-top-500.md`): every crate's largest files (`vbuff-store/src/lib.rs`, `vbuff-gui/src/app.rs`, `src/main.rs`) were broken into single-responsibility modules, and the one confirmed duplicate implementation found in the codebase (`parse_rgba_dims`, copy-pasted between `vbuff-platform` and `vbuff-gui`) was consolidated into `vbuff-types`.
+
+---
+
+## 7. If we only do 10 things for the MVP (dependency-ordered)
 
 Single-process build using `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-gui`, and the root binary. Each step unblocks the next.
 
@@ -252,6 +268,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 
 ## Related documents
 
+- `README.md` - project overview, build & usage
 - `architecture.md` - canonical system design, crate stack, data model, roadmap, risks
 - `plan.md` - phased implementation plan / milestones
 - `docs/competitive-analysis.md` - competitor landscape and the four-corner wedge
@@ -260,6 +277,8 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/ideas-top-300.md` - user-facing, sync, integration, and operations ideas 198-300
 - `docs/ideas-301-400.md` - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
+- `docs/code-audit-top-50.md` - top 50 things wrong in the current code, including where it diverges from this document's own "non-negotiable" calls (section 6)
+- `docs/problems-improvements-top-500.md` - items 51-556: SOLID/DRY, security, storage, concurrency, performance, testing, code-quality, config, GUI-design, docs, and dependency findings against the current code, extending the 50 above
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
 
 ---

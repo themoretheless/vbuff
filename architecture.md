@@ -2,6 +2,14 @@
 
 vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. It captures every system clipboard change into a durable, searchable, encrypted local history; summons a keyboard-driven popup via a global hotkey; and pastes the chosen clip back into the previously focused application. It is local-first and private by default, with opt-in peer-to-peer LAN sync.
 
+> **This document describes the target architecture, not the current state of the repository.** The shipped MVP
+> binary today is a single generic `arboard`-polling clipboard backend (text + one image flavor, no concealed-hint
+> support, no source-app attribution), an unencrypted plain-SQLite store with no FTS5, and `global-hotkey` (which
+> does not cover Wayland) - none of the native per-OS backends, encryption, or FTS5 described below exist yet. See
+> [docs/code-audit-top-50.md](docs/code-audit-top-50.md) for the full, file-and-line-grounded list of what diverges
+> from this design as of the current commit, so it can be read as an implementation checklist rather than mistaken
+> for a status report.
+
 ---
 
 ## Goals & non-goals
@@ -188,6 +196,94 @@ vbuff/
 ```
 
 `vbuff-store` is split from `vbuff-core` because eviction/retention/dedup *policy* (core) is independent of *persistence* (store), letting us fuzz the policy logic against an in-memory fake store. `vbuff-types` is separate so the CLI and IPC can serialize `Clip` without pulling in rusqlite or egui. Dependency direction is strictly downward; `vbuff-core` never depends on `vbuff-gui`, `vbuff-store`, or `vbuff-platform`'s *impls* (only its *traits*).
+
+### Current module map: what exists today, one small file at a time
+
+The table above is the target crate layout (`vbuff-daemon`, `vbuff-ipc`, `vbuff-sync`, `vbuff-cli` are not built yet -
+see the disclaimer at the top of this document). Within the five crates and the root binary that *do* exist, every
+source file was split so it holds a single, nameable responsibility (Single Responsibility Principle) and so
+duplicated logic has exactly one home (DRY) - the intent is that a reader can open one ~50-150 line file at a time
+and understand the whole system incrementally, rather than needing to hold a 500+ line file in their head at once.
+`docs/problems-improvements-top-500.md` catalogs the specific SOLID/DRY violations this addressed; one of them -
+`vbuff-core`'s eviction policy silently disagreeing with the store's SQL eviction for re-copied clips - was only
+caught *because* splitting the store forced writing a test that runs both implementations side by side (see
+`vbuff-store/src/lib.rs`'s `enforce_cap_matches_pure_eviction_policy`); the fix added `ClipMeta::updated_at`, which
+did not exist before.
+
+```
+crates/vbuff-types/src/
+├── lib.rs        Clip, Flavor, Body, ClipMeta, ClipId, ContentKind - the shared data model, zero I/O.
+└── rgba.rs        the image/x-vbuff-rgba MIME convention, defined once and shared by vbuff-platform and vbuff-gui
+                    (previously duplicated verbatim in both).
+
+crates/vbuff-core/src/
+├── lib.rs         module re-exports only.
+├── hash.rs        canonical BLAKE3 content hashing for dedup.
+├── classify.rs    heuristic ContentKind detection.
+├── filter.rs      search/ranking - the search actually wired into the GUI today.
+└── eviction.rs    retention policy (pure logic); checked against the store's own SQL policy by a parity test
+                    rather than merged, since merging would force the SQL hot path through an in-memory Vec<Clip>.
+
+crates/vbuff-store/src/
+├── lib.rs         Store: the public CRUD surface, orchestrating schema/paths/row.
+├── schema.rs      table definition and forward-only migrations.
+├── paths.rs       resolves the default on-disk database location.
+├── row.rs         mapping between SQL rows and Clip.
+├── serde_clip.rs  JSON (de)serialization of the flavor blob column.
+└── error.rs       StoreError.
+
+crates/vbuff-platform/src/
+├── lib.rs         module re-exports + paste_modifier().
+├── traits.rs      the four backend traits + shared key/capture types.
+├── clipboard.rs   the arboard-backed ClipboardBackend impl (today's only clipboard backend, all platforms).
+├── hotkey.rs      the global-hotkey-backed HotkeyBackend impl + hotkey-string parsing.
+├── paste.rs       the enigo-backed PasteBackend impl.
+└── error.rs       PlatformError.
+
+crates/vbuff-gui/src/
+├── lib.rs         module re-exports.
+├── app.rs         PopupApp: struct definition + eframe::App::update orchestration only.
+├── input.rs       keyboard handling (Esc/arrows/Enter/quick-pick) -> UiAction.
+├── render.rs      panel + row drawing, including the empty/no-results state.
+├── thumbnail.rs   image-texture cache, pruned whenever the clip list changes.
+├── color.rs       hex-color parsing + the color-clip swatch.
+├── theme.rs       the small design-system constants (spacing/sizes/quick-pick slots) - see "Design system" below.
+├── state.rs       AppState, SharedState, UiAction - the data crossing the GUI/wiring boundary.
+└── view.rs        pure formatting helpers (relative_time, short_app_name).
+
+src/  (the root binary)
+├── main.rs        startup wiring only: build the store/state, spawn capture, register the hotkey, hand off to gui.
+├── config.rs      Config: policy loaded from/saved to TOML.
+├── constants.rs   GUI_LIMIT, shared by capture.rs and actions.rs.
+├── capture.rs     the background poll loop + capture-gate rules (whitespace skip, app exclusion).
+├── actions.rs     UiAction -> store/clipboard/paste side effects.
+├── gui.rs         the eframe event loop: hotkey receiver, tray polling, popup update, pending-paste firing.
+└── tray.rs        the tray icon/menu (behind the `tray` feature).
+```
+
+### Design system (the popup's visual language)
+
+`vbuff-gui/src/theme.rs` is intentionally small - a handful of named constants (`SPACING_XS`, `SPACING_SM`,
+`ROW_HEIGHT`, `THUMBNAIL_SIZE`, `ICON_FONT_SIZE`, `QUICK_PICK_SLOTS`, `QUICK_PICK_BADGE_WIDTH`) rather than a
+theming engine, so every magic number that used to be scattered through the row-rendering code has exactly one
+named source of truth. Two concrete design fixes landed alongside the split:
+
+- **A real empty state.** Before, an empty or no-match history rendered a blank list with no explanation; now
+  `render.rs`'s `render_empty_state` distinguishes "no clips yet" (nothing has been copied) from "no matches"
+  (a search query excluded everything), each with a one-line hint, so an empty popup never reads as broken.
+- **Consistent row alignment.** The quick-pick number badge (rows 1-9) previously shifted the kind icon/thumbnail
+  right compared to unnumbered rows (10+), so the icon column drifted depending on scroll position; a fixed-width
+  `QUICK_PICK_BADGE_WIDTH` slot is now reserved on every row regardless of whether it carries a digit.
+- **Recency reflects last touch, not first capture.** A row's relative-time label (`3m`, `2h`, ...) now reads
+  `clip.meta.updated_at` instead of `created_at`, so a clip you re-copied a minute ago says "now," not its
+  original capture time from last week.
+
+This is a code-level pass verified by `cargo build`/`cargo test`/`cargo clippy`, not a visually-inspected redesign -
+`vbuff-gui` is a native `eframe` desktop app with no available headless renderer or browser-preview tooling in this
+environment, so the actual pixel output has not been screenshotted or interactively checked. Treat the visual
+claims above as "compiles and is structurally correct," not "confirmed to look right on screen." A deeper visual
+critique (contrast, motion, information density) is tracked as forward-looking items in
+`docs/problems-improvements-top-500.md` rather than claimed as done here.
 
 ### Core data model
 
@@ -1047,6 +1143,8 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
+- [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in the current code, cross-referenced against this document's claims
+- [docs/problems-improvements-top-500.md](docs/problems-improvements-top-500.md) - items 51-556: the SOLID/DRY, security, platform, storage, concurrency, performance, testing, code-quality, config, GUI-design, docs, and dependency findings behind the "Current module map" and "Design system" sections above
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
 
 
