@@ -33,6 +33,14 @@ pub struct AppState {
     pub recoverable_skip_until: Option<Instant>,
     /// Latest redacted command result, dismissible from the popup.
     pub notice: Option<CommandNotice>,
+    /// Screen-reader live-region message. Content is intentionally generic.
+    pub accessibility_announcement: Option<String>,
+    /// Bumped for every live-region message, including repeated text.
+    pub announcement_revision: u64,
+    /// Resolved summon shortcut shown by the one-time coachmark.
+    pub hotkey_label: Option<String>,
+    /// True until the coachmark is explicitly dismissed.
+    pub show_hotkey_coachmark: bool,
     /// Set to true by the wiring when the popup should be shown/focused.
     pub show_requested: bool,
     /// A monotonically increasing revision; bumped when `clips` changes so the
@@ -108,6 +116,11 @@ impl AppState {
     pub fn clear_notice(&mut self) {
         self.notice = None;
     }
+
+    pub fn announce(&mut self, message: impl Into<String>) {
+        self.accessibility_announcement = Some(message.into());
+        self.announcement_revision = self.announcement_revision.wrapping_add(1);
+    }
 }
 
 /// A thread-safe handle to [`AppState`].
@@ -132,6 +145,8 @@ pub enum UiAction {
     SetPinned(ClipId, bool),
     /// Delete a single clip.
     Delete(ClipId),
+    /// Restore one recently deleted in-memory clip.
+    RestoreClip(Box<Clip>),
     /// Clear history while preserving pinned clips.
     ClearHistory,
     /// Toggle capture pause.
@@ -142,6 +157,8 @@ pub enum UiAction {
     InstallStarterPack(StarterPack),
     /// Dismiss the current command result.
     DismissNotice,
+    /// Permanently dismiss the first-run hotkey coachmark.
+    DismissHotkeyCoachmark,
     /// Hide the popup (Esc / focus loss).
     Hide,
 }
@@ -160,6 +177,12 @@ impl fmt::Debug for UiAction {
                 .field(pinned)
                 .finish(),
             Self::Delete(id) => formatter.debug_tuple("Delete").field(id).finish(),
+            Self::RestoreClip(clip) => formatter
+                .debug_struct("RestoreClip")
+                .field("id", &clip.id)
+                .field("kind", &clip.meta.kind)
+                .field("bytes", &clip.meta.byte_size)
+                .finish(),
             Self::ClearHistory => formatter.write_str("ClearHistory"),
             Self::TogglePause => formatter.write_str("TogglePause"),
             Self::RecoverSkipped => formatter.write_str("RecoverSkipped"),
@@ -168,6 +191,7 @@ impl fmt::Debug for UiAction {
                 .field(pack)
                 .finish(),
             Self::DismissNotice => formatter.write_str("DismissNotice"),
+            Self::DismissHotkeyCoachmark => formatter.write_str("DismissHotkeyCoachmark"),
             Self::Hide => formatter.write_str("Hide"),
         }
     }

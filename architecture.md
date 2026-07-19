@@ -1,6 +1,6 @@
 # vbuff - Architecture & System Design
 
-vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v5 search/CAS/migration hardening, fail-closed AI eligibility with local feature vectors, tiered capture recovery, byte/RSS pressure policy, secret clawback, History/Trust/Compose surfaces, config handoff, local `ask`, an offline verifier, and tested sync/IPC/plugin/update foundations. It still uses `arboard`, stores SQLite without SQLCipher, and has no live daemon dispatch, native integration clients, sync transport, third-party plugin runtime, or updater fetch/install path. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), and [batch 151-200](docs/implementation-batch-151-200.md) ledgers.
+vbuff is a cross-platform (macOS, Windows, Linux/X11, Linux/Wayland) clipboard manager and text-expansion tool written in Rust. This document defines the target system: durable searchable history, SQLCipher at-rest encryption, native all-flavor capture, and opt-in peer-to-peer sync. The current binary has the resident local loop, schema v6 search/CAS/migration/lifecycle hardening, fail-closed AI eligibility with local feature vectors, tiered capture recovery, byte/RSS pressure policy, secret clawback, History/Compose/Trust/Settings surfaces, config handoff, local `ask`, an offline verifier, and tested sync/IPC/plugin/update foundations. It still uses `arboard`, stores the main SQLite database without SQLCipher, has no OS-keystore key wired to durable Undo, and has no live daemon dispatch, native integration clients, sync transport, third-party plugin runtime, or updater fetch/install path. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), and [batch 201-250](docs/implementation-batch-201-250.md) ledgers.
 
 ---
 
@@ -262,7 +262,7 @@ Current extraction status:
 6. **Done:** serializable capture-health/notice contracts live below the GUI in `vbuff-types`; the narrow `Diagnostics` publisher carries worker health and redacted command outcomes to popup/tray without coupling capture policy to rendering.
 7. **Done:** the capture worker publishes a monotonic heartbeat; its watchdog surfaces `CaptureHealth::Stalled`, ignores deliberate pause, and allows a later successful read to report recovery.
 8. **Done:** the root process performs bind-or-forward before opening storage or registering a hotkey; an OS-released owner lock serializes recovery, a second launch forwards `ShowPopup`, `Ping` proves liveness, and a stale endpoint is removed and rebound once.
-9. **Done:** schema v5 owns FTS5 prose/code indexes, structured facets, SimHash/dHash, keyset search, Bloom-assisted dedup, transactional refcounted CAS, verified migration preflight/rollback, expiry, content audits, and content-hash-keyed eligible embeddings. SQLCipher is still absent.
+9. **Done:** schema v6 owns FTS5 prose/code indexes, structured facets, SimHash/dHash plus normalized text groups, keyset search, Bloom-assisted exact dedup with a reuse ledger, transactional refcounted CAS, persisted per-kind retention, externally keyed encrypted grace records, verified migration preflight/rollback, expiry, content audits, and content-hash-keyed eligible embeddings. SQLCipher and the OS-keystore provider are still absent.
 10. **Done:** hotkey, tray, and second-instance events wake egui directly; a five-second supervisory repaint replaces the former 100 ms resident poll, while the visible popup uses a one-second refresh for expiry and capture state instead of repainting every frame.
 11. **Foundation:** `vbuff-sync` now has tested protocol/crypto building blocks, while transport, persistence, pairing UI, and runtime integration remain M9 work.
 12. **Done:** tiered capture supervision, byte-aware backpressure, RSS-aware maintenance, secret detection/clawback, doctor output, process hardening, strict posture, FTS health, and atomic store batches are active in the current root runtime.
@@ -1139,8 +1139,11 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/implementation-batch-051-100.md](docs/implementation-batch-051-100.md) - execution status and review evidence for engineering backlog items 51-100
 - [docs/implementation-batch-101-150.md](docs/implementation-batch-101-150.md) - release, Trust UI, migration/sync, product-policy, and review evidence for items 101-150
 - [docs/implementation-batch-151-200.md](docs/implementation-batch-151-200.md) - privacy/AI, integrations, delivery gates, data freeze, and Compose evidence for items 151-200
+- [docs/implementation-batch-201-250.md](docs/implementation-batch-201-250.md) - workflow contracts, popup design/accessibility, schema 6 lifecycle, and review evidence for items 201-250
 - [docs/decision-gates-151-200.md](docs/decision-gates-151-200.md) - numeric stop/go criteria, owner roles, external evidence, and dependency fallback ladders
+- [docs/decision-gates-201-250.md](docs/decision-gates-201-250.md) - plugin host, native caret, assistive technology, display, and encrypted-recovery gates
 - [docs/data-contract-v1.md](docs/data-contract-v1.md) - frozen schema/hash/format/IPC fixtures and compatibility procedure
+- [docs/data-contract-v2.md](docs/data-contract-v2.md) - schema 6 lifecycle and compatibility contract
 - [docs/product-strategy-decisions.md](docs/product-strategy-decisions.md) - explicit resolution of conflicting licensing/pricing/governance hypotheses 128-140
 - [docs/competitive-analysis.md](docs/competitive-analysis.md) - competitor landscape
 - [docs/features-top-500.md](docs/features-top-500.md) - 640-feature catalog
@@ -1148,6 +1151,7 @@ Cross-cutting guarantees that back the table: the behavioral test suite runs ide
 - [docs/ideas-301-400.md](docs/ideas-301-400.md) - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog: current problems, SOLID/DRY cuts, design issues, quality gaps, and roadmap hygiene
 - [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed native correctness, Unicode/search, security, local-first sync, and verification ideas 501-600
+- [docs/ideas-601-610.md](docs/ideas-601-610.md) - post-600 evidence-backed candidates outside the active execution goal
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 high-signal repositories and the primary research/standards evidence catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
@@ -1164,7 +1168,8 @@ The numbered backlog remains the canonical statement of intent; implementation s
 | 51-100 | Second implementation/review batch complete with native and runtime dependencies kept explicit | [Batch 051-100 ledger](docs/implementation-batch-051-100.md) |
 | 101-150 | Third implementation/review batch complete with native, release-credential, transport, and policy dependencies explicit | [Batch 101-150 ledger](docs/implementation-batch-101-150.md) |
 | 151-200 | Fourth implementation/review batch complete with runtime, foundation, adapted, native, and external dependencies explicit | [Batch 151-200 ledger](docs/implementation-batch-151-200.md) |
-| 201-600 | Queued in groups of 50 | Shared range map below |
+| 201-250 | Fifth implementation/review batch complete with runtime, foundation, adapted, native, and key-provider dependencies explicit | [Batch 201-250 ledger](docs/implementation-batch-201-250.md) |
+| 251-600 | Queued in groups of 50 | Shared range map below |
 
 The architectural cut line is strict: a pure algorithm can be complete as a foundation without being a shipped feature. In particular, native provenance/generation/realization work is not complete through `arboard`, and sync is not a user feature until authenticated transport, persistence, pairing UX, and replication are wired.
 
@@ -1182,6 +1187,8 @@ The backlog is intentionally split instead of duplicated. `architecture.md`, `RE
 | 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy, search, storage, platform fit, teams, automation, governance |
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current problems, SOLID/DRY refactors, test gaps, designer-grade UX, review hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Native protocol correctness, international text/search, security, local-first sync, evidence and verification |
+
+The [post-600 candidates 601-610](docs/ideas-601-610.md) remain a separate evidence pool and do not change the canonical 1-600 objective.
 
 ---
 

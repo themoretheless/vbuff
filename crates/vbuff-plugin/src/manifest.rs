@@ -158,6 +158,120 @@ impl CapabilityGrant {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionPermissionRequest {
+    pub action_id: String,
+    pub required: BTreeSet<PluginCapability>,
+    #[serde(default)]
+    pub network_hosts: BTreeSet<String>,
+    #[serde(default)]
+    pub file_paths: BTreeSet<String>,
+    #[serde(default)]
+    pub process_commands: BTreeSet<String>,
+}
+
+impl ActionPermissionRequest {
+    pub fn validate(&self, manifest: &PluginManifest) -> Result<()> {
+        manifest.validate()?;
+        if !valid_command_id(&self.action_id) {
+            return Err(PluginError::InvalidManifest("invalid action id".into()));
+        }
+        if !self.required.is_subset(&manifest.requested_capabilities) {
+            return Err(PluginError::CapabilityDenied(
+                "action requests a capability outside its manifest".into(),
+            ));
+        }
+        validate_action_scope(
+            self.required.contains(&PluginCapability::Network),
+            &self.network_hosts,
+            &manifest.network_hosts,
+            64,
+            valid_host,
+            "network",
+        )?;
+        validate_action_scope(
+            self.required.contains(&PluginCapability::FileRead)
+                || self.required.contains(&PluginCapability::FileWrite),
+            &self.file_paths,
+            &manifest.file_paths,
+            64,
+            valid_scope_path,
+            "file",
+        )?;
+        validate_action_scope(
+            self.required.contains(&PluginCapability::ProcessSpawn),
+            &self.process_commands,
+            &manifest.process_commands,
+            32,
+            valid_command_id,
+            "process",
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionCapabilityGrant {
+    pub plugin_id: String,
+    pub manifest_hash: [u8; 32],
+    pub action_id: String,
+    pub granted: BTreeSet<PluginCapability>,
+    #[serde(default)]
+    pub network_hosts: BTreeSet<String>,
+    #[serde(default)]
+    pub file_paths: BTreeSet<String>,
+    #[serde(default)]
+    pub process_commands: BTreeSet<String>,
+}
+
+impl ActionCapabilityGrant {
+    pub fn authorize(
+        &self,
+        manifest: &PluginManifest,
+        request: &ActionPermissionRequest,
+    ) -> Result<()> {
+        request.validate(manifest)?;
+        if self.plugin_id != manifest.id
+            || self.manifest_hash != manifest.hash()?
+            || self.action_id != request.action_id
+        {
+            return Err(PluginError::CapabilityDenied(
+                "action grant does not match this action revision".into(),
+            ));
+        }
+        if self.granted != request.required
+            || self.network_hosts != request.network_hosts
+            || self.file_paths != request.file_paths
+            || self.process_commands != request.process_commands
+        {
+            return Err(PluginError::CapabilityDenied(
+                "action grant must exactly match its requested sandbox".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_action_scope(
+    required: bool,
+    requested: &BTreeSet<String>,
+    manifest_scope: &BTreeSet<String>,
+    max_items: usize,
+    validator: fn(&str) -> bool,
+    label: &str,
+) -> Result<()> {
+    if required != !requested.is_empty()
+        || requested.len() > max_items
+        || !requested.is_subset(manifest_scope)
+        || requested.iter().any(|value| !validator(value))
+    {
+        return Err(PluginError::CapabilityDenied(format!(
+            "invalid per-action {label} scope"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_relative_path(path: &str) -> Result<()> {
     let valid = !path.is_empty()
         && !path.starts_with('/')
@@ -267,5 +381,39 @@ mod tests {
         assert!(manifest.validate().is_err());
         manifest.process_commands.insert("format-json".into());
         assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn action_grants_cannot_inherit_unrequested_manifest_scope() {
+        let mut manifest = manifest();
+        manifest
+            .requested_capabilities
+            .insert(PluginCapability::Network);
+        manifest.network_hosts =
+            BTreeSet::from(["api.example.com".into(), "unused.example.com".into()]);
+        let request = ActionPermissionRequest {
+            action_id: "summarize".into(),
+            required: BTreeSet::from([
+                PluginCapability::ReadClipContent,
+                PluginCapability::Network,
+            ]),
+            network_hosts: BTreeSet::from(["api.example.com".into()]),
+            file_paths: BTreeSet::new(),
+            process_commands: BTreeSet::new(),
+        };
+        let grant = ActionCapabilityGrant {
+            plugin_id: manifest.id.clone(),
+            manifest_hash: manifest.hash().unwrap(),
+            action_id: request.action_id.clone(),
+            granted: request.required.clone(),
+            network_hosts: request.network_hosts.clone(),
+            file_paths: BTreeSet::new(),
+            process_commands: BTreeSet::new(),
+        };
+        assert!(grant.authorize(&manifest, &request).is_ok());
+
+        let mut overbroad = grant;
+        overbroad.network_hosts.insert("unused.example.com".into());
+        assert!(overbroad.authorize(&manifest, &request).is_err());
     }
 }

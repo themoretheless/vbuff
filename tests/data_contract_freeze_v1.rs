@@ -7,7 +7,10 @@ use vbuff_types::Flavor;
 
 #[test]
 fn data_contract_v1_golden_vectors_are_frozen() {
-    assert_eq!(vbuff_store::SCHEMA_VERSION, 5);
+    assert_eq!(vbuff_store::DATA_CONTRACT_V1_SCHEMA_VERSION, 5);
+    const {
+        assert!(vbuff_store::SCHEMA_VERSION >= vbuff_store::DATA_CONTRACT_V1_SCHEMA_VERSION);
+    }
 
     let flavors = [
         Flavor::inline("text/html", b"<b>hello</b>".to_vec()),

@@ -16,12 +16,19 @@ use thiserror::Error;
 
 pub use adapter::{ExportAdapter, ExportRecord, ImportAdapter, ImportRecord};
 pub use bundle::{LockedPlugin, PluginBundle, PluginLock, SignedBundle};
-pub use manifest::{CapabilityGrant, PluginCapability, PluginManifest};
+pub use manifest::{
+    ActionCapabilityGrant, ActionPermissionRequest, CapabilityGrant, PluginCapability,
+    PluginManifest,
+};
 pub use migration::{
     ImportBatchJournal, LiveMigrationTracker, MigrationPreflight, MigrationRecord, RollbackPlan,
 };
 pub use offline::{OfflineRunEvidence, SignedOfflineAttestation};
-pub use pipeline::{Pipeline, PipelinePreview, TransformSpec, TypedValue, ValueType};
+pub use pipeline::{
+    ExplainedPipelinePreview, Pipeline, PipelineBuilder, PipelineEdge, PipelineExplanation,
+    PipelineGraph, PipelineNode, PipelinePreview, PipelineStepExplanation, TransformSpec,
+    TypedValue, ValueType,
+};
 pub use recipes::{STARTER_RECIPES, StarterRecipe, StarterRecipeId, apply_starter_recipe};
 pub use recognizer::{ActionCandidate, Recognizer, RecognizerInput, TypedAction, run_recognizer};
 pub use snippet_pack::{SignedSnippetPack, SnippetDefinition, SnippetPack};

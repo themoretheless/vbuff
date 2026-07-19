@@ -78,6 +78,16 @@ impl TransformSpec {
         self.input_type()
     }
 
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::TrimText => "Trim whitespace",
+            Self::UppercaseText => "Uppercase",
+            Self::PrefixText { .. } => "Add prefix",
+            Self::NormalizeUrl => "Normalize URL",
+            Self::PrettyJson => "Format JSON",
+        }
+    }
+
     fn apply(&self, value: TypedValue) -> Result<TypedValue> {
         if value.kind != self.input_type() {
             return Err(PluginError::TypeMismatch(format!(
@@ -152,21 +162,7 @@ impl Pipeline {
     }
 
     pub fn execute(&self, input: TypedValue) -> Result<TypedValue> {
-        if input.kind != self.input_type {
-            return Err(PluginError::TypeMismatch(format!(
-                "pipeline expects {:?}, received {:?}",
-                self.input_type, input.kind
-            )));
-        }
-        if input.bytes.len() > MAX_VALUE_BYTES
-            || input.mime.is_empty()
-            || input.mime.len() > 256
-            || input.mime.chars().any(char::is_control)
-        {
-            return Err(PluginError::InvalidInput(
-                "input value exceeds its contract".into(),
-            ));
-        }
+        self.validate_input(&input)?;
         self.steps
             .iter()
             .try_fold(input, |value, step| step.apply(value))
@@ -192,6 +188,208 @@ impl Pipeline {
             bounded_preview: preview,
         })
     }
+
+    pub fn dry_run_explained(
+        &self,
+        input: &TypedValue,
+        preview_bytes: usize,
+    ) -> Result<ExplainedPipelinePreview> {
+        self.validate_input(input)?;
+        if preview_bytes > MAX_PREVIEW_BYTES {
+            return Err(PluginError::InvalidInput(
+                "preview exceeds the byte limit".into(),
+            ));
+        }
+
+        let mut current = input.clone();
+        let mut steps = Vec::with_capacity(self.steps.len());
+        for (index, transform) in self.steps.iter().enumerate() {
+            let input_bytes = current.bytes.len() as u64;
+            let input_hash = *blake3::hash(&current.bytes).as_bytes();
+            let output = transform.apply(current)?;
+            let output_hash = *blake3::hash(&output.bytes).as_bytes();
+            steps.push(PipelineStepExplanation {
+                index,
+                label: transform.label().into(),
+                input_type: transform.input_type(),
+                output_type: transform.output_type(),
+                input_bytes,
+                output_bytes: output.bytes.len() as u64,
+                changed: input_hash != output_hash,
+            });
+            current = output;
+        }
+
+        let changed = current != *input;
+        let output_hash = *blake3::hash(&current.bytes).as_bytes();
+        let mut bounded_preview = String::from_utf8_lossy(&current.bytes).into_owned();
+        truncate_utf8(&mut bounded_preview, preview_bytes);
+        Ok(ExplainedPipelinePreview {
+            preview: PipelinePreview {
+                output_type: current.kind,
+                output_mime: current.mime,
+                output_bytes: current.bytes.len() as u64,
+                output_hash,
+                changed,
+                bounded_preview,
+            },
+            explanation: PipelineExplanation {
+                input_type: self.input_type,
+                output_type: current.kind,
+                input_bytes: input.bytes.len() as u64,
+                output_bytes: current.bytes.len() as u64,
+                changed,
+                steps,
+            },
+        })
+    }
+
+    pub fn graph(&self) -> PipelineGraph {
+        PipelineGraph::from_steps(self.input_type, &self.steps)
+    }
+
+    pub const fn input_type(&self) -> ValueType {
+        self.input_type
+    }
+
+    pub fn steps(&self) -> &[TransformSpec] {
+        &self.steps
+    }
+
+    fn validate_input(&self, input: &TypedValue) -> Result<()> {
+        if input.kind != self.input_type {
+            return Err(PluginError::TypeMismatch(format!(
+                "pipeline expects {:?}, received {:?}",
+                self.input_type, input.kind
+            )));
+        }
+        if input.bytes.len() > MAX_VALUE_BYTES
+            || input.mime.is_empty()
+            || input.mime.len() > 256
+            || input.mime.chars().any(char::is_control)
+        {
+            return Err(PluginError::InvalidInput(
+                "input value exceeds its contract".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineBuilder {
+    input_type: ValueType,
+    steps: Vec<TransformSpec>,
+}
+
+impl PipelineBuilder {
+    pub const fn new(input_type: ValueType) -> Self {
+        Self {
+            input_type,
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn from_pipeline(pipeline: &Pipeline) -> Self {
+        Self {
+            input_type: pipeline.input_type,
+            steps: pipeline.steps.clone(),
+        }
+    }
+
+    pub fn insert(&mut self, index: usize, transform: TransformSpec) -> Result<()> {
+        if index > self.steps.len() || self.steps.len() >= MAX_PIPELINE_STEPS {
+            return Err(PluginError::InvalidInput(
+                "pipeline insertion is outside the step limit".into(),
+            ));
+        }
+        let mut candidate = self.steps.clone();
+        candidate.insert(index, transform);
+        Pipeline::new(self.input_type, candidate.clone())?;
+        self.steps = candidate;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, index: usize) -> Result<TransformSpec> {
+        if index >= self.steps.len() {
+            return Err(PluginError::InvalidInput(
+                "pipeline step was not found".into(),
+            ));
+        }
+        Ok(self.steps.remove(index))
+    }
+
+    pub fn move_step(&mut self, from: usize, to: usize) -> Result<()> {
+        if from >= self.steps.len() || to >= self.steps.len() {
+            return Err(PluginError::InvalidInput(
+                "pipeline move is outside the step range".into(),
+            ));
+        }
+        let mut candidate = self.steps.clone();
+        let transform = candidate.remove(from);
+        candidate.insert(to, transform);
+        Pipeline::new(self.input_type, candidate.clone())?;
+        self.steps = candidate;
+        Ok(())
+    }
+
+    pub fn graph(&self) -> PipelineGraph {
+        PipelineGraph::from_steps(self.input_type, &self.steps)
+    }
+
+    pub fn build(&self) -> Result<Pipeline> {
+        Pipeline::new(self.input_type, self.steps.clone())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineGraph {
+    pub input_type: ValueType,
+    pub output_type: ValueType,
+    pub nodes: Vec<PipelineNode>,
+    pub edges: Vec<PipelineEdge>,
+}
+
+impl PipelineGraph {
+    fn from_steps(input_type: ValueType, steps: &[TransformSpec]) -> Self {
+        let nodes = steps
+            .iter()
+            .enumerate()
+            .map(|(index, transform)| PipelineNode {
+                id: index as u16,
+                label: transform.label().into(),
+                input_type: transform.input_type(),
+                output_type: transform.output_type(),
+            })
+            .collect::<Vec<_>>();
+        let edges = (1..nodes.len())
+            .map(|index| PipelineEdge {
+                from: (index - 1) as u16,
+                to: index as u16,
+            })
+            .collect();
+        let output_type = steps.last().map_or(input_type, TransformSpec::output_type);
+        Self {
+            input_type,
+            output_type,
+            nodes,
+            edges,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineNode {
+    pub id: u16,
+    pub label: String,
+    pub input_type: ValueType,
+    pub output_type: ValueType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineEdge {
+    pub from: u16,
+    pub to: u16,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -214,6 +412,43 @@ impl std::fmt::Debug for PipelinePreview {
             .field("output_hash", &"[redacted]")
             .field("changed", &self.changed)
             .field("bounded_preview", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineStepExplanation {
+    pub index: usize,
+    pub label: String,
+    pub input_type: ValueType,
+    pub output_type: ValueType,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineExplanation {
+    pub input_type: ValueType,
+    pub output_type: ValueType,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub changed: bool,
+    pub steps: Vec<PipelineStepExplanation>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExplainedPipelinePreview {
+    pub preview: PipelinePreview,
+    pub explanation: PipelineExplanation,
+}
+
+impl std::fmt::Debug for ExplainedPipelinePreview {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExplainedPipelinePreview")
+            .field("preview", &self.preview)
+            .field("explanation", &self.explanation)
             .finish()
     }
 }
@@ -281,5 +516,36 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{pipeline:?}").contains("private prefix"));
+    }
+
+    #[test]
+    fn visual_builder_exposes_a_typed_linear_graph() {
+        let mut builder = PipelineBuilder::new(ValueType::Text);
+        builder.insert(0, TransformSpec::TrimText).unwrap();
+        builder.insert(1, TransformSpec::UppercaseText).unwrap();
+        builder.move_step(1, 0).unwrap();
+        let graph = builder.graph();
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges, vec![PipelineEdge { from: 0, to: 1 }]);
+        assert_eq!(builder.build().unwrap().steps().len(), 2);
+    }
+
+    #[test]
+    fn explained_dry_run_reports_each_change_without_content() {
+        let pipeline = Pipeline::new(
+            ValueType::Text,
+            vec![TransformSpec::TrimText, TransformSpec::UppercaseText],
+        )
+        .unwrap();
+        let input = TypedValue {
+            kind: ValueType::Text,
+            mime: "text/plain".into(),
+            bytes: b"  private value  ".to_vec(),
+        };
+        let explained = pipeline.dry_run_explained(&input, 7).unwrap();
+        assert_eq!(explained.explanation.steps.len(), 2);
+        assert!(explained.explanation.steps.iter().all(|step| step.changed));
+        assert_eq!(explained.preview.bounded_preview, "PRIVATE");
+        assert!(!format!("{explained:?}").contains("private value"));
     }
 }

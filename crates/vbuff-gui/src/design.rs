@@ -5,9 +5,8 @@ use egui::{
     WidgetType,
 };
 
-pub(crate) const POPUP_SIZE: [f32; 2] = [560.0, 620.0];
-pub(crate) const POPUP_MIN_SIZE: [f32; 2] = [420.0, 420.0];
-pub(crate) const ROW_HEIGHT: f32 = 58.0;
+pub(crate) const POPUP_SIZE: [f32; 2] = [820.0, 620.0];
+pub(crate) const POPUP_MIN_SIZE: [f32; 2] = [520.0, 420.0];
 pub(crate) const ROW_MARGIN: f32 = 7.0;
 pub(crate) const THUMBNAIL_SIZE: f32 = 40.0;
 pub(crate) const ICON_BUTTON_SIZE: f32 = 28.0;
@@ -28,6 +27,10 @@ pub(crate) enum Icon {
     Up,
     Down,
     Duplicate,
+    Menu,
+    Preview,
+    Eye,
+    Undo,
 }
 
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -72,6 +75,10 @@ pub(crate) fn icon_button(
         Icon::Up => draw_chevron(ui, center, stroke, -1.0),
         Icon::Down => draw_chevron(ui, center, stroke, 1.0),
         Icon::Duplicate => draw_duplicate(ui, center, stroke),
+        Icon::Menu => draw_menu(ui, center, stroke),
+        Icon::Preview => draw_preview(ui, center, stroke),
+        Icon::Eye => draw_eye(ui, center, stroke),
+        Icon::Undo => draw_undo(ui, center, stroke),
     }
 
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), tooltip));
@@ -281,4 +288,54 @@ fn draw_duplicate(ui: &Ui, center: Pos2, stroke: Stroke) {
         .rect_filled(front, 1.0, ui.visuals().panel_fill);
     ui.painter()
         .rect_stroke(front, 1.0, stroke, StrokeKind::Inside);
+}
+
+fn draw_menu(ui: &Ui, center: Pos2, stroke: Stroke) {
+    for offset in [-5.0, 0.0, 5.0] {
+        ui.painter()
+            .circle_filled(center + egui::vec2(offset, 0.0), 1.5, stroke.color);
+    }
+}
+
+fn draw_preview(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let points = vec![
+        center + egui::vec2(-7.0, 0.0),
+        center + egui::vec2(-3.0, -4.0),
+        center + egui::vec2(3.0, -4.0),
+        center + egui::vec2(7.0, 0.0),
+        center + egui::vec2(3.0, 4.0),
+        center + egui::vec2(-3.0, 4.0),
+    ];
+    ui.painter().add(Shape::closed_line(points, stroke));
+    ui.painter().circle_stroke(center, 2.0, stroke);
+}
+
+fn draw_eye(ui: &Ui, center: Pos2, stroke: Stroke) {
+    draw_preview(ui, center, stroke);
+}
+
+fn draw_undo(ui: &Ui, center: Pos2, stroke: Stroke) {
+    ui.painter().add(Shape::line(
+        vec![
+            center + egui::vec2(5.5, 4.5),
+            center + egui::vec2(4.0, -2.0),
+            center + egui::vec2(-3.5, -3.0),
+            center + egui::vec2(-6.0, 1.0),
+        ],
+        stroke,
+    ));
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-6.0, 1.0),
+            center + egui::vec2(-5.5, -5.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-6.0, 1.0),
+            center + egui::vec2(0.0, 0.5),
+        ],
+        stroke,
+    );
 }

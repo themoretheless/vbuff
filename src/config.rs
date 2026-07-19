@@ -51,6 +51,8 @@ pub struct Config {
     pub strict_security_mode: bool,
     /// Register vbuff to launch when the user logs in.
     pub launch_at_login: bool,
+    /// The summon-shortcut coachmark has been acknowledged on this profile.
+    pub hotkey_coachmark_seen: bool,
 }
 
 impl fmt::Debug for Config {
@@ -73,6 +75,7 @@ impl fmt::Debug for Config {
             .field("memory_hard_limit_mb", &self.memory_hard_limit_mb)
             .field("strict_security_mode", &self.strict_security_mode)
             .field("launch_at_login", &self.launch_at_login)
+            .field("hotkey_coachmark_seen", &self.hotkey_coachmark_seen)
             .finish()
     }
 }
@@ -96,6 +99,7 @@ impl Default for Config {
             memory_hard_limit_mb: 1_024,
             strict_security_mode: false,
             launch_at_login: false,
+            hotkey_coachmark_seen: false,
         }
     }
 }

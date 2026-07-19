@@ -155,6 +155,11 @@ impl Runtime {
             }
         });
 
+        if let Ok(mut state) = shared.lock() {
+            state.hotkey_label = Some(config.hotkey.clone());
+            state.show_hotkey_coachmark = !config.hotkey_coachmark_seen;
+        }
+
         Self {
             history,
             popup: PopupApp::new(Arc::clone(&shared)),
@@ -299,6 +304,15 @@ impl Runtime {
                     tracing::warn!("deleting clip failed: {error}");
                 }
             },
+            AppCommand::RestoreClip(clip) => {
+                match self.history.insert(&clip, self.config.max_history) {
+                    Ok(()) => self.notice(NoticeLevel::Info, "Clip restored"),
+                    Err(error) => {
+                        self.notice(NoticeLevel::Error, "Couldn't restore the clip");
+                        tracing::warn!("restoring deleted clip failed: {error}");
+                    }
+                }
+            }
             #[cfg(feature = "tray")]
             AppCommand::RequestClearHistory => {
                 self.popup.request_clear_history_confirmation(ctx);
@@ -336,6 +350,15 @@ impl Runtime {
             #[cfg(feature = "tray")]
             AppCommand::ToggleAutostart => self.toggle_autostart(),
             AppCommand::DismissNotice => self.clear_notice(),
+            AppCommand::DismissHotkeyCoachmark => {
+                self.config.hotkey_coachmark_seen = true;
+                if let Ok(mut state) = self.shared.lock() {
+                    state.show_hotkey_coachmark = false;
+                }
+                if let Err(error) = self.config.save() {
+                    tracing::warn!("saving hotkey coachmark state failed: {error}");
+                }
+            }
             AppCommand::Hide => {}
             #[cfg(feature = "tray")]
             AppCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -381,14 +404,18 @@ impl Runtime {
 
     fn poll_pending_paste(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        if let Some(result) = self.paste.poll(now)
-            && let Err(error) = result
-        {
-            self.notice(
-                NoticeLevel::Error,
-                "Automatic paste failed; the clip remains copied",
-            );
-            tracing::warn!("paste-back failed: {error}");
+        if let Some(result) = self.paste.poll(now) {
+            match result {
+                Ok(()) => self.announce("Paste complete"),
+                Err(error) => {
+                    self.notice(
+                        NoticeLevel::Error,
+                        "Automatic paste failed; the clip remains copied",
+                    );
+                    self.announce("Automatic paste failed; clip remains copied");
+                    tracing::warn!("paste-back failed: {error}");
+                }
+            }
         }
         if self.paste.wait_duration(now).is_some() {
             ctx.request_repaint_after(PASTE_REPAINT_INTERVAL);
@@ -452,5 +479,11 @@ impl Runtime {
 
     fn clear_notice(&self) {
         self.diagnostics.clear_notice();
+    }
+
+    fn announce(&self, message: &'static str) {
+        if let Ok(mut state) = self.shared.lock() {
+            state.announce(message);
+        }
     }
 }

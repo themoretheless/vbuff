@@ -29,6 +29,8 @@ ulid = { version = "1.2", features = ["serde"] }
 blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+similar = "3.1.1"
+web-time = "1.1.0"
 url = "2"
 semver = { version = "1", features = ["serde"] }
 
@@ -37,6 +39,7 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["backup",
 
 # GUI
 eframe = { version = "0.32", default-features = false, features = [
+    "accesskit",
     "default_fonts",
     "glow",
     "wayland",

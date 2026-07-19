@@ -33,17 +33,25 @@ use vbuff_types::{
 mod cas;
 mod error;
 mod image_fingerprint;
+mod lifecycle;
 mod migration;
 mod search;
 mod serde_clip;
 
 pub use error::StoreError;
+pub use lifecycle::{
+    DeletionReason, GraceBinEntry, MergeLedgerEntry, RetentionReport, RetentionRule,
+    RetentionScope, SuggestedPin, normalized_text_fingerprint,
+};
 
 /// Result type for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Schema frozen by the original v1 data-contract fixture.
+pub const DATA_CONTRACT_V1_SCHEMA_VERSION: i64 = 5;
+
 /// The current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StoreOpenProfile {
@@ -289,6 +297,7 @@ impl Store {
         };
         store.migrate()?;
         store.backfill_fingerprints(32)?;
+        store.backfill_normalized_fingerprints(128)?;
         store.rebuild_dedup_filter()?;
         store.gc_blobs()?;
         Ok(store)
@@ -363,6 +372,14 @@ impl Store {
                 ALTER TABLE clips ADD COLUMN item_text TEXT NOT NULL DEFAULT '';
                 "#,
             )?;
+        }
+        let normalized_hash_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clips') WHERE name = 'normalized_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        if version < 6 && !normalized_hash_exists {
+            conn.execute("ALTER TABLE clips ADD COLUMN normalized_hash BLOB", [])?;
         }
         if version == 3 {
             conn.execute_batch(
@@ -479,6 +496,38 @@ impl Store {
                 row_json TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS dedup_merge_ledger (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                merged_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dedup_merge_clip
+                ON dedup_merge_ledger(clip_id, merged_at DESC, event_seq DESC);
+
+            CREATE TABLE IF NOT EXISTS grace_bin (
+                recovery_id TEXT PRIMARY KEY,
+                clip_id TEXT NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                purge_after INTEGER NOT NULL,
+                reason INTEGER NOT NULL CHECK(reason BETWEEN 0 AND 2),
+                nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+                ciphertext BLOB NOT NULL CHECK(length(ciphertext) >= 16)
+            );
+            CREATE INDEX IF NOT EXISTS idx_grace_bin_expiry
+                ON grace_bin(purge_after, recovery_id);
+
+            CREATE TABLE IF NOT EXISTS retention_rules (
+                kind INTEGER NOT NULL,
+                sensitive INTEGER NOT NULL CHECK(sensitive IN (0, 1)),
+                max_age_ms INTEGER,
+                max_items INTEGER,
+                grace_ms INTEGER NOT NULL CHECK(grace_ms >= 0),
+                PRIMARY KEY(kind, sensitive),
+                CHECK(max_age_ms IS NOT NULL OR max_items IS NOT NULL),
+                CHECK(max_age_ms IS NULL OR max_age_ms > 0),
+                CHECK(max_items IS NULL OR max_items >= 0)
+            ) WITHOUT ROWID;
+
             CREATE INDEX IF NOT EXISTS idx_clips_simhash ON clips(simhash);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b0 ON clips(simhash_b0);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b1 ON clips(simhash_b1);
@@ -489,6 +538,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_clips_dhash_b1 ON clips(dhash_b1);
             CREATE INDEX IF NOT EXISTS idx_clips_dhash_b2 ON clips(dhash_b2);
             CREATE INDEX IF NOT EXISTS idx_clips_dhash_b3 ON clips(dhash_b3);
+            CREATE INDEX IF NOT EXISTS idx_clips_normalized_hash
+                ON clips(normalized_hash, updated_at DESC)
+                WHERE normalized_hash IS NOT NULL;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS clip_fts_prose
                 USING fts5(item_text, tokenize='unicode61 remove_diacritics 2');
@@ -565,6 +617,23 @@ impl Store {
             END;
             "#,
         )?;
+        for rule in lifecycle::default_retention_rules() {
+            let (kind, sensitive) = rule.scope.database_values();
+            conn.execute(
+                r#"
+                INSERT OR IGNORE INTO retention_rules(
+                    kind, sensitive, max_age_ms, max_items, grace_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    kind,
+                    sensitive as i64,
+                    rule.max_age.map(duration_millis_i64).transpose()?,
+                    rule.max_items.map(|items| items as i64),
+                    duration_millis_i64(rule.grace_window)?,
+                ],
+            )?;
+        }
         conn.execute_batch(
             r#"
             UPDATE clips
@@ -714,6 +783,50 @@ impl Store {
         Ok(count)
     }
 
+    /// Backfill a bounded number of cosmetic-variant fingerprints.
+    pub fn backfill_normalized_fingerprints(&self, limit: usize) -> Result<usize> {
+        let limit = limit.min(512);
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, content_hash, flavors, kind, created_at, updated_at,
+                   byte_size, source_app, metadata_json, pinned, favorite
+            FROM clips
+            WHERE normalized_hash IS NULL
+              AND kind IN (0, 1, 2, 5, 6, 7)
+              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
+            ORDER BY updated_at DESC, seq DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map([limit as i64], row_to_clip)?;
+        let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut pending = Vec::with_capacity(raw.len());
+        for row in raw {
+            let mut clip = raw_to_clip(row)?;
+            self.hydrate_clip(&mut clip)?;
+            let fingerprint = clip
+                .primary_text()
+                .and_then(lifecycle::normalized_text_fingerprint)
+                .map(|hash| hash.to_vec())
+                .unwrap_or_default();
+            pending.push((clip.id.to_string_repr(), fingerprint));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        for (id, fingerprint) in &pending {
+            transaction.execute(
+                "UPDATE clips SET normalized_hash = ?1 WHERE id = ?2",
+                params![fingerprint, id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(pending.len())
+    }
+
     /// Insert a clip, deduplicating by content hash.
     ///
     /// If a clip with the same `content_hash` already exists, its `updated_at`
@@ -799,6 +912,12 @@ impl Store {
                 .map(|text| extract_facets(text, clip.meta.kind, false))
                 .unwrap_or_default()
         };
+        let normalized_hash = (!effective_meta.sensitive)
+            .then(|| {
+                clip.primary_text()
+                    .and_then(lifecycle::normalized_text_fingerprint)
+            })
+            .flatten();
         let transaction = self.conn.unchecked_transaction()?;
 
         if let Some((id_str, _)) = existing {
@@ -817,8 +936,9 @@ impl Store {
                     simhash = ?7, simhash_b0 = ?8, simhash_b1 = ?9,
                     simhash_b2 = ?10, simhash_b3 = ?11,
                     dhash = ?12, dhash_b0 = ?13, dhash_b1 = ?14,
-                    dhash_b2 = ?15, dhash_b3 = ?16
-                WHERE id = ?17
+                    dhash_b2 = ?15, dhash_b3 = ?16,
+                    normalized_hash = ?17
+                WHERE id = ?18
                 "#,
                 params![
                     now,
@@ -837,8 +957,13 @@ impl Store {
                     dhash_bands.map(|bands| i64::from(bands[1])),
                     dhash_bands.map(|bands| i64::from(bands[2])),
                     dhash_bands.map(|bands| i64::from(bands[3])),
+                    normalized_hash.map(|hash| hash.to_vec()),
                     id_str,
                 ],
+            )?;
+            transaction.execute(
+                "INSERT INTO dedup_merge_ledger(clip_id, merged_at) VALUES (?1, ?2)",
+                params![id_str, now],
             )?;
             transaction.execute("DELETE FROM clip_facets WHERE clip_id = ?1", [&id_str])?;
             for facet in &facets {
@@ -880,9 +1005,11 @@ impl Store {
                 (id, content_hash, flavors, kind, created_at, updated_at,
                  byte_size, source_app, preview, item_text, metadata_json, expires_at,
                  simhash, simhash_b0, simhash_b1, simhash_b2, simhash_b3,
-                 dhash, dhash_b0, dhash_b1, dhash_b2, dhash_b3, pinned, favorite)
+                 dhash, dhash_b0, dhash_b1, dhash_b2, dhash_b3,
+                 normalized_hash, pinned, favorite)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
+                    ?23, ?24, ?25)
             "#,
             params![
                 clip.id.to_string_repr(),
@@ -907,6 +1034,7 @@ impl Store {
                 dhash_bands.map(|bands| i64::from(bands[1])),
                 dhash_bands.map(|bands| i64::from(bands[2])),
                 dhash_bands.map(|bands| i64::from(bands[3])),
+                normalized_hash.map(|hash| hash.to_vec()),
                 clip.pinned as i64,
                 clip.favorite as i64,
             ],
@@ -953,6 +1081,229 @@ impl Store {
     /// Load the most recent clips (alias used at startup to hydrate the GUI).
     pub fn load_recent(&self, limit: usize) -> Result<Vec<Clip>> {
         self.list(limit)
+    }
+
+    /// Return byte-distinct clips in the same cosmetic-text group.
+    pub fn near_duplicate_group(&self, id: ClipId, limit: usize) -> Result<Vec<Clip>> {
+        let fingerprint: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT normalized_hash FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(fingerprint) = fingerprint else {
+            return Ok(Vec::new());
+        };
+        if fingerprint.len() != 32 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, content_hash, flavors, kind, created_at, updated_at,
+                   byte_size, source_app, metadata_json, pinned, favorite
+            FROM clips
+            WHERE normalized_hash = ?1
+            ORDER BY updated_at DESC, seq DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![fingerprint, limit.clamp(1, 512) as i64],
+            row_to_clip,
+        )?;
+        let mut clips = collect_clips(rows)?;
+        self.hydrate_clips(&mut clips)?;
+        Ok(clips)
+    }
+
+    /// Return the newest exact-dedup events for one canonical clip.
+    pub fn merge_ledger(&self, id: ClipId, limit: usize) -> Result<Vec<MergeLedgerEntry>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT merged_at
+            FROM dedup_merge_ledger
+            WHERE clip_id = ?1
+            ORDER BY merged_at DESC, event_seq DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![id.to_string_repr(), limit.min(1_000) as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut entries = Vec::new();
+        for merged_at in rows {
+            entries.push(MergeLedgerEntry {
+                clip_id: id,
+                merged_at: datetime_from_millis(merged_at?)?,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Suggest frequently reused, non-sensitive clips that are not pinned.
+    pub fn suggested_pins(&self, minimum_reuses: usize, limit: usize) -> Result<Vec<SuggestedPin>> {
+        if minimum_reuses < 2 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT c.id, COUNT(l.event_seq) + 1 AS reuse_count,
+                   COALESCE(MAX(l.merged_at), c.updated_at) AS last_reused_at
+            FROM clips AS c
+            JOIN dedup_merge_ledger AS l ON l.clip_id = c.id
+            WHERE c.pinned = 0
+              AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
+            GROUP BY c.id
+            HAVING COUNT(l.event_seq) + 1 >= ?1
+            ORDER BY reuse_count DESC, last_reused_at DESC, c.seq DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![minimum_reuses as i64, limit.min(100) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut suggestions = Vec::new();
+        for row in rows {
+            let (id, reuse_count, last_reused_at) = row?;
+            suggestions.push(SuggestedPin {
+                clip_id: ClipId::parse(&id)
+                    .map_err(|_| StoreError::Corrupt("bad ulid in merge ledger".into()))?,
+                reuse_count: reuse_count.max(0) as u64,
+                last_reused_at: datetime_from_millis(last_reused_at)?,
+            });
+        }
+        Ok(suggestions)
+    }
+
+    /// Persist one per-kind or sensitive-content retention rule.
+    pub fn set_retention_rule(&self, rule: &RetentionRule) -> Result<()> {
+        rule.validate()?;
+        let (kind, sensitive) = rule.scope.database_values();
+        self.conn.execute(
+            r#"
+            INSERT INTO retention_rules(kind, sensitive, max_age_ms, max_items, grace_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(kind, sensitive) DO UPDATE SET
+                max_age_ms = excluded.max_age_ms,
+                max_items = excluded.max_items,
+                grace_ms = excluded.grace_ms
+            "#,
+            params![
+                kind,
+                sensitive as i64,
+                rule.max_age.map(duration_millis_i64).transpose()?,
+                rule.max_items.map(|items| items as i64),
+                duration_millis_i64(rule.grace_window)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the complete effective retention policy in stable scope order.
+    pub fn retention_rules(&self) -> Result<Vec<RetentionRule>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT kind, sensitive, max_age_ms, max_items, grace_ms
+            FROM retention_rules
+            ORDER BY sensitive, kind
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut rules = Vec::new();
+        for row in rows {
+            let (kind, sensitive, max_age_ms, max_items, grace_ms) = row?;
+            if max_age_ms.is_some_and(|value| value <= 0)
+                || max_items.is_some_and(|value| value < 0)
+                || grace_ms < 0
+            {
+                return Err(StoreError::Corrupt("invalid stored retention rule".into()));
+            }
+            let rule = RetentionRule {
+                scope: RetentionScope::from_database(kind, sensitive)?,
+                max_age: max_age_ms.map(|value| Duration::from_millis(value as u64)),
+                max_items: max_items.map(|value| value as usize),
+                grace_window: Duration::from_millis(grace_ms as u64),
+            };
+            rule.validate()?;
+            rules.push(rule);
+        }
+        Ok(rules)
+    }
+
+    /// Apply configured per-kind retention in a bounded maintenance pass.
+    ///
+    /// A non-zero grace window fails closed when `grace_key` is absent: those
+    /// clips are reported as deferred instead of being hard-deleted.
+    pub fn enforce_retention(&self, grace_key: Option<&[u8; 32]>) -> Result<RetentionReport> {
+        self.purge_grace_bin()?;
+        let now = now_millis();
+        let mut candidates = BTreeMap::<String, Duration>::new();
+        let mut remaining_candidates = 0usize;
+        for rule in self.retention_rules()? {
+            let capacity = lifecycle::MAX_RETENTION_EVICTIONS.saturating_sub(candidates.len());
+            if capacity == 0 {
+                remaining_candidates = remaining_candidates.saturating_add(1);
+                break;
+            }
+            let ids = self.retention_candidates(&rule, now, capacity + 1)?;
+            if ids.len() > capacity {
+                remaining_candidates = remaining_candidates.saturating_add(ids.len() - capacity);
+            }
+            for id in ids.into_iter().take(capacity) {
+                candidates.entry(id).or_insert(rule.grace_window);
+            }
+        }
+
+        let mut report = RetentionReport {
+            remaining_candidates,
+            ..RetentionReport::default()
+        };
+        let mut deleted_any = false;
+        for (id, grace_window) in candidates {
+            let id = ClipId::parse(&id)
+                .map_err(|_| StoreError::Corrupt("bad ulid in retention query".into()))?;
+            if grace_window.is_zero() {
+                report.hard_deleted += self
+                    .conn
+                    .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+                deleted_any = true;
+            } else if let Some(key) = grace_key {
+                self.delete_with_grace_inner(
+                    id,
+                    key,
+                    grace_window,
+                    DeletionReason::Retention,
+                    false,
+                )?;
+                report.encrypted += 1;
+                deleted_any = true;
+            } else {
+                report.deferred_without_key += 1;
+            }
+        }
+        if deleted_any {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(report)
     }
 
     /// Search with an adaptive LIKE/FTS5 tier and structured facet filters.
@@ -1629,6 +1980,267 @@ impl Store {
         Ok(())
     }
 
+    /// Move one clip into the encrypted grace bin before deleting its live row.
+    ///
+    /// The key is borrowed for this call and is never persisted by the store.
+    pub fn delete_with_grace(
+        &self,
+        id: ClipId,
+        key: &[u8; 32],
+        window: Duration,
+        reason: DeletionReason,
+    ) -> Result<String> {
+        self.purge_grace_bin()?;
+        self.delete_with_grace_inner(id, key, window, reason, true)
+    }
+
+    fn delete_with_grace_inner(
+        &self,
+        id: ClipId,
+        key: &[u8; 32],
+        window: Duration,
+        reason: DeletionReason,
+        scrub_after: bool,
+    ) -> Result<String> {
+        let window_ms = duration_millis_i64(window)?;
+        if window_ms == 0 || window > Duration::from_secs(7 * 24 * 60 * 60) {
+            return Err(StoreError::Maintenance(
+                "grace-bin window must be between 1 ms and 7 days".into(),
+            ));
+        }
+        let mut clip = self
+            .load_clip_by_id(id)?
+            .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))?;
+        // Hydrate CAS payloads before their live reference is removed so the
+        // encrypted recovery record is self-contained.
+        self.hydrate_clip(&mut clip)?;
+        let deleted_at = now_millis();
+        let purge_after = deleted_at
+            .checked_add(window_ms)
+            .ok_or_else(|| StoreError::Maintenance("grace-bin expiry overflow".into()))?;
+        let recovery_id = ClipId::new().to_string_repr();
+        let (nonce, ciphertext) =
+            lifecycle::seal_clip(key, &recovery_id, &clip, deleted_at, purge_after, reason)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO grace_bin(
+                recovery_id, clip_id, deleted_at, purge_after, reason, nonce, ciphertext
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                recovery_id,
+                id.to_string_repr(),
+                deleted_at,
+                purge_after,
+                reason.as_i64(),
+                nonce.as_slice(),
+                ciphertext,
+            ],
+        )?;
+        let deleted =
+            transaction.execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+        if deleted != 1 {
+            return Err(StoreError::ClipNotFound(id.to_string_repr()));
+        }
+        transaction.commit()?;
+        if scrub_after {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(recovery_id)
+    }
+
+    /// List unexpired encrypted recovery records without decrypting content.
+    pub fn grace_bin(&self, limit: usize) -> Result<Vec<GraceBinEntry>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT recovery_id, clip_id, deleted_at, purge_after, reason
+            FROM grace_bin
+            WHERE purge_after > ?1
+            ORDER BY deleted_at DESC, recovery_id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![now_millis(), limit.min(1_000) as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (recovery_id, clip_id, deleted_at, purge_after, reason) = row?;
+            entries.push(GraceBinEntry {
+                recovery_id,
+                clip_id: ClipId::parse(&clip_id)
+                    .map_err(|_| StoreError::Corrupt("bad grace-bin clip id".into()))?,
+                deleted_at: datetime_from_millis(deleted_at)?,
+                purge_after: datetime_from_millis(purge_after)?,
+                reason: DeletionReason::from_i64(reason)?,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Decrypt, validate, and restore one grace-bin record.
+    pub fn restore_from_grace(&self, recovery_id: &str, key: &[u8; 32]) -> Result<ClipId> {
+        let row = self
+            .conn
+            .query_row(
+                r#"
+                SELECT clip_id, deleted_at, purge_after, reason, nonce, ciphertext
+                FROM grace_bin WHERE recovery_id = ?1
+                "#,
+                [recovery_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::ClipNotFound(recovery_id.to_owned()))?;
+        let (clip_id, deleted_at, purge_after, reason, nonce, ciphertext) = row;
+        if purge_after <= now_millis() {
+            self.conn.execute(
+                "DELETE FROM grace_bin WHERE recovery_id = ?1",
+                [recovery_id],
+            )?;
+            self.scrub_deleted_pages()?;
+            return Err(StoreError::ClipNotFound(recovery_id.to_owned()));
+        }
+        let clip = lifecycle::open_clip(
+            key,
+            &lifecycle::EncryptedGraceRecord {
+                recovery_id,
+                clip_id: &clip_id,
+                deleted_at_ms: deleted_at,
+                purge_after_ms: purge_after,
+                reason: DeletionReason::from_i64(reason)?,
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+            },
+        )?;
+        let restored_id = self.insert(&clip)?;
+        self.conn.execute(
+            "DELETE FROM grace_bin WHERE recovery_id = ?1",
+            [recovery_id],
+        )?;
+        self.scrub_deleted_pages()?;
+        Ok(restored_id)
+    }
+
+    /// Secure-delete expired encrypted recovery records.
+    pub fn purge_grace_bin(&self) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM grace_bin WHERE purge_after <= ?1",
+            [now_millis()],
+        )?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(deleted)
+    }
+
+    fn load_clip_by_id(&self, id: ClipId) -> Result<Option<Clip>> {
+        let raw = self
+            .conn
+            .query_row(
+                r#"
+                SELECT id, content_hash, flavors, kind, created_at, updated_at,
+                       byte_size, source_app, metadata_json, pinned, favorite
+                FROM clips WHERE id = ?1
+                "#,
+                [id.to_string_repr()],
+                row_to_clip,
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut clip = raw_to_clip(raw)?;
+        self.hydrate_clip(&mut clip)?;
+        Ok(Some(clip))
+    }
+
+    fn retention_candidates(
+        &self,
+        rule: &RetentionRule,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        rule.validate()?;
+        let (kind, sensitive) = rule.scope.database_values();
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(max_age) = rule.max_age {
+            let cutoff = now
+                .checked_sub(duration_millis_i64(max_age)?)
+                .ok_or_else(|| StoreError::Maintenance("retention cutoff overflow".into()))?;
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT id FROM clips
+                WHERE pinned = 0 AND favorite = 0
+                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                    OR (?1 = 0 AND kind = ?2
+                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
+                  AND updated_at < ?3
+                ORDER BY updated_at ASC, seq ASC
+                LIMIT ?4
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![sensitive as i64, kind, cutoff, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                let id = row?;
+                if seen.insert(id.clone()) {
+                    candidates.push(id);
+                }
+            }
+        }
+        if let Some(max_items) = rule.max_items
+            && candidates.len() < limit
+        {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT id FROM clips
+                WHERE pinned = 0 AND favorite = 0
+                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                    OR (?1 = 0 AND kind = ?2
+                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
+                ORDER BY updated_at DESC, seq DESC
+                LIMIT ?3 OFFSET ?4
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![
+                    sensitive as i64,
+                    kind,
+                    (limit - candidates.len()) as i64,
+                    max_items as i64,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                let id = row?;
+                if seen.insert(id.clone()) {
+                    candidates.push(id);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Apply all mutations in one SQLite transaction or roll every one back.
     pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction()?;
@@ -1991,6 +2603,16 @@ impl StoredMetadata {
 
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn datetime_from_millis(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_millis(value)
+        .ok_or_else(|| StoreError::Corrupt("timestamp is outside the supported range".into()))
+}
+
+fn duration_millis_i64(duration: Duration) -> Result<i64> {
+    i64::try_from(duration.as_millis())
+        .map_err(|_| StoreError::Maintenance("duration exceeds SQLite range".into()))
 }
 
 fn elapsed_ms(duration: Duration) -> u64 {
@@ -2938,5 +3560,137 @@ mod tests {
             store.capture_metrics().unwrap()["captured"],
             i64::MAX as u64
         );
+    }
+
+    #[test]
+    fn normalized_groups_preserve_byte_distinct_variants() {
+        let store = Store::open_in_memory().unwrap();
+        let first = make_clip("Hello,\nworld");
+        let second = make_clip(" hello , world ");
+        assert_ne!(first.content_hash, second.content_hash);
+
+        store.insert(&first).unwrap();
+        store.insert(&second).unwrap();
+
+        let group = store.near_duplicate_group(first.id, 10).unwrap();
+        assert_eq!(group.len(), 2);
+        assert_eq!(store.count().unwrap(), 2);
+        assert!(
+            group
+                .iter()
+                .any(|clip| clip.primary_text() == Some("Hello,\nworld"))
+        );
+        assert!(
+            group
+                .iter()
+                .any(|clip| clip.primary_text() == Some(" hello , world "))
+        );
+    }
+
+    #[test]
+    fn normalized_backfill_marks_unusable_text_as_scanned() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("   ");
+        store.insert(&clip).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET normalized_hash = NULL WHERE id = ?1",
+                [clip.id.to_string_repr()],
+            )
+            .unwrap();
+
+        assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 1);
+        assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 0);
+        assert!(store.near_duplicate_group(clip.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_dedup_records_reuse_and_suggests_a_pin() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("reuse this exact value");
+
+        let id = store.insert(&clip).unwrap();
+        assert_eq!(store.insert(&clip).unwrap(), id);
+        assert_eq!(store.insert(&clip).unwrap(), id);
+
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.merge_ledger(id, 10).unwrap().len(), 2);
+        assert_eq!(
+            store.suggested_pins(3, 10).unwrap(),
+            vec![SuggestedPin {
+                clip_id: id,
+                reuse_count: 3,
+                last_reused_at: store.merge_ledger(id, 1).unwrap()[0].merged_at,
+            }]
+        );
+        store.set_pinned(id, true).unwrap();
+        assert!(store.suggested_pins(2, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn encrypted_grace_bin_restores_exact_clip_and_rejects_wrong_key() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("recover this private payload");
+        let id = store.insert(&clip).unwrap();
+        let persisted = store.list(1).unwrap().remove(0);
+        let key = [19_u8; 32];
+
+        let recovery_id = store
+            .delete_with_grace(
+                id,
+                &key,
+                std::time::Duration::from_secs(60),
+                DeletionReason::User,
+            )
+            .unwrap();
+
+        assert_eq!(store.count().unwrap(), 0);
+        assert_eq!(store.grace_bin(10).unwrap()[0].clip_id, id);
+        let ciphertext: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM grace_bin WHERE recovery_id = ?1",
+                [&recovery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !ciphertext
+                .windows(b"private payload".len())
+                .any(|window| window == b"private payload")
+        );
+        assert!(store.restore_from_grace(&recovery_id, &[20; 32]).is_err());
+        assert_eq!(store.grace_bin(10).unwrap().len(), 1);
+
+        assert_eq!(store.restore_from_grace(&recovery_id, &key).unwrap(), id);
+        assert_eq!(store.list(1).unwrap()[0], persisted);
+        assert!(store.grace_bin(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retention_defers_grace_deletion_without_key_then_encrypts_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_retention_rule(&RetentionRule {
+                scope: RetentionScope::Kind(ContentKind::Text),
+                max_age: None,
+                max_items: Some(1),
+                grace_window: std::time::Duration::from_secs(60),
+            })
+            .unwrap();
+        for value in ["retention one", "retention two", "retention three"] {
+            store.insert(&make_clip(value)).unwrap();
+        }
+
+        let deferred = store.enforce_retention(None).unwrap();
+        assert_eq!(deferred.deferred_without_key, 2);
+        assert_eq!(store.count().unwrap(), 3);
+
+        let report = store.enforce_retention(Some(&[31; 32])).unwrap();
+        assert_eq!(report.encrypted, 2);
+        assert_eq!(report.hard_deleted, 0);
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.grace_bin(10).unwrap().len(), 2);
     }
 }

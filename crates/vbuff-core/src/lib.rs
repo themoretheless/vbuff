@@ -31,6 +31,7 @@ pub mod reliability;
 pub mod secret;
 pub mod security_audit;
 pub mod slo;
+pub mod workflow;
 
 pub use classify::detect_kind;
 pub use eviction::{EvictionPolicy, evict};

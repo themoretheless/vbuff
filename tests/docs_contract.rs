@@ -105,6 +105,10 @@ fn top_docs_link_every_complete_implementation_batch() {
             "docs/implementation-batch-151-200.md",
             (151..=200).collect::<Vec<_>>(),
         ),
+        (
+            "docs/implementation-batch-201-250.md",
+            (201..=250).collect::<Vec<_>>(),
+        ),
     ] {
         for file in TOP_DOCS {
             assert!(
@@ -182,27 +186,25 @@ fn research_catalog_has_exact_repository_and_source_ids() {
     assert_eq!(evidenced_items.len(), 100);
 
     for line in evidenced_items {
-        let evidence_ids: Vec<&str> = line
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-            .filter(|token| token.starts_with("GH-") || token.starts_with("S-"))
-            .collect();
-        assert!(
-            !evidence_ids.is_empty(),
-            "backlog item has no evidence id: {line}"
-        );
-        for id in evidence_ids {
-            let (prefix, number) = id
-                .split_once('-')
-                .unwrap_or_else(|| panic!("invalid evidence id {id}"));
-            let number: usize = number
-                .parse()
-                .unwrap_or_else(|error| panic!("invalid evidence id {id}: {error}"));
-            match prefix {
-                "GH" => assert!((1..=100).contains(&number), "unknown evidence id {id}"),
-                "S" => assert!((1..=26).contains(&number), "unknown evidence id {id}"),
-                _ => unreachable!(),
-            }
-        }
+        assert_evidence_ids(line);
+    }
+
+    let candidate_tail = read("docs/ideas-601-610.md");
+    let candidate_lines = candidate_tail
+        .lines()
+        .filter(|line| numbered_backlog_item(line).is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        candidate_lines
+            .iter()
+            .filter_map(|line| numbered_backlog_item(line))
+            .collect::<Vec<_>>(),
+        (601..=610).collect::<Vec<_>>()
+    );
+    assert_eq!(candidate_lines.len(), 10);
+    for line in candidate_lines {
+        assert!(line.contains("Evidence:"));
+        assert_evidence_ids(line);
     }
 }
 
@@ -218,7 +220,10 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
     assert!(readme.contains("Sixteen checked-in golden images"));
     assert!(readme.contains("docs/decision-gates-151-200.md"));
+    assert!(readme.contains("docs/decision-gates-201-250.md"));
     assert!(readme.contains("docs/data-contract-v1.md"));
+    assert!(readme.contains("docs/data-contract-v2.md"));
+    assert!(readme.contains("docs/ideas-601-610.md"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -228,8 +233,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("`crates/vbuff-types/src/status.rs`"));
     assert!(architecture.contains("| `src/single_instance/` |"));
     assert!(architecture.contains("`CaptureHealth::Stalled`"));
-    assert!(architecture.contains("schema v5"));
-    assert!(architecture.contains("History/Trust/Compose"));
+    assert!(architecture.contains("schema v6"));
+    assert!(architecture.contains("History/Compose/Trust/Settings"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
@@ -237,6 +242,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(recommendation.contains("one typed capture-health vocabulary"));
     assert!(recommendation.contains("pause-aware heartbeat/watchdog"));
     assert!(recommendation.contains("batch 151-200"));
+    assert!(recommendation.contains("batch 201-250"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
@@ -246,6 +252,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("native hook re-subscribe/auto-restart"));
     assert!(plan.contains("M6 -> M7 data-contract gate"));
     assert!(plan.contains("Unknown` is a release blocker"));
+    assert!(plan.contains("docs/ideas-601-610.md"));
 }
 
 #[test]
@@ -259,13 +266,17 @@ fn local_markdown_links_resolve() {
         "docs/ideas-301-400.md",
         "docs/ideas-401-500.md",
         "docs/ideas-501-600.md",
+        "docs/ideas-601-610.md",
         "docs/repositories-research-100.md",
         "docs/implementation-batch-001-050.md",
         "docs/implementation-batch-051-100.md",
         "docs/implementation-batch-101-150.md",
         "docs/implementation-batch-151-200.md",
+        "docs/implementation-batch-201-250.md",
         "docs/decision-gates-151-200.md",
+        "docs/decision-gates-201-250.md",
         "docs/data-contract-v1.md",
+        "docs/data-contract-v2.md",
         "docs/product-strategy-decisions.md",
     ];
 
@@ -307,6 +318,30 @@ fn numbered_table_id(line: &str, prefix: &str) -> Option<usize> {
     let value = line.strip_prefix("| ")?.strip_prefix(prefix)?;
     let (number, _) = value.split_once(" |")?;
     number.parse().ok()
+}
+
+fn assert_evidence_ids(line: &str) {
+    let evidence_ids = line
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .filter(|token| token.starts_with("GH-") || token.starts_with("S-"))
+        .collect::<Vec<_>>();
+    assert!(
+        !evidence_ids.is_empty(),
+        "backlog item has no evidence id: {line}"
+    );
+    for id in evidence_ids {
+        let (prefix, number) = id
+            .split_once('-')
+            .unwrap_or_else(|| panic!("invalid evidence id {id}"));
+        let number: usize = number
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid evidence id {id}: {error}"));
+        match prefix {
+            "GH" => assert!((1..=100).contains(&number), "unknown evidence id {id}"),
+            "S" => assert!((1..=26).contains(&number), "unknown evidence id {id}"),
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn markdown_link_targets(source: &str) -> Vec<&str> {

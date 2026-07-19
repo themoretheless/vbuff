@@ -6,7 +6,7 @@
 >
 > Sourcing note: the task referenced a separate "decision spine" file and a "pitfalls JSON" with `pitfallsExec`/`topMistakesSummary` keys. Those literal artifacts do not exist in the repo. The positioning, pillars, non-goals, roadmap phases, and success metrics are grounded in `architecture.md` (goals/non-goals, the four backend traits, the four-phase roadmap, the risks table) and `docs/competitive-analysis.md` (the four-corner wedge). Competitor mistakes and differentiators are grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the 122-item `docs/competitor-extras.md`. Feature tiers (MVP/v1/v2/future) come from `docs/features-top-500.md` (640 items) and the extras catalog.
 >
-> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, `vbuff-plugin`, and most of `vbuff-update` are tested foundations, not live network, extension, sync, or auto-update features. Items 1-200 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), and [batch 151-200](docs/implementation-batch-151-200.md). The fourth ledger separates active Compose/config/ask/privacy paths from AI/integration/sync foundations; numeric stop/go rules live in [decision gates](docs/decision-gates-151-200.md), and mutually exclusive pricing/licensing ideas remain resolved in [one decision record](docs/product-strategy-decisions.md).
+> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, `vbuff-plugin`, and most of `vbuff-update` are tested foundations, not live network, extension, sync, or auto-update features. Items 1-250 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), and [batch 201-250](docs/implementation-batch-201-250.md). The fifth ledger separates active popup/store behavior from workflow, plugin-host, native-caret, and OS-keystore foundations; stop/go rules live in [decision gates 151-200](docs/decision-gates-151-200.md) and [201-250](docs/decision-gates-201-250.md), and mutually exclusive pricing/licensing ideas remain resolved in [one decision record](docs/product-strategy-decisions.md).
 
 ---
 
@@ -288,8 +288,11 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/implementation-batch-051-100.md` - engineering items 51-100, current runtime/foundation status, remaining native/security/runtime dependencies, and review evidence
 - `docs/implementation-batch-101-150.md` - engineering/product items 101-150, Trust/release/migration/sync evidence, policy decisions, and three review passes
 - `docs/implementation-batch-151-200.md` - engineering/product items 151-200, privacy/AI and integration boundaries, delivery gates, Compose evidence, and three review passes
+- `docs/implementation-batch-201-250.md` - workflow, popup design/accessibility, store lifecycle, native/key-provider boundaries, and three review passes
 - `docs/decision-gates-151-200.md` - registered kill criteria, owner roles, fallback ladders, and external evidence requirements
+- `docs/decision-gates-201-250.md` - plugin, caret, accessibility, display, and encrypted-recovery activation gates
 - `docs/data-contract-v1.md` - frozen schema/hash/format/IPC fixtures and compatibility process
+- `docs/data-contract-v2.md` - schema 6 normalized-dedup, encrypted grace-bin, and retention compatibility process
 - `docs/product-strategy-decisions.md` - one coherent resolution for mutually exclusive licensing, pricing, and governance proposals 128-140
 - `docs/competitive-analysis.md` - competitor landscape and the four-corner wedge
 - `docs/competitor-extras.md` - the 122-item feature-gap sweep used in section 4
@@ -298,6 +301,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/ideas-301-400.md` - extended privacy, search, storage, platform, team, automation, and governance ideas 301-400
 - `docs/ideas-401-500.md` - review backlog: current implementation problems, SOLID/DRY refactors, testing gaps, design fixes, and roadmap hygiene
 - `docs/ideas-501-600.md` - evidence-backed native correctness, international text/search, security, local-first sync, and verification ideas
+- `docs/ideas-601-610.md` - ten post-600 research candidates outside the active 1-600 goal
 - `docs/repositories-research-100.md` - 100 high-signal repositories plus primary papers, standards, and concrete vbuff lessons
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
@@ -314,9 +318,10 @@ Execution follows the user's requested groups of 50. The strategy layer does not
 | 51-100 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-051-100.md); reliability/security runtime work is active, while native, encrypted-store, daemon, and WASM dependencies remain explicit |
 | 101-150 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-101-150.md); Trust/config/verify/CI paths are active, while updater, native conformance, migration, sync, and AI remain bounded foundations |
 | 151-200 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-151-200.md); Compose/config/ask/privacy paths are active, while models, extensions, mobile, daemon dispatch, sync, SQLCipher, and external evidence remain explicit |
-| 201-600 | Queued | Preserve the canonical priority and evidence links below |
+| 201-250 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-201-250.md); popup/store paths are active while visual pipelines, native caret acquisition, real AT evidence, and durable keystore-backed Undo remain explicit |
+| 251-600 | Queued | Preserve the canonical priority and evidence links below |
 
-The product cut line after the fourth batch is unchanged: finish trustworthy encrypted single-machine storage, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. The AI/sync/IPC/plugin/update foundations reduce later protocol risk; they do not justify turning on a model endpoint, network listener, WASM host, relay, or update fetcher early.
+The product cut line after the fifth batch is unchanged: finish trustworthy SQLCipher single-machine storage, OS-keystore key delivery, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. The AI/sync/IPC/plugin/update foundations reduce later protocol risk; they do not justify turning on a model endpoint, network listener, WASM host, relay, or update fetcher early.
 
 ---
 
@@ -332,6 +337,8 @@ The full 600-item review is shared with `README.md`, `architecture.md`, and `pla
 | 301-400 | [docs/ideas-301-400.md](docs/ideas-301-400.md) | Privacy controls, search, data model, platform fit, collaboration, automation |
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY cuts, testing gaps, design fixes, roadmap hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Repository/research-backed protocol correctness, Unicode/search, privacy, sync, testing, release evidence |
+
+The [post-600 candidates 601-610](docs/ideas-601-610.md) are research follow-ups only and do not change the active 1-600 sequence.
 
 ---
 

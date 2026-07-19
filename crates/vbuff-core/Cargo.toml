@@ -8,8 +8,11 @@ description = "Pure clipboard-history logic: hashing, dedup, eviction, search, c
 [dependencies]
 vbuff-types.workspace = true
 blake3.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+serde_json.workspace = true
+similar.workspace = true
 url.workspace = true
 hmac.workspace = true
 sha2.workspace = true

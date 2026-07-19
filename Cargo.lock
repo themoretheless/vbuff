@@ -585,6 +585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cee35f73844aa3014bb606320a6c1f010249dbdf43342fe54b5a4f6a8ed4b79"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4004,6 +4014,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "similar"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6505efef05804732ed8a3f2d4f279429eb485bd69d5b0cc6b19cc02005cda16"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4629,9 +4648,12 @@ name = "vbuff-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chrono",
  "hmac",
  "regex",
+ "serde_json",
  "sha2 0.10.9",
+ "similar",
  "thiserror 2.0.18",
  "ulid",
  "url",
@@ -4656,6 +4678,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -4716,7 +4739,9 @@ version = "0.1.0"
 dependencies = [
  "atomic-write-file",
  "blake3",
+ "chacha20poly1305",
  "chrono",
+ "getrandom 0.3.4",
  "image",
  "rusqlite",
  "serde",
@@ -4726,6 +4751,7 @@ dependencies = [
  "tracing",
  "vbuff-core",
  "vbuff-types",
+ "zeroize",
 ]
 
 [[package]]

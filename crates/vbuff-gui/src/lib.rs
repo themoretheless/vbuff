@@ -8,6 +8,7 @@
 mod app;
 mod demo;
 mod design;
+pub mod experience;
 mod state;
 mod view;
 

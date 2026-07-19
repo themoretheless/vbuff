@@ -16,6 +16,7 @@ use vbuff_types::{Clip, ClipId};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MaintenanceSummary {
     pub fingerprints: usize,
+    pub normalized_fingerprints: usize,
     pub embeddings: usize,
     pub audited: usize,
     pub repaired: usize,
@@ -125,6 +126,11 @@ impl History {
             } else {
                 0
             };
+            let normalized_fingerprints = if background_work {
+                store.backfill_normalized_fingerprints(32)?
+            } else {
+                0
+            };
             let embeddings = if background_work {
                 store.backfill_embeddings(32)?
             } else {
@@ -143,6 +149,7 @@ impl History {
             (
                 MaintenanceSummary {
                     fingerprints,
+                    normalized_fingerprints,
                     embeddings,
                     audited: audit.checked,
                     repaired: audit.repaired,

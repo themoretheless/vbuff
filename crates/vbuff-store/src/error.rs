@@ -36,4 +36,8 @@ pub enum StoreError {
     /// Privacy maintenance could not finish after a logical mutation.
     #[error("store maintenance error: {0}")]
     Maintenance(String),
+
+    /// Authenticated encryption, decryption, or entropy generation failed.
+    #[error("store cryptography error")]
+    Crypto,
 }

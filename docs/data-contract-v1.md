@@ -1,12 +1,12 @@
 # Data contract v1
 
-Frozen on 2026-07-18 before broader CLI, daemon IPC, and replication consumers attach. The executable oracle is `tests/data_contract_freeze_v1.rs`; this document explains what a deliberate change must preserve.
+Frozen on 2026-07-18 before broader CLI, daemon IPC, and replication consumers attach. The executable oracle is `tests/data_contract_freeze_v1.rs`; this document explains what a deliberate change must preserve. The current schema has advanced without rewriting this record; see [data contract v2](data-contract-v2.md).
 
 ## Frozen surfaces
 
 | Surface | v1 value | Compatibility rule |
 |---|---|---|
-| Store schema | `vbuff_store::SCHEMA_VERSION == 5` | A schema change requires a forward migration, prior-version fixture coverage, and a new recorded version. Never rewrite or wipe an unknown store. |
+| Store schema | `vbuff_store::DATA_CONTRACT_V1_SCHEMA_VERSION == 5` | A schema change requires a forward migration, prior-version fixture coverage, and a new recorded version. Never rewrite or wipe an unknown store. |
 | Content hash | BLAKE3 over the canonical flavor set. The HTML/plain fixture hashes to `db6a06a659f896aadf82f2d907704f2a9800748b5f799b3ee5f577cfec45f783`. | Flavor ordering and MIME normalization must not silently change identity. A new algorithm needs a versioned hash domain and mixed-version behavior. |
 | Format keys | Windows `CF_UNICODETEXT` -> `PlainText`; macOS `org.nspasteboard.ConcealedType` -> `Concealed`. | Add mappings compatibly. Reassigning an existing native key requires a new format-contract version and backend migration plan. |
 | IPC hello | `{"client_name":"contract-fixture","protocol":{"minimum":1,"maximum":1},"requested":["read_history","subscribe_events"]}` | Field names, enum spelling, capability order, and protocol range are wire behavior. Breaking serde changes require protocol negotiation and an old-reader test. |

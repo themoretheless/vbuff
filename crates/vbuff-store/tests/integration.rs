@@ -1,7 +1,7 @@
 //! Integration tests for `vbuff-store` against a real on-disk SQLite database.
 
 use vbuff_core::content_hash_from_flavors;
-use vbuff_store::Store;
+use vbuff_store::{DeletionReason, Store};
 use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
 
 fn make_clip(text: &str) -> Clip {
@@ -41,6 +41,42 @@ fn persists_across_reopen() {
     assert_eq!(store.count().unwrap(), 2);
     let listed = store.list(10).unwrap();
     assert_eq!(listed[0].primary_text(), Some("another clip"));
+}
+
+#[test]
+fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let clip = make_clip("schema five lifecycle migration");
+    {
+        let store = Store::open(&db).unwrap();
+        store.insert(&clip).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP INDEX idx_clips_normalized_hash;
+                DROP TABLE dedup_merge_ledger;
+                DROP TABLE grace_bin;
+                DROP TABLE retention_rules;
+                ALTER TABLE clips DROP COLUMN normalized_hash;
+                PRAGMA user_version = 5;
+                "#,
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.doctor().unwrap().schema_version, 6);
+    assert_eq!(
+        store.list(1).unwrap()[0].primary_text(),
+        clip.primary_text()
+    );
+    assert_eq!(store.retention_rules().unwrap().len(), 10);
+    assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 0);
+    assert_eq!(store.near_duplicate_group(clip.id, 10).unwrap().len(), 1);
 }
 
 #[test]
@@ -191,6 +227,52 @@ fn large_bodies_use_sharded_refcounted_cas_and_hydrate_on_read() {
     store.delete(clip.id).unwrap();
     assert_eq!(store.gc_blobs().unwrap(), 1);
     assert!(regular_files(&dir.path().join("blobs")).is_empty());
+}
+
+#[test]
+fn encrypted_grace_bin_is_self_contained_and_scrubs_large_cas_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    let canary = "VBUFF_GRACE_CAS_CANARY_91D4";
+    let text = canary.repeat(40_000);
+    let clip = make_clip(&text);
+    let key = [41_u8; 32];
+
+    store.insert(&clip).unwrap();
+    assert_eq!(regular_files(&dir.path().join("blobs")).len(), 1);
+    let recovery_id = store
+        .delete_with_grace(
+            clip.id,
+            &key,
+            std::time::Duration::from_secs(60),
+            DeletionReason::User,
+        )
+        .unwrap();
+    assert_eq!(store.gc_blobs().unwrap(), 1);
+    assert!(regular_files(&dir.path().join("blobs")).is_empty());
+
+    for path in [db.clone(), dir.path().join("history.db-wal")] {
+        if path.exists() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(canary.len())
+                    .any(|window| window == canary.as_bytes()),
+                "grace-bin plaintext remained in {}",
+                path.display()
+            );
+        }
+    }
+
+    assert_eq!(
+        store.restore_from_grace(&recovery_id, &key).unwrap(),
+        clip.id
+    );
+    assert_eq!(
+        store.list(1).unwrap()[0].primary_text(),
+        Some(text.as_str())
+    );
 }
 
 fn large_clip(kind: ContentKind, mime: &str, bytes: Vec<u8>) -> Clip {

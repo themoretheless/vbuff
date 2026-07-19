@@ -56,6 +56,7 @@ pub(crate) fn spawn(
                 Ok(Some(summary))
                     if summary.fts_optimized
                         || summary.fingerprints > 0
+                        || summary.normalized_fingerprints > 0
                         || summary.embeddings > 0
                         || summary.repaired > 0
                         || summary.quarantined > 0
@@ -65,6 +66,7 @@ pub(crate) fn spawn(
                 {
                     tracing::debug!(
                         fingerprints = summary.fingerprints,
+                        normalized_fingerprints = summary.normalized_fingerprints,
                         embeddings = summary.embeddings,
                         audited = summary.audited,
                         repaired = summary.repaired,
