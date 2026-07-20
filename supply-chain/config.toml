@@ -195,6 +195,10 @@ criteria = "safe-to-deploy"
 version = "1.6.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.bstr]]
+version = "1.12.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.bytemuck]]
 version = "1.25.0"
 criteria = "safe-to-deploy"
@@ -1261,6 +1265,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.simdutf8]]
 version = "0.1.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.similar]]
+version = "3.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.siphasher]]

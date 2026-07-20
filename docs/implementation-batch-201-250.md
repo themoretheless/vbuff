@@ -78,3 +78,5 @@ Reviewed on 2026-07-20. This ledger is the execution overlay for backlog items 2
 ## Acceptance gate
 
 The batch is accepted only after formatting, strict all-target/all-feature clippy, locked workspace tests, root no-default-feature tests, WASM compilation, store disk/CAS recovery tests, documentation contracts/local links, workflow review, and `git diff --check`. Native caret bounds, real assistive-technology runs, OS-keystore key delivery, plugin sandbox execution, and forced-color/native monitor evidence remain separate product gates after deterministic code is green.
+
+Post-merge CI review on 2026-07-21 regenerated and visually reviewed all 16 light/dark, 1x/2x Linux popup goldens, then reproduced an exact no-update match on Ubuntu 24.04 with Rust 1.97.0. The same correction added version-pinned `cargo-vet` coverage for `similar`/`bstr` and synchronized `fuzz/Cargo.lock`; locked vetting and fuzz-target compilation passed locally before the follow-up push.
