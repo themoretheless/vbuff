@@ -9,6 +9,94 @@ permissions:
   contents: read
 
 jobs:
+  test-evidence:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+          - os: macos-15
+            name: macos
+          - os: windows-2025
+            name: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+      - name: Record runner and toolchain
+        shell: bash
+        run: |
+          mkdir -p evidence
+          {
+            printf 'revision=%s\n' "$GITHUB_SHA"
+            printf 'runner=%s\n' "${{ matrix.os }}"
+            rustc --version
+            cargo --version
+          } > "evidence/environment-${{ matrix.name }}.txt"
+      - name: Test release matrix member
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features --locked 2>&1 | tee "evidence/tests-${{ matrix.name }}.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: vbuff-test-evidence-${{ matrix.name }}
+          path: evidence
+          if-no-files-found: error
+
+  security_performance_evidence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxcb1-dev libxfixes-dev libwayland-dev
+      - name: Install evidence tools
+        run: |
+          cargo install --locked cargo-deny --version 0.19.8
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-vet --version 0.10.2
+          cargo install --locked cargo-cyclonedx --version 0.5.9
+      - name: Capture residue-canary evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p evidence
+          cargo test -p vbuff-store --test integration --locked expired_sensitive_clip_is_scrubbed_from_database_and_wal -- --exact --nocapture 2>&1 | tee evidence/canary-expiry.log
+          cargo test -p vbuff-store --test integration --locked encrypted_grace_bin_is_self_contained_and_scrubs_large_cas_plaintext -- --exact --nocapture 2>&1 | tee evidence/canary-grace-bin.log
+          printf '%s\n' 'Scope: plaintext-residue removal after expiry and encrypted grace deletion.' 'Not proven: whole-database encryption; SQLCipher and an OS-keystore key remain release gates.' > evidence/canary-scope.txt
+      - name: Capture dependency-policy evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo deny check --hide-inclusion-graph 2>&1 | tee evidence/cargo-deny.log
+          cargo audit --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 2>&1 | tee evidence/cargo-audit.log
+          cargo vet --locked 2>&1 | tee evidence/cargo-vet.log
+      - name: Capture release performance evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release -p vbuff-core --test performance_budget --locked -- --ignored --nocapture 2>&1 | tee evidence/performance-core.log
+          cargo test --release -p vbuff-store --test performance_budget --locked -- --ignored --nocapture 2>&1 | tee evidence/performance-store.log
+      - name: Generate CycloneDX SBOM
+        shell: bash
+        run: |
+          cargo cyclonedx --format json --describe binaries --all-features
+          find . -path './evidence' -prune -o -name '*.cdx.json' -exec cp --parents '{}' evidence/ \;
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: vbuff-security-performance-evidence
+          path: evidence
+          if-no-files-found: error
+
   reproducible-build:
     strategy:
       fail-fast: false
@@ -44,6 +132,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -60,12 +149,65 @@ jobs:
           cp repro/vbuff-repro-one/vbuff dist/vbuff
           chmod +x dist/vbuff
           find . -path './dist' -prune -o -name '*.cdx.json' -exec cp --parents '{}' dist/ \;
-          sha256sum dist/vbuff > dist/SHA256SUMS
+          cd dist
+          sha256sum vbuff > SHA256SUMS
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        id: attest
+        with:
+          subject-path: dist/vbuff
+      - name: Include the signed provenance bundle and reference
+        shell: bash
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" dist/provenance.sigstore.json
+          {
+            printf 'attestation_id=%s\n' "${{ steps.attest.outputs.attestation-id }}"
+            printf 'attestation_url=%s\n' "${{ steps.attest.outputs.attestation-url }}"
+          } > dist/provenance.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vbuff-linux-x86_64
           path: dist
           if-no-files-found: error
-      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+
+  evidence-bundle:
+    if: always()
+    needs: [test-evidence, security_performance_evidence, compare-and-attest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        continue-on-error: true
         with:
-          subject-path: dist/vbuff
+          pattern: vbuff-*-evidence*
+          path: evidence
+          merge-multiple: true
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        continue-on-error: true
+        with:
+          name: vbuff-linux-x86_64
+          path: evidence/release
+      - name: Bind evidence to the release source
+        shell: bash
+        run: |
+          {
+            printf 'revision=%s\n' "$GITHUB_SHA"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'workflow_run=%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'test_matrix=%s\n' "${{ needs.test-evidence.result }}"
+            printf 'security_performance=%s\n' "${{ needs.security_performance_evidence.result }}"
+            printf 'reproducibility_and_attestation=%s\n' "${{ needs.compare-and-attest.result }}"
+          } > evidence/release-metadata.txt
+          cd evidence
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/VBUFF-EVIDENCE-MANIFEST.sha256"
+          mv "$RUNNER_TEMP/VBUFF-EVIDENCE-MANIFEST.sha256" MANIFEST.sha256
+          sha256sum --check MANIFEST.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vbuff-release-evidence-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+      - name: Require every evidence producer to pass
+        if: needs.test-evidence.result != 'success' || needs.security_performance_evidence.result != 'success' || needs.compare-and-attest.result != 'success'
+        run: exit 1

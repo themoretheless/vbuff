@@ -6,7 +6,7 @@
 >
 > Sourcing note: the task referenced a separate "decision spine" file and a "pitfalls JSON" with `pitfallsExec`/`topMistakesSummary` keys. Those literal artifacts do not exist in the repo. The positioning, pillars, non-goals, roadmap phases, and success metrics are grounded in `architecture.md` (goals/non-goals, the four backend traits, the four-phase roadmap, the risks table) and `docs/competitive-analysis.md` (the four-corner wedge). Competitor mistakes and differentiators are grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the 122-item `docs/competitor-extras.md`. Feature tiers (MVP/v1/v2/future) come from `docs/features-top-500.md` (640 items) and the extras catalog.
 >
-> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, `vbuff-plugin`, and most of `vbuff-update` are tested foundations, not live network, extension, sync, or auto-update features. Items 1-250 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), and [batch 201-250](docs/implementation-batch-201-250.md). The fifth ledger separates active popup/store behavior from workflow, plugin-host, native-caret, and OS-keystore foundations; stop/go rules live in [decision gates 151-200](docs/decision-gates-151-200.md) and [201-250](docs/decision-gates-201-250.md), and mutually exclusive pricing/licensing ideas remain resolved in [one decision record](docs/product-strategy-decisions.md).
+> Execution note: product recommendations describe the target unless they explicitly say "current". The present SQLite store is not SQLCipher-encrypted; `vbuff-sync`, `vbuff-ipc`, `vbuff-plugin`, and most of `vbuff-update` are tested foundations, not live network, extension, sync, or auto-update features. Items 1-300 are reconciled in [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), [batch 201-250](docs/implementation-batch-201-250.md), and [batch 251-300](docs/implementation-batch-251-300.md). The sixth ledger separates active everyday popup/store/config behavior from device, integration, native-event, credential, and maintainer foundations; stop/go rules live in [decision gates 151-200](docs/decision-gates-151-200.md), [201-250](docs/decision-gates-201-250.md), and [251-300](docs/decision-gates-251-300.md), current gaps live in the [public limitation ledger](docs/limitations.md), and mutually exclusive pricing/licensing ideas remain resolved in [one decision record](docs/product-strategy-decisions.md).
 
 ---
 
@@ -126,7 +126,7 @@ Design review checklist:
 
 The SOLID/DRY product rule: a command should have one name, one behavior, and one permission model across popup, tray, CLI, IPC, and docs. If "clear history" means different things in two surfaces, the design is wrong even if the code compiles.
 
-Current implementation review: the popup uses one design-token module for stable dimensions, fixed-size icon actions with tooltips, distinct empty states, and explicit destructive confirmations. Popup and tray share one typed capture-health vocabulary and content-free notices. History keeps frequent work dense; Trust isolates capability/privacy/SLO/release evidence and opens only a redacted feedback draft; Compose provides an ephemeral stack, named explicit form steps, and escaped merge templates without nested cards or automatic focus injection. Sixteen Linux-rendered goldens cover four surfaces across theme and DPI; the review caught and fixed a clipped Compose action before acceptance. The status strip separates saved, intentionally skipped, and lost captures; sensitive/incomplete/local-only/expiry states remain visible; bounded thumbnails and skip recovery stay fail closed. Hotkey, tray, and second-instance actions wake the event loop directly; a pause-aware heartbeat/watchdog exposes stalls. Native hook re-subscribe, screen-reader verification, SQLCipher, native concealed/provenance coverage, and real compositor evidence remain release work.
+Current implementation review: the popup uses one design-token module for stable dimensions, fixed-size icon actions with tooltips, distinct empty states, and explicit destructive confirmations. Popup and tray share one typed capture-health vocabulary and content-free notices. History keeps frequent work dense with sticky kind/source filters, calendar expiry, session protection, plain-text clones, and direct clear scope; Settings holds review-before-apply profile selection, an opt-in metadata-only health digest, and independent stale-pin review. Trust isolates capability/privacy/SLO/release evidence and opens only a redacted feedback draft; Compose provides an ephemeral stack, named explicit form steps, and escaped merge templates without nested cards or automatic focus injection. Twenty-four Linux-rendered goldens cover six states across theme and DPI. The status strip separates saved, intentionally skipped, and lost captures; sensitive/incomplete/local-only/expiry states remain visible; bounded thumbnails and skip recovery stay fail closed. Hotkey, tray, and second-instance actions wake the event loop directly; a pause-aware heartbeat/watchdog exposes stalls, and remote-session startup can pause with a typed reason. Native continuous idle/lock signals, hook re-subscribe, screen-reader verification, SQLCipher, native concealed/provenance coverage, and real compositor evidence remain release work.
 
 ---
 
@@ -289,8 +289,13 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/implementation-batch-101-150.md` - engineering/product items 101-150, Trust/release/migration/sync evidence, policy decisions, and three review passes
 - `docs/implementation-batch-151-200.md` - engineering/product items 151-200, privacy/AI and integration boundaries, delivery gates, Compose evidence, and three review passes
 - `docs/implementation-batch-201-250.md` - workflow, popup design/accessibility, store lifecycle, native/key-provider boundaries, and three review passes
+- `docs/implementation-batch-251-300.md` - everyday runtime UX, device/integration foundations, operations, and three review passes
 - `docs/decision-gates-151-200.md` - registered kill criteria, owner roles, fallback ladders, and external evidence requirements
 - `docs/decision-gates-201-250.md` - plugin, caret, accessibility, display, and encrypted-recovery activation gates
+- `docs/decision-gates-251-300.md` - native auto-pause, sync/client authority, release evidence, migration, and governance gates
+- `docs/limitations.md` - versioned current limitations, practical workarounds, and exit evidence
+- `docs/maintainer-handoff.md` - release custody, emergency patch, dependency cadence, sunset, and continuity drill
+- `docs/scope-review.md` - quarterly Promote/Keep/Defer/Cut decisions and cut-line triggers
 - `docs/data-contract-v1.md` - frozen schema/hash/format/IPC fixtures and compatibility process
 - `docs/data-contract-v2.md` - schema 6 normalized-dedup, encrypted grace-bin, and retention compatibility process
 - `docs/product-strategy-decisions.md` - one coherent resolution for mutually exclusive licensing, pricing, and governance proposals 128-140
@@ -302,6 +307,7 @@ Everything beyond this list - FTS5 indexed/fuzzy/regex search, blob CAS + image 
 - `docs/ideas-401-500.md` - review backlog: current implementation problems, SOLID/DRY refactors, testing gaps, design fixes, and roadmap hygiene
 - `docs/ideas-501-600.md` - evidence-backed native correctness, international text/search, security, local-first sync, and verification ideas
 - `docs/ideas-601-610.md` - ten post-600 research candidates outside the active 1-600 goal
+- `docs/ideas-611-620.md` - ten review-derived post-600 candidates outside the active goal
 - `docs/repositories-research-100.md` - 100 high-signal repositories plus primary papers, standards, and concrete vbuff lessons
 - `docs/mistakes-top-500.md` - competitor anti-patterns and vbuff's fixes
 - `docs/pain-points.md` - evidence-backed, app-named competitor complaints used in section 3
@@ -319,9 +325,10 @@ Execution follows the user's requested groups of 50. The strategy layer does not
 | 101-150 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-101-150.md); Trust/config/verify/CI paths are active, while updater, native conformance, migration, sync, and AI remain bounded foundations |
 | 151-200 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-151-200.md); Compose/config/ask/privacy paths are active, while models, extensions, mobile, daemon dispatch, sync, SQLCipher, and external evidence remain explicit |
 | 201-250 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-201-250.md); popup/store paths are active while visual pipelines, native caret acquisition, real AT evidence, and durable keystore-backed Undo remain explicit |
-| 251-600 | Queued | Preserve the canonical priority and evidence links below |
+| 251-300 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-251-300.md); everyday popup/store/config paths are active while live sync, external clients, native event adapters, SQLCipher, credentials, and maintainer drills remain explicit |
+| 301-600 | Queued | Preserve the canonical priority and evidence links below |
 
-The product cut line after the fifth batch is unchanged: finish trustworthy SQLCipher single-machine storage, OS-keystore key delivery, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. The AI/sync/IPC/plugin/update foundations reduce later protocol risk; they do not justify turning on a model endpoint, network listener, WASM host, relay, or update fetcher early.
+The product cut line after the sixth batch is unchanged: finish trustworthy SQLCipher single-machine storage, OS-keystore key delivery, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. Device and integration contracts reduce later protocol risk; they do not justify turning on a model endpoint, MCP/webhook listener, extension bridge, WASM host, relay, or update fetcher early. The [quarterly scope review](docs/scope-review.md) enforces that boundary.
 
 ---
 
@@ -338,7 +345,7 @@ The full 600-item review is shared with `README.md`, `architecture.md`, and `pla
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY cuts, testing gaps, design fixes, roadmap hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Repository/research-backed protocol correctness, Unicode/search, privacy, sync, testing, release evidence |
 
-The [post-600 candidates 601-610](docs/ideas-601-610.md) are research follow-ups only and do not change the active 1-600 sequence.
+The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/ideas-611-620.md) are research follow-ups only and do not change the active 1-600 sequence.
 
 ---
 

@@ -26,19 +26,27 @@ fn thousand_row_insert_and_search_stay_inside_budget() {
     for index in 0..1_000 {
         store.insert(&clip(index)).unwrap();
     }
+    let insert_elapsed = insert_started.elapsed();
+    println!(
+        "metric=store_insert rows=1000 elapsed_ms={} budget_ms=15000",
+        insert_elapsed.as_millis()
+    );
     assert!(
-        insert_started.elapsed() < Duration::from_secs(15),
-        "1k inserts exceeded 15 seconds: {:?}",
-        insert_started.elapsed()
+        insert_elapsed < Duration::from_secs(15),
+        "1k inserts exceeded 15 seconds: {insert_elapsed:?}"
     );
 
     let search_started = Instant::now();
     for index in 0..100 {
         black_box(store.search(&format!("row {}", index % 10), 20).unwrap());
     }
+    let search_elapsed = search_started.elapsed();
+    println!(
+        "metric=store_search queries=100 elapsed_ms={} budget_ms=5000",
+        search_elapsed.as_millis()
+    );
     assert!(
-        search_started.elapsed() < Duration::from_secs(5),
-        "100 searches exceeded 5 seconds: {:?}",
-        search_started.elapsed()
+        search_elapsed < Duration::from_secs(5),
+        "100 searches exceeded 5 seconds: {search_elapsed:?}"
     );
 }

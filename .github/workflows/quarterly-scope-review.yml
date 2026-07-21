@@ -1,0 +1,40 @@
+name: Quarterly Scope Review
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 8 1,4,7,10 *"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  open-review:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Open one scope review for the current quarter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          year="$(date -u +%Y)"
+          month="$(date -u +%m)"
+          quarter="$(( (10#$month - 1) / 3 + 1 ))"
+          title="Quarterly scope review: ${year} Q${quarter}"
+          if gh issue list --state all --search "\"$title\" in:title" --limit 20 --json title --jq '.[].title' | grep -Fqx "$title"; then
+            printf 'Scope review already exists: %s\n' "$title"
+            exit 0
+          fi
+          printf '%s\n' \
+            'Use the checked-in review rules and template:' \
+            '' \
+            '- Re-rank only against the active milestone and release gates.' \
+            '- Record Promote, Keep, Defer, or Cut for every considered item.' \
+            '- Do not expand the canonical 1-600 objective from candidate lists.' \
+            '- Update docs/scope-review.md with the dated decision record.' \
+            '' \
+            'Reference: docs/scope-review.md' > "$RUNNER_TEMP/scope-review.md"
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/scope-review.md"

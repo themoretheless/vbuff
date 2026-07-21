@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
+pub use vbuff_types::CapturePauseReason as AutoPauseReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +64,90 @@ pub struct SessionState {
     locked: bool,
     foreground: bool,
     sleeping: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoPauseSignals {
+    pub idle_for: Duration,
+    pub screen_locked: bool,
+    pub remote_control_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoPausePolicy {
+    pub idle_after: Option<Duration>,
+    pub pause_on_lock: bool,
+    pub pause_on_remote_control: bool,
+}
+
+impl Default for AutoPausePolicy {
+    fn default() -> Self {
+        Self {
+            idle_after: Some(Duration::from_secs(15 * 60)),
+            pause_on_lock: true,
+            pause_on_remote_control: true,
+        }
+    }
+}
+
+impl AutoPausePolicy {
+    pub fn reason(self, signals: AutoPauseSignals) -> Option<AutoPauseReason> {
+        if self.pause_on_lock && signals.screen_locked {
+            Some(AutoPauseReason::ScreenLocked)
+        } else if self.pause_on_remote_control && signals.remote_control_active {
+            Some(AutoPauseReason::RemoteControl)
+        } else if self
+            .idle_after
+            .is_some_and(|threshold| !threshold.is_zero() && signals.idle_for >= threshold)
+        {
+            Some(AutoPauseReason::Idle)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoPauseTransition {
+    Pause(AutoPauseReason),
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AutoPauseController {
+    policy: AutoPausePolicy,
+    active_reason: Option<AutoPauseReason>,
+}
+
+impl AutoPauseController {
+    pub const fn new(policy: AutoPausePolicy) -> Self {
+        Self {
+            policy,
+            active_reason: None,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        signals: AutoPauseSignals,
+        manually_paused: bool,
+    ) -> Option<AutoPauseTransition> {
+        let next = self.policy.reason(signals);
+        if next == self.active_reason {
+            return None;
+        }
+        let previous = self.active_reason;
+        self.active_reason = next;
+        match (previous, next) {
+            (_, Some(reason)) => Some(AutoPauseTransition::Pause(reason)),
+            (Some(_), None) if !manually_paused => Some(AutoPauseTransition::Resume),
+            _ => None,
+        }
+    }
+
+    pub const fn active_reason(self) -> Option<AutoPauseReason> {
+        self.active_reason
+    }
 }
 
 impl Default for SessionState {
@@ -239,5 +324,55 @@ mod tests {
         let report = detect_coexisting_managers(["CopyQ".into(), "terminal".into()]);
         assert_eq!(report.detected_managers, vec!["CopyQ"]);
         assert_eq!(report.recommended_mode, CoexistenceMode::Cooperative);
+    }
+
+    #[test]
+    fn auto_pause_prioritizes_lock_and_never_resumes_a_manual_pause() {
+        let policy = AutoPausePolicy {
+            idle_after: Some(Duration::from_secs(60)),
+            ..AutoPausePolicy::default()
+        };
+        let mut controller = AutoPauseController::new(policy);
+        assert_eq!(
+            controller.observe(
+                AutoPauseSignals {
+                    idle_for: Duration::from_secs(61),
+                    ..AutoPauseSignals::default()
+                },
+                false,
+            ),
+            Some(AutoPauseTransition::Pause(AutoPauseReason::Idle))
+        );
+        assert_eq!(
+            controller.observe(
+                AutoPauseSignals {
+                    screen_locked: true,
+                    ..AutoPauseSignals::default()
+                },
+                false,
+            ),
+            Some(AutoPauseTransition::Pause(AutoPauseReason::ScreenLocked))
+        );
+        assert_eq!(controller.observe(AutoPauseSignals::default(), true), None);
+        assert_eq!(controller.active_reason(), None);
+    }
+
+    #[test]
+    fn clearing_an_automatic_reason_requests_resume() {
+        let mut controller = AutoPauseController::new(AutoPausePolicy::default());
+        assert_eq!(
+            controller.observe(
+                AutoPauseSignals {
+                    remote_control_active: true,
+                    ..AutoPauseSignals::default()
+                },
+                false,
+            ),
+            Some(AutoPauseTransition::Pause(AutoPauseReason::RemoteControl))
+        );
+        assert_eq!(
+            controller.observe(AutoPauseSignals::default(), false),
+            Some(AutoPauseTransition::Resume)
+        );
     }
 }

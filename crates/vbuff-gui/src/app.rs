@@ -16,10 +16,15 @@ use chrono::Utc;
 use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
 use vbuff_core::feedback::FeedbackEnvironment;
-use vbuff_core::workflow::{TextTransform, TransformOverlay};
+use vbuff_core::onboarding::DefaultProfile;
+use vbuff_core::workflow::{
+    TextTransform, TransformOverlay, clean_link, expiry_label, recent_source_apps,
+    stale_pin_candidates,
+};
 use vbuff_core::{SearchResult, search};
 use vbuff_types::{
-    Body, CapabilityView, CapabilityViewLevel, CaptureHealth, Clip, ClipId, CommandNotice,
+    Body, CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth,
+    CapturePauseReason, Clip, ClipId, ClipboardHealthDigest, CommandNotice, ContentKind,
     NoticeLevel, PrivacyDecisionLevel, PrivacyLedgerSummary, SecurityPostureLevel,
     SecurityPostureSummary, SloMetricState, SloStatusSummary,
 };
@@ -27,7 +32,7 @@ use web_time::Instant;
 
 use crate::design::{self, Icon};
 use crate::experience::{
-    ClipBadge, DensityMode, FocusLossGuard, FocusLossState, HandedMode, MotionBudget,
+    ClipBadge, DensityMode, FocusLossGuard, FocusLossState, HandedMode, HistoryScope, MotionBudget,
     NearDuplicateDelta, ScrollTuner, UiPreferences, clip_badges, contextual_search_hint,
     contrast_ratio, match_highlight_alpha, recency_strength,
 };
@@ -52,6 +57,7 @@ enum PreviewTransform {
     Trim,
     Uppercase,
     PrettyJson,
+    CleanLink,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -147,6 +153,8 @@ pub struct PopupApp {
     confirm_clear_history: bool,
     /// Clip awaiting explicit delete confirmation.
     confirm_delete: Option<ClipId>,
+    /// Default profile awaiting an explicit review/apply decision.
+    confirm_profile: Option<DefaultProfile>,
     /// Compact history and inspectable trust surfaces share one popup.
     surface: PopupSurface,
     /// Ephemeral, local-only composition scratchpad.
@@ -160,6 +168,7 @@ pub struct PopupApp {
     motion_budget: MotionBudget,
     peek_sensitive: Option<(ClipId, Instant)>,
     preview_transform: PreviewTransform,
+    history_scope: HistoryScope,
     color_output_format: ColorOutputFormat,
     command_palette_open: bool,
     command_query: String,
@@ -188,6 +197,7 @@ impl PopupApp {
             design_applied: false,
             confirm_clear_history: false,
             confirm_delete: None,
+            confirm_profile: None,
             surface: PopupSurface::History,
             paste_stack: PasteStack::default(),
             compose_mode: ComposeMode::Stack,
@@ -199,6 +209,7 @@ impl PopupApp {
             motion_budget: MotionBudget::new(now),
             peek_sensitive: None,
             preview_transform: PreviewTransform::Original,
+            history_scope: HistoryScope::All,
             color_output_format: ColorOutputFormat::Hex,
             command_palette_open: false,
             command_query: String::new(),
@@ -224,6 +235,7 @@ impl PopupApp {
         self.selected = 0;
         self.confirm_clear_history = false;
         self.confirm_delete = None;
+        self.confirm_profile = None;
         self.surface = PopupSurface::History;
         self.feedback_preview = false;
         self.command_palette_open = false;
@@ -250,6 +262,18 @@ impl PopupApp {
         self.request_focus_next_frame = false;
     }
 
+    /// Open the popup directly on its settings surface.
+    pub fn request_settings_view(&mut self, ctx: &egui::Context) {
+        self.show(ctx);
+        self.surface = PopupSurface::Settings;
+        self.request_focus_next_frame = false;
+    }
+
+    /// Apply the persisted health-digest visibility preference.
+    pub fn set_health_digest_visible(&mut self, visible: bool) {
+        self.preferences.show_health_digest = visible;
+    }
+
     /// Open the popup directly on the composition scratchpad.
     pub fn request_compose_view(&mut self, ctx: &egui::Context) {
         self.show(ctx);
@@ -273,7 +297,10 @@ impl PopupApp {
 
     /// Build the current filtered view of clips.
     fn filtered(&self, clips: &[Clip]) -> Vec<FilteredClip> {
-        let results: Vec<SearchResult<'_>> = search(clips, &self.query);
+        let results: Vec<SearchResult<'_>> = search(clips, &self.query)
+            .into_iter()
+            .filter(|result| self.history_scope.matches(result.clip))
+            .collect();
         let mut filtered: Vec<FilteredClip> = Vec::with_capacity(results.len());
         let mut root: Option<(ClipId, vbuff_types::ContentKind, String)> = None;
         for result in results {
@@ -343,8 +370,14 @@ impl eframe::App for PopupApp {
         let (
             clips,
             paused,
+            pause_reason,
             capture_health,
             capture_stats,
+            health_alert,
+            size_budget_alert,
+            health_digest,
+            session_protected,
+            default_profile,
             security_posture,
             capabilities,
             privacy_ledger,
@@ -370,8 +403,14 @@ impl eframe::App for PopupApp {
             (
                 s.clips.clone(),
                 s.paused,
+                s.pause_reason,
                 s.capture_health,
                 s.capture_stats,
+                s.health_alert,
+                s.size_budget_alert,
+                s.health_digest,
+                s.session_protected.clone(),
+                s.default_profile,
                 s.security_posture,
                 s.capabilities.clone(),
                 s.privacy_ledger.clone(),
@@ -455,13 +494,27 @@ impl eframe::App for PopupApp {
 
         // 4. Global key handling.
         let modifier_down = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
-        if !self.confirm_clear_history && self.confirm_delete.is_none() {
+        if !self.confirm_clear_history
+            && self.confirm_delete.is_none()
+            && self.confirm_profile.is_none()
+        {
             ctx.input(|i| {
                 if i.key_pressed(Key::Escape) {
                     if self.command_palette_open {
                         self.command_palette_open = false;
-                    } else if self.action_flyout.take().is_none() {
-                        self.actions.push_back(UiAction::Hide);
+                    } else {
+                        let closed_flyout = self.action_flyout.take().is_some();
+                        if !closed_flyout
+                            && self.surface == PopupSurface::History
+                            && (self.history_scope != HistoryScope::All
+                                || !self.query.trim().is_empty())
+                        {
+                            self.history_scope = HistoryScope::All;
+                            self.query.clear();
+                            self.selected = 0;
+                        } else if !closed_flyout {
+                            self.actions.push_back(UiAction::Hide);
+                        }
                     }
                 }
                 if modifier_down && i.key_pressed(Key::K) {
@@ -585,7 +638,7 @@ impl eframe::App for PopupApp {
             match self.surface {
                 PopupSurface::History => {
                     ui.horizontal(|ui| {
-                        render_capture_status(ui, paused, capture_health);
+                        render_capture_status(ui, paused, pause_reason, capture_health);
                         ui.separator();
                         render_security_status(ui, security_posture);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -614,6 +667,12 @@ impl eframe::App for PopupApp {
                             }
                         });
                     });
+                    if let Some(health) = health_alert {
+                        self.render_health_alert(ui, health);
+                    }
+                    if let Some(alert) = size_budget_alert {
+                        self.render_size_budget_alert(ui, alert);
+                    }
                     if recoverable_skip {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -652,6 +711,7 @@ impl eframe::App for PopupApp {
                     if let Some(notice) = &notice {
                         self.render_notice(ui, notice);
                     }
+                    self.render_history_filters(ui, &clips);
                     ui.separator();
 
                     if total == 0 {
@@ -684,6 +744,7 @@ impl eframe::App for PopupApp {
                                         cheap_rows,
                                         modifier_down,
                                         row_height,
+                                        session_protected.contains(&clip.id),
                                     );
                                 }
                             });
@@ -697,15 +758,18 @@ impl eframe::App for PopupApp {
                     &privacy_ledger,
                     &slo_status,
                 ),
-                PopupSurface::Settings => self.render_settings_surface(ui),
+                PopupSurface::Settings => {
+                    self.render_settings_surface(ui, &clips, health_digest, default_profile)
+                }
             }
         });
 
         self.render_clear_history_confirmation(ctx);
         self.render_delete_confirmation(ctx);
+        self.render_profile_confirmation(ctx, health_digest.stored_items);
         self.render_feedback_preview(ctx, &capabilities);
         self.render_command_palette(ctx, paused, &filtered, &clip_by_id);
-        self.render_action_flyout(ctx, &clip_by_id);
+        self.render_action_flyout(ctx, &clip_by_id, &session_protected);
         self.render_accessibility_announcement(
             ctx,
             accessibility_announcement.as_deref(),
@@ -840,6 +904,110 @@ impl PopupApp {
         });
     }
 
+    fn render_history_filters(&mut self, ui: &mut egui::Ui, clips: &[Clip]) {
+        if clips.is_empty() {
+            return;
+        }
+        let recent_apps = recent_source_apps(clips, 3);
+        ui.horizontal_wrapped(|ui| {
+            let previous_scope = self.history_scope.clone();
+            egui::ComboBox::from_id_salt("history_kind_scope")
+                .selected_text(self.history_scope.label())
+                .width(116.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.history_scope, HistoryScope::All, "All kinds");
+                    for kind in [
+                        ContentKind::Url,
+                        ContentKind::Image,
+                        ContentKind::Code,
+                        ContentKind::File,
+                        ContentKind::Color,
+                        ContentKind::Text,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.history_scope,
+                            HistoryScope::Kind(kind),
+                            kind.label(),
+                        );
+                    }
+                    ui.selectable_value(
+                        &mut self.history_scope,
+                        HistoryScope::Snippets,
+                        "Snippets",
+                    );
+                });
+            if self.history_scope != previous_scope {
+                self.selected = 0;
+            }
+            for app in recent_apps {
+                let selected = self.history_scope == HistoryScope::Source(app.clone());
+                if ui
+                    .selectable_label(selected, short_app_name(&app))
+                    .clicked()
+                {
+                    self.history_scope = if selected {
+                        HistoryScope::All
+                    } else {
+                        HistoryScope::Source(app)
+                    };
+                    self.selected = 0;
+                }
+            }
+            if self.history_scope != HistoryScope::All
+                && design::icon_button(ui, Icon::Close, "Clear history filter", false).clicked()
+            {
+                self.history_scope = HistoryScope::All;
+                self.selected = 0;
+            }
+        });
+    }
+
+    fn render_health_alert(&mut self, ui: &mut egui::Ui, health: CaptureHealth) {
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(194, 64, 72, 24))
+            .inner_margin(5.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    design::status_dot(ui, Color32::from_rgb(194, 64, 72));
+                    ui.label(RichText::new(health.label()).small().strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if design::icon_button(ui, Icon::Close, "Dismiss capture alert", false)
+                            .clicked()
+                        {
+                            self.actions.push_back(UiAction::DismissHealthAlert);
+                        }
+                        if ui.small_button("Review").clicked() {
+                            self.surface = PopupSurface::Trust;
+                            self.actions.push_back(UiAction::DismissHealthAlert);
+                        }
+                    });
+                });
+            });
+    }
+
+    fn render_size_budget_alert(&mut self, ui: &mut egui::Ui, alert: CaptureBudgetAlert) {
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(210, 144, 32, 24))
+            .inner_margin(5.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    design::status_dot(ui, Color32::from_rgb(210, 144, 32));
+                    ui.label(RichText::new(alert.label()).small().strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if design::icon_button(ui, Icon::Close, "Dismiss size-budget alert", false)
+                            .clicked()
+                        {
+                            self.actions.push_back(UiAction::DismissSizeBudgetAlert);
+                        }
+                        if ui.small_button("Settings").clicked() {
+                            self.surface = PopupSurface::Settings;
+                            self.actions.push_back(UiAction::DismissSizeBudgetAlert);
+                        }
+                    });
+                });
+            });
+    }
+
     fn render_hotkey_coachmark(&mut self, ui: &mut egui::Ui, hotkey: &str) {
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
@@ -858,11 +1026,113 @@ impl PopupApp {
             });
     }
 
-    fn render_settings_surface(&mut self, ui: &mut egui::Ui) {
+    fn render_settings_surface(
+        &mut self,
+        ui: &mut egui::Ui,
+        clips: &[Clip],
+        digest: ClipboardHealthDigest,
+        default_profile: Option<DefaultProfile>,
+    ) {
         ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.heading("Defaults");
+                ui.horizontal(|ui| {
+                    for profile in [
+                        DefaultProfile::Casual,
+                        DefaultProfile::Developer,
+                        DefaultProfile::PrivacyMax,
+                    ] {
+                        if ui
+                            .selectable_label(default_profile == Some(profile), profile.label())
+                            .clicked()
+                            && default_profile != Some(profile)
+                        {
+                            self.confirm_profile = Some(profile);
+                        }
+                    }
+                });
+
+                ui.add_space(12.0);
+                ui.heading("Clipboard health");
+                ui.checkbox(
+                    &mut self.preferences.show_health_digest,
+                    "Show health digest",
+                );
+                if self.preferences.show_health_digest {
+                    egui::Grid::new("clipboard_health_digest")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            digest_row(ui, "Database", human_bytes(digest.database_bytes));
+                            digest_row(ui, "Items", digest.stored_items.to_string());
+                            digest_row(ui, "Largest clip", human_bytes(digest.largest_clip_bytes));
+                            digest_row(
+                                ui,
+                                "Expiring this week",
+                                digest.expiring_within_week.to_string(),
+                            );
+                            digest_row(ui, "Sensitive", digest.sensitive_items.to_string());
+                            digest_row(ui, "Suggested pins", digest.suggested_pins.to_string());
+                            digest_row(ui, "Stale pins", digest.stale_pins.to_string());
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Pinned items to review");
+                let stale = stale_pin_candidates(
+                    clips,
+                    Utc::now(),
+                    std::time::Duration::from_secs(90 * 24 * 60 * 60),
+                    5,
+                );
+                if stale.is_empty() {
+                    ui.label(RichText::new("No pins older than 90 days").small().weak());
+                } else {
+                    for candidate in stale {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Pinned item · {}d · {}",
+                                    candidate.age_days,
+                                    human_bytes(candidate.byte_size)
+                                ))
+                                .small(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if design::icon_button(
+                                        ui,
+                                        Icon::Delete,
+                                        "Delete stale pin",
+                                        false,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.confirm_delete = Some(candidate.clip_id);
+                                    }
+                                    if design::icon_button(
+                                        ui,
+                                        Icon::Pin { filled: true },
+                                        "Unpin stale item",
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.actions.push_back(UiAction::SetPinned(
+                                            candidate.clip_id,
+                                            false,
+                                        ));
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+
+                ui.add_space(12.0);
                 ui.heading("Appearance");
                 ui.horizontal(|ui| {
                     ui.label("Density");
@@ -1071,7 +1341,12 @@ impl PopupApp {
         }
     }
 
-    fn render_action_flyout(&mut self, ctx: &egui::Context, clip_by_id: &HashMap<ClipId, &Clip>) {
+    fn render_action_flyout(
+        &mut self,
+        ctx: &egui::Context,
+        clip_by_id: &HashMap<ClipId, &Clip>,
+        session_protected: &HashSet<ClipId>,
+    ) {
         let Some(id) = self.action_flyout else {
             return;
         };
@@ -1079,6 +1354,7 @@ impl PopupApp {
             self.action_flyout = None;
             return;
         };
+        let protected = session_protected.contains(&id);
         let mut command = None;
         let mut request_delete = false;
         ctx.input(|input| {
@@ -1116,6 +1392,22 @@ impl PopupApp {
                 }
             } else if clip.primary_text().is_some() && ui.button("Add to stack").clicked() {
                 command = Some(PaletteCommand::AddSelectedToStack);
+            }
+            if clip.primary_text().is_some() && ui.button("Create plain-text clone").clicked() {
+                self.actions.push_back(UiAction::CreatePlainTextClone(id));
+                self.action_flyout = None;
+            }
+            if ui
+                .button(if protected {
+                    "Remove session protection"
+                } else {
+                    "Protect for this session"
+                })
+                .clicked()
+            {
+                self.actions
+                    .push_back(UiAction::SetSessionProtected(id, !protected));
+                self.action_flyout = None;
             }
             if ui.button("Preview").clicked() {
                 self.preferences.large_preview = true;
@@ -1719,19 +2011,30 @@ impl PopupApp {
                 PreviewTransform::PrettyJson,
                 "JSON",
             );
+            if clip.meta.kind == ContentKind::Url {
+                ui.selectable_value(
+                    &mut self.preview_transform,
+                    PreviewTransform::CleanLink,
+                    "Clean link",
+                );
+            }
         });
         let transformed = match self.preview_transform {
             PreviewTransform::Original => Ok(canonical.to_owned()),
             PreviewTransform::Trim => TransformOverlay::preview(canonical, TextTransform::Trim)
-                .map(|overlay| overlay.output().to_owned()),
+                .map(|overlay| overlay.output().to_owned())
+                .map_err(|_| ()),
             PreviewTransform::Uppercase => {
                 TransformOverlay::preview(canonical, TextTransform::Uppercase)
                     .map(|overlay| overlay.output().to_owned())
+                    .map_err(|_| ())
             }
             PreviewTransform::PrettyJson => {
                 TransformOverlay::preview(canonical, TextTransform::PrettyJson)
                     .map(|overlay| overlay.output().to_owned())
+                    .map_err(|_| ())
             }
+            PreviewTransform::CleanLink => clean_link(canonical).map_err(|_| ()),
         };
         match transformed {
             Ok(output) => {
@@ -1831,6 +2134,7 @@ impl PopupApp {
         cheap: bool,
         quick_pick: bool,
         row_height: f32,
+        session_protected: bool,
     ) {
         let freshness = recency_strength(clip.meta.created_at, Utc::now());
         let bg = if selected {
@@ -1906,12 +2210,10 @@ impl PopupApp {
                             for badge in clip_badges(clip).into_iter().take(2) {
                                 meta.push(badge.label().into());
                             }
-                            if let Some(expires_at) = clip.meta.expires_at.as_ref() {
-                                let seconds = expires_at
-                                    .signed_duration_since(Utc::now())
-                                    .num_seconds()
-                                    .max(0);
-                                meta.push(format!("Expires in {seconds}s"));
+                            if session_protected {
+                                meta.push("Protected this session".into());
+                            } else if clip.meta.expires_at.is_some() {
+                                meta.push(expiry_label(clip, Utc::now(), None));
                             }
                             if let Some(delta) = hit.duplicate_delta {
                                 meta.push(format!(
@@ -2014,7 +2316,7 @@ impl PopupApp {
             egui::Modal::new(egui::Id::new("clear_history_confirmation")).show(ctx, |ui| {
                 ui.set_width(300.0);
                 ui.heading("Clear clipboard history?");
-                ui.label("Pinned clips will be kept.");
+                ui.label("Pinned and session-protected clips will be kept.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let cancel = ui.button("Cancel").clicked();
@@ -2082,6 +2384,67 @@ impl PopupApp {
         }
     }
 
+    fn render_profile_confirmation(&mut self, ctx: &egui::Context, current_items: usize) {
+        let Some(profile) = self.confirm_profile else {
+            return;
+        };
+        let defaults = profile.defaults();
+        let response =
+            egui::Modal::new(egui::Id::new("profile_confirmation")).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.heading(format!("Apply {} defaults?", profile.label()));
+                egui::Grid::new("profile_default_preview")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        digest_row(ui, "History cap", defaults.max_history.to_string());
+                        digest_row(
+                            ui,
+                            "Secret retention",
+                            human_duration(defaults.secret_ttl_seconds),
+                        );
+                        digest_row(
+                            ui,
+                            "Full capture up to",
+                            human_bytes(
+                                u64::try_from(defaults.capture_hard_limit_bytes)
+                                    .unwrap_or(u64::MAX),
+                            ),
+                        );
+                        digest_row(
+                            ui,
+                            "Pause after idle",
+                            human_duration(defaults.auto_pause_idle_seconds),
+                        );
+                    });
+                if defaults.max_history < current_items {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "The lower history cap may remove older unpinned items during automatic cleanup.",
+                        )
+                        .small()
+                        .color(Color32::from_rgb(210, 144, 32)),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Cancel").clicked();
+                    let apply = ui.button("Apply defaults").clicked();
+                    (cancel, apply)
+                })
+                .inner
+            });
+        let (cancel, apply) = response.inner;
+        if apply {
+            self.actions
+                .push_back(UiAction::ApplyDefaultProfile(profile));
+            self.confirm_profile = None;
+        } else if cancel || response.should_close() {
+            self.confirm_profile = None;
+        }
+    }
+
     /// Get or build a thumbnail texture for an image clip.
     fn thumbnail(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<TextureHandle> {
         if clip.meta.sensitive {
@@ -2098,9 +2461,17 @@ impl PopupApp {
     }
 }
 
-fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth) {
+fn render_capture_status(
+    ui: &mut egui::Ui,
+    paused: bool,
+    reason: Option<CapturePauseReason>,
+    health: CaptureHealth,
+) {
     let (label, color) = if paused {
-        ("Capture paused", Color32::from_rgb(210, 144, 32))
+        (
+            reason.map_or("Capture paused", CapturePauseReason::label),
+            Color32::from_rgb(210, 144, 32),
+        )
     } else {
         let color = match health {
             CaptureHealth::Starting => Color32::from_rgb(112, 120, 132),
@@ -2116,6 +2487,37 @@ fn render_capture_status(ui: &mut egui::Ui, paused: bool, health: CaptureHealth)
 
     design::status_dot(ui, color);
     ui.label(RichText::new(label).small().color(color));
+}
+
+fn digest_row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(RichText::new(label).small().weak());
+    ui.label(RichText::new(value).small().monospace());
+    ui.end_row();
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn human_duration(seconds: u64) -> String {
+    if seconds.is_multiple_of(60 * 60) {
+        format!("{}h", seconds / (60 * 60))
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) {

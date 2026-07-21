@@ -80,8 +80,32 @@ impl History {
         self.mutate_and_refresh(|store| store.set_pinned(id, pinned))
     }
 
+    pub(crate) fn set_session_protected(&self, id: ClipId, protected: bool) -> anyhow::Result<()> {
+        self.store
+            .lock()
+            .map_err(|_| anyhow!("history store mutex poisoned"))?
+            .set_session_protected(id, protected)?;
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
+        if protected {
+            state.session_protected.insert(id);
+        } else {
+            state.session_protected.remove(&id);
+        }
+        state.revision = state.revision.wrapping_add(1);
+        Ok(())
+    }
+
     pub(crate) fn delete(&self, id: ClipId) -> anyhow::Result<()> {
-        self.mutate_and_refresh(|store| store.delete(id))
+        self.mutate_and_refresh(|store| store.delete(id))?;
+        self.shared
+            .lock()
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?
+            .session_protected
+            .remove(&id);
+        Ok(())
     }
 
     /// Clear non-pinned history. The command name is shared across all surfaces.
@@ -111,7 +135,7 @@ impl History {
         background_work: bool,
         secret_ttl: Duration,
     ) -> anyhow::Result<Option<MaintenanceSummary>> {
-        let (summary, refreshed_clips) = {
+        let (summary, refreshed_clips, digest) = {
             let store = match self.store.try_lock() {
                 Ok(store) => store,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -146,6 +170,7 @@ impl History {
             let refreshed_clips = changed_visible_rows
                 .then(|| store.load_recent(self.snapshot_limit.load(Ordering::Relaxed)))
                 .transpose()?;
+            let digest = store.clipboard_health_digest()?;
             (
                 MaintenanceSummary {
                     fingerprints,
@@ -160,15 +185,18 @@ impl History {
                     fts_optimized,
                 },
                 refreshed_clips,
+                digest,
             )
         };
 
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
         if let Some(clips) = refreshed_clips {
-            self.shared
-                .lock()
-                .map_err(|_| anyhow!("GUI state mutex poisoned"))?
-                .set_clips(clips);
+            state.set_clips(clips);
         }
+        state.health_digest = digest;
         Ok(Some(summary))
     }
 
@@ -185,10 +213,11 @@ impl History {
             store.load_recent(limit)?
         };
         self.snapshot_limit.store(limit, Ordering::Relaxed);
-        self.shared
+        let mut state = self
+            .shared
             .lock()
-            .map_err(|_| anyhow!("GUI state mutex poisoned"))?
-            .set_clips(clips);
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
+        state.set_clips(clips);
         Ok(true)
     }
 
@@ -205,10 +234,11 @@ impl History {
             store.load_recent(self.snapshot_limit.load(Ordering::Relaxed))?
         };
 
-        self.shared
+        let mut state = self
+            .shared
             .lock()
-            .map_err(|_| anyhow!("GUI state mutex poisoned"))?
-            .set_clips(clips);
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
+        state.set_clips(clips);
         Ok(())
     }
 }

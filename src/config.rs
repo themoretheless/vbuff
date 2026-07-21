@@ -9,15 +9,21 @@ use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use vbuff_core::onboarding::DefaultProfile;
 
-const SHAREABLE_CONFIG_SCHEMA: u16 = 1;
-const HANDOFF_CONFIG_SCHEMA: u16 = 1;
+const CONFIG_SCHEMA_VERSION: u16 = 2;
+const LEGACY_CONFIG_SCHEMA_VERSION: u16 = 1;
+const SHAREABLE_CONFIG_SCHEMA: u16 = 2;
+const HANDOFF_CONFIG_SCHEMA: u16 = 2;
 const MAX_SHAREABLE_CONFIG_BYTES: usize = 256 * 1024;
 
 /// User-tunable configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Version of the owner-local config representation.
+    #[serde(default = "legacy_config_schema")]
+    pub schema_version: u16,
     /// Global show/hide hotkey, e.g. `"Cmd+Shift+V"` or `"Ctrl+Shift+V"`.
     pub hotkey: String,
     /// Clipboard poll interval in milliseconds.
@@ -51,6 +57,14 @@ pub struct Config {
     pub strict_security_mode: bool,
     /// Register vbuff to launch when the user logs in.
     pub launch_at_login: bool,
+    /// Applied first-run profile, if the user selected one.
+    pub default_profile: Option<DefaultProfile>,
+    /// Pause after this many idle seconds; zero disables idle auto-pause.
+    pub auto_pause_idle_seconds: u64,
+    /// Pause when a native session adapter reports a screen lock.
+    pub auto_pause_on_lock: bool,
+    /// Pause when a remote-control session is detected.
+    pub auto_pause_remote: bool,
     /// The summon-shortcut coachmark has been acknowledged on this profile.
     pub hotkey_coachmark_seen: bool,
 }
@@ -59,6 +73,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Config")
+            .field("schema_version", &self.schema_version)
             .field("hotkey", &self.hotkey)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("max_history", &self.max_history)
@@ -75,6 +90,10 @@ impl fmt::Debug for Config {
             .field("memory_hard_limit_mb", &self.memory_hard_limit_mb)
             .field("strict_security_mode", &self.strict_security_mode)
             .field("launch_at_login", &self.launch_at_login)
+            .field("default_profile", &self.default_profile)
+            .field("auto_pause_idle_seconds", &self.auto_pause_idle_seconds)
+            .field("auto_pause_on_lock", &self.auto_pause_on_lock)
+            .field("auto_pause_remote", &self.auto_pause_remote)
             .field("hotkey_coachmark_seen", &self.hotkey_coachmark_seen)
             .finish()
     }
@@ -83,6 +102,7 @@ impl fmt::Debug for Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            schema_version: CONFIG_SCHEMA_VERSION,
             hotkey: default_hotkey().to_string(),
             poll_interval_ms: 300,
             max_history: 500,
@@ -99,6 +119,10 @@ impl Default for Config {
             memory_hard_limit_mb: 1_024,
             strict_security_mode: false,
             launch_at_login: false,
+            default_profile: None,
+            auto_pause_idle_seconds: 15 * 60,
+            auto_pause_on_lock: true,
+            auto_pause_remote: true,
             hotkey_coachmark_seen: false,
         }
     }
@@ -155,6 +179,10 @@ pub struct ShareableConfig {
     pub memory_hard_limit_mb: usize,
     pub strict_security_mode: bool,
     pub launch_at_login: bool,
+    pub default_profile: Option<DefaultProfile>,
+    pub auto_pause_idle_seconds: u64,
+    pub auto_pause_on_lock: bool,
+    pub auto_pause_remote: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -184,6 +212,8 @@ pub(crate) enum ConfigCommand {
     Apply(PathBuf),
     HandoffExport(PathBuf),
     HandoffApply(PathBuf),
+    MigratePreview,
+    MigrateApply,
 }
 
 impl fmt::Debug for ConfigCommand {
@@ -196,8 +226,21 @@ impl fmt::Debug for ConfigCommand {
             Self::Apply(_) => formatter.write_str("Apply([redacted path])"),
             Self::HandoffExport(_) => formatter.write_str("HandoffExport([redacted path])"),
             Self::HandoffApply(_) => formatter.write_str("HandoffApply([redacted path])"),
+            Self::MigratePreview => formatter.write_str("MigratePreview"),
+            Self::MigrateApply => formatter.write_str("MigrateApply"),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigMigrationPreview {
+    from_schema: u16,
+    to_schema: u16,
+    changes: Vec<&'static str>,
+}
+
+const fn legacy_config_schema() -> u16 {
+    LEGACY_CONFIG_SCHEMA_VERSION
 }
 
 /// The default hotkey string for the current OS.
@@ -218,7 +261,7 @@ impl Config {
     pub fn load_or_create() -> anyhow::Result<Config> {
         let path = config_path()?;
         if path.exists() {
-            let text = std::fs::read_to_string(&path)?;
+            let text = read_bounded(std::fs::File::open(&path)?)?;
             let cfg: Config = toml::from_str(&text)?;
             Ok(cfg)
         } else {
@@ -232,7 +275,7 @@ impl Config {
     pub fn load_for_inspection() -> anyhow::Result<Config> {
         let path = config_path()?;
         if path.exists() {
-            Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+            Ok(toml::from_str(&read_bounded(std::fs::File::open(path)?)?)?)
         } else {
             Ok(Config::default())
         }
@@ -240,6 +283,11 @@ impl Config {
 
     /// Persist the config to the default path.
     pub fn save(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == CONFIG_SCHEMA_VERSION,
+            "config schema {} needs previewed migration; run `vbuff config migrate preview`",
+            self.schema_version
+        );
         let path = config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -266,6 +314,10 @@ impl Config {
             memory_hard_limit_mb: self.memory_hard_limit_mb,
             strict_security_mode: self.strict_security_mode,
             launch_at_login: self.launch_at_login,
+            default_profile: self.default_profile,
+            auto_pause_idle_seconds: self.auto_pause_idle_seconds,
+            auto_pause_on_lock: self.auto_pause_on_lock,
+            auto_pause_remote: self.auto_pause_remote,
         }
     }
 
@@ -285,7 +337,26 @@ impl Config {
         self.memory_hard_limit_mb = shared.memory_hard_limit_mb;
         self.strict_security_mode = shared.strict_security_mode;
         self.launch_at_login = shared.launch_at_login;
+        self.default_profile = shared.default_profile;
+        self.auto_pause_idle_seconds = shared.auto_pause_idle_seconds;
+        self.auto_pause_on_lock = shared.auto_pause_on_lock;
+        self.auto_pause_remote = shared.auto_pause_remote;
         Ok(())
+    }
+
+    pub fn apply_default_profile(&mut self, profile: DefaultProfile) {
+        let defaults = profile.defaults();
+        self.default_profile = Some(profile);
+        self.max_history = defaults.max_history;
+        self.secret_ttl_seconds = defaults.secret_ttl_seconds;
+        self.capture_soft_limit_bytes = defaults.capture_soft_limit_bytes;
+        self.capture_hard_limit_bytes = defaults.capture_hard_limit_bytes;
+        self.capture_preview_bytes = self
+            .capture_preview_bytes
+            .min(defaults.capture_soft_limit_bytes);
+        self.auto_pause_idle_seconds = defaults.auto_pause_idle_seconds;
+        self.auto_pause_remote = defaults.auto_pause_remote;
+        self.detect_secrets = defaults.detect_secrets;
     }
 }
 
@@ -330,6 +401,11 @@ impl ShareableConfig {
             matches!(self.paste_modifier.as_str(), "" | "auto" | "cmd" | "ctrl"),
             "invalid paste modifier"
         );
+        anyhow::ensure!(
+            self.auto_pause_idle_seconds == 0
+                || (60..=7 * 24 * 60 * 60).contains(&self.auto_pause_idle_seconds),
+            "invalid idle auto-pause interval"
+        );
         Ok(())
     }
 }
@@ -362,6 +438,10 @@ impl ConfigHandoff {
         anyhow::ensure!(
             self.payload_hash == hash_config(&self.config)?,
             "handoff checksum mismatch"
+        );
+        anyhow::ensure!(
+            self.config.schema_version == CONFIG_SCHEMA_VERSION,
+            "handoff config needs migration before import"
         );
         self.config.shareable().validate()?;
         anyhow::ensure!(
@@ -460,8 +540,22 @@ fn parse_requested(
                 ),
             }
         }
+        Some("migrate") => {
+            let command = match arguments.next().as_deref() {
+                Some("preview") => ConfigCommand::MigratePreview,
+                Some("apply") => ConfigCommand::MigrateApply,
+                _ => anyhow::bail!(
+                    "usage: vbuff config migrate preview | vbuff config migrate apply"
+                ),
+            };
+            anyhow::ensure!(
+                arguments.next().is_none(),
+                "usage: vbuff config migrate preview | vbuff config migrate apply"
+            );
+            Ok(Some(command))
+        }
         _ => anyhow::bail!(
-            "usage: vbuff config export [file] | vbuff config apply <file|-> | vbuff config handoff <export|apply> <file>"
+            "usage: vbuff config export [file] | vbuff config apply <file|-> | vbuff config handoff <export|apply> <file> | vbuff config migrate <preview|apply>"
         ),
     }
 }
@@ -506,8 +600,106 @@ pub(crate) fn run(command: ConfigCommand) -> anyhow::Result<()> {
             handoff.config.save()?;
             println!("vbuff config: applied full setup handoff");
         }
+        ConfigCommand::MigratePreview => {
+            let path = config_path()?;
+            let text = read_bounded(std::fs::File::open(&path)?)?;
+            let preview = preview_migration(&text)?;
+            print_migration_preview(&preview, &rollback_path(&path, preview.from_schema));
+        }
+        ConfigCommand::MigrateApply => {
+            let path = config_path()?;
+            let text = read_bounded(std::fs::File::open(&path)?)?;
+            let preview = preview_migration(&text)?;
+            if preview.changes.is_empty() {
+                println!("vbuff config: already at schema {}", preview.to_schema);
+                return Ok(());
+            }
+            let backup = rollback_path(&path, preview.from_schema);
+            if backup.exists() {
+                anyhow::ensure!(
+                    read_bounded(std::fs::File::open(&backup)?)? == text,
+                    "rollback copy already exists with different contents"
+                );
+            } else {
+                write_private(&backup, &text)?;
+            }
+            write_private(&path, &migrate_config_text(&text)?)?;
+            println!(
+                "vbuff config: migrated schema {} -> {}; rollback copy written",
+                preview.from_schema, preview.to_schema
+            );
+        }
     }
     Ok(())
+}
+
+fn preview_migration(text: &str) -> anyhow::Result<ConfigMigrationPreview> {
+    let raw: toml::Value = toml::from_str(text)?;
+    let from_schema = raw
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("invalid config schema"))?
+        .unwrap_or(LEGACY_CONFIG_SCHEMA_VERSION);
+    anyhow::ensure!(from_schema > 0, "invalid config schema");
+    anyhow::ensure!(
+        from_schema <= CONFIG_SCHEMA_VERSION,
+        "config schema {from_schema} is newer than this vbuff build"
+    );
+    let _: Config = toml::from_str(text)?;
+    let changes = if from_schema < CONFIG_SCHEMA_VERSION {
+        vec![
+            "record schema_version = 2",
+            "recognize optional first-run profile state",
+            "add idle, lock, and remote-control auto-pause policy",
+        ]
+    } else {
+        Vec::new()
+    };
+    Ok(ConfigMigrationPreview {
+        from_schema,
+        to_schema: CONFIG_SCHEMA_VERSION,
+        changes,
+    })
+}
+
+fn migrate_config_text(text: &str) -> anyhow::Result<String> {
+    let config: Config = toml::from_str(text)?;
+    let mut document = text.parse::<toml_edit::Document>()?;
+    document["schema_version"] = toml_edit::value(i64::from(CONFIG_SCHEMA_VERSION));
+    if document.get("auto_pause_idle_seconds").is_none() {
+        document["auto_pause_idle_seconds"] =
+            toml_edit::value(i64::try_from(config.auto_pause_idle_seconds)?);
+    }
+    if document.get("auto_pause_on_lock").is_none() {
+        document["auto_pause_on_lock"] = toml_edit::value(config.auto_pause_on_lock);
+    }
+    if document.get("auto_pause_remote").is_none() {
+        document["auto_pause_remote"] = toml_edit::value(config.auto_pause_remote);
+    }
+    Ok(document.to_string())
+}
+
+fn rollback_path(path: &std::path::Path, schema: u16) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".schema-{schema}.rollback"));
+    PathBuf::from(value)
+}
+
+fn print_migration_preview(preview: &ConfigMigrationPreview, backup: &std::path::Path) {
+    if preview.changes.is_empty() {
+        println!("vbuff config: already at schema {}", preview.to_schema);
+        return;
+    }
+    println!(
+        "vbuff config migration preview: schema {} -> {}",
+        preview.from_schema, preview.to_schema
+    );
+    for change in &preview.changes {
+        println!("- {change}");
+    }
+    println!("- rollback copy: {}", backup.display());
 }
 
 fn write_private(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
@@ -561,6 +753,7 @@ mod tests {
         assert_eq!(cfg.hotkey, back.hotkey);
         assert_eq!(cfg.max_history, back.max_history);
         assert_eq!(cfg.launch_at_login, back.launch_at_login);
+        assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
     }
 
     #[test]
@@ -646,5 +839,62 @@ mod tests {
     fn shareable_config_reader_is_bounded() {
         let oversized = vec![b'x'; MAX_SHAREABLE_CONFIG_BYTES + 1];
         assert!(read_bounded(&oversized[..]).is_err());
+    }
+
+    #[test]
+    fn profiles_apply_coherent_bounded_defaults() {
+        let mut config = Config::default();
+        config.apply_default_profile(DefaultProfile::PrivacyMax);
+        assert_eq!(config.default_profile, Some(DefaultProfile::PrivacyMax));
+        assert_eq!(config.max_history, 200);
+        assert_eq!(config.secret_ttl_seconds, 60);
+        assert_eq!(config.auto_pause_idle_seconds, 5 * 60);
+        assert!(config.auto_pause_remote);
+        config.shareable().validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_config_migration_is_previewed_without_private_values() {
+        let legacy = r#"
+hotkey = "Ctrl+Shift+V"
+excluded_apps = ["private-bank-app"]
+auto_pause_idle_seconds = 900
+"#;
+        let parsed: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.schema_version, LEGACY_CONFIG_SCHEMA_VERSION);
+        assert!(parsed.save().is_err());
+        let preview = preview_migration(legacy).unwrap();
+        assert_eq!(preview.from_schema, 1);
+        assert_eq!(preview.to_schema, 2);
+        assert_eq!(preview.changes.len(), 3);
+        assert!(!format!("{preview:?}").contains("private-bank-app"));
+        assert_eq!(
+            rollback_path(std::path::Path::new("config.toml"), 1),
+            PathBuf::from("config.toml.schema-1.rollback")
+        );
+        assert!(preview_migration("schema_version = -1").is_err());
+        assert!(preview_migration("schema_version = 65536").is_err());
+
+        let migrated = migrate_config_text(
+            "# keep this comment\nhotkey = \"Ctrl+Shift+V\"\nfuture_owner_key = \"keep\"\n",
+        )
+        .unwrap();
+        assert!(migrated.contains("# keep this comment"));
+        assert!(migrated.contains("future_owner_key = \"keep\""));
+        assert!(migrated.contains("schema_version = 2"));
+        assert!(migrated.contains("auto_pause_on_lock = true"));
+    }
+
+    #[test]
+    fn migrate_cli_requires_an_explicit_non_destructive_verb() {
+        assert_eq!(
+            parse_requested(["config", "migrate", "preview"].map(str::to_owned)).unwrap(),
+            Some(ConfigCommand::MigratePreview)
+        );
+        assert_eq!(
+            parse_requested(["config", "migrate", "apply"].map(str::to_owned)).unwrap(),
+            Some(ConfigCommand::MigrateApply)
+        );
+        assert!(parse_requested(["config", "migrate"].map(str::to_owned)).is_err());
     }
 }

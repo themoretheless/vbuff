@@ -4631,6 +4631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "toml_edit 0.20.2",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
@@ -4651,6 +4652,7 @@ dependencies = [
  "chrono",
  "hmac",
  "regex",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "similar",
@@ -4694,6 +4696,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "url",
+ "vbuff-core",
  "vbuff-types",
  "zeroize",
 ]

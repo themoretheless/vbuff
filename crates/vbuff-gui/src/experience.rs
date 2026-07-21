@@ -5,6 +5,58 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use vbuff_types::{Clip, ContentKind};
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum HistoryScope {
+    #[default]
+    All,
+    Kind(ContentKind),
+    Snippets,
+    Source(String),
+}
+
+impl std::fmt::Debug for HistoryScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => formatter.write_str("All"),
+            Self::Kind(kind) => formatter.debug_tuple("Kind").field(kind).finish(),
+            Self::Snippets => formatter.write_str("Snippets"),
+            Self::Source(_) => formatter.write_str("Source([redacted])"),
+        }
+    }
+}
+
+impl HistoryScope {
+    pub fn matches(&self, clip: &Clip) -> bool {
+        match self {
+            Self::All => true,
+            Self::Kind(kind) => clip.meta.kind == *kind,
+            Self::Snippets => clip.pinned || clip.favorite,
+            Self::Source(source) => clip.meta.source_app.as_ref() == Some(source),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::All => "All kinds".into(),
+            Self::Kind(kind) => kind.label().into(),
+            Self::Snippets => "Snippets".into(),
+            Self::Source(_) => "Recent app".into(),
+        }
+    }
+
+    pub fn from_jump_key(character: char) -> Option<Self> {
+        match character.to_ascii_lowercase() {
+            'u' => Some(Self::Kind(ContentKind::Url)),
+            'i' => Some(Self::Kind(ContentKind::Image)),
+            'c' => Some(Self::Kind(ContentKind::Code)),
+            'f' => Some(Self::Kind(ContentKind::File)),
+            'l' => Some(Self::Kind(ContentKind::Color)),
+            's' => Some(Self::Snippets),
+            _ => None,
+        }
+    }
+}
 use web_time::Instant;
 
 const RAPID_SCROLL_POINTS_PER_SECOND: f32 = 1_400.0;
@@ -44,6 +96,7 @@ pub struct UiPreferences {
     pub large_preview: bool,
     pub handed_mode: HandedMode,
     pub motion_inspector: bool,
+    pub show_health_digest: bool,
 }
 
 impl Default for UiPreferences {
@@ -54,6 +107,7 @@ impl Default for UiPreferences {
             large_preview: true,
             handed_mode: HandedMode::Off,
             motion_inspector: false,
+            show_health_digest: false,
         }
     }
 }
@@ -373,5 +427,19 @@ mod tests {
     fn contrast_self_audit_matches_wcag_reference_values() {
         assert!((contrast_ratio([0, 0, 0], [255, 255, 255]) - 21.0).abs() < 0.01);
         assert!(contrast_ratio([120, 120, 120], [255, 255, 255]) < 4.5);
+    }
+
+    #[test]
+    fn history_jump_keys_are_bounded_and_source_debug_is_redacted() {
+        assert_eq!(
+            HistoryScope::from_jump_key('U'),
+            Some(HistoryScope::Kind(ContentKind::Url))
+        );
+        assert_eq!(
+            HistoryScope::from_jump_key('s'),
+            Some(HistoryScope::Snippets)
+        );
+        assert_eq!(HistoryScope::from_jump_key('x'), None);
+        assert!(!format!("{:?}", HistoryScope::Source("private.app".into())).contains("private"));
     }
 }

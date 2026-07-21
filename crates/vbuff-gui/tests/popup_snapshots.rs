@@ -6,9 +6,9 @@ use egui_kittest::{Harness, SnapshotOptions};
 use vbuff_core::content_hash_from_flavors;
 use vbuff_gui::{AppState, PopupApp};
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, Clip, ClipId, ClipMeta, ContentKind, Flavor,
-    PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel,
-    SecurityPostureSummary, SloMetricState,
+    CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, Clip, ClipId, ClipMeta,
+    ClipboardHealthDigest, ContentKind, Flavor, PrivacyDecisionLevel, PrivacyEventSummary,
+    PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary, SloMetricState,
 };
 
 #[test]
@@ -22,6 +22,8 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
                 Surface::Populated,
                 Surface::Trust,
                 Surface::Compose,
+                Surface::Settings,
+                Surface::Alerts,
             ] {
                 let name = format!("popup_{theme_name}_{dpi_name}_{}", surface.name());
                 let state = Arc::new(Mutex::new(snapshot_state(surface)));
@@ -45,6 +47,11 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
                         .add_compose_item("URL", "https://github.com/themoretheless/vbuff");
                     harness.state_mut().request_compose_view(&ctx);
                     harness.run_steps(2);
+                } else if surface == Surface::Settings {
+                    let ctx = harness.ctx.clone();
+                    harness.state_mut().request_settings_view(&ctx);
+                    harness.state_mut().set_health_digest_visible(true);
+                    harness.run_steps(2);
                 }
                 harness.snapshot_options(name, &snapshots);
             }
@@ -58,6 +65,8 @@ enum Surface {
     Populated,
     Trust,
     Compose,
+    Settings,
+    Alerts,
 }
 
 impl Surface {
@@ -67,6 +76,8 @@ impl Surface {
             Self::Populated => "populated",
             Self::Trust => "trust",
             Self::Compose => "compose",
+            Self::Settings => "settings",
+            Self::Alerts => "alerts",
         }
     }
 }
@@ -90,6 +101,28 @@ fn snapshot_state(surface: Surface) -> AppState {
     state.capture_stats.captured = 42;
     state.capture_stats.intentionally_skipped = 3;
     state.slo_status.zero_loss = SloMetricState::Met;
+    if surface == Surface::Settings {
+        state.default_profile = Some(vbuff_core::onboarding::DefaultProfile::Developer);
+        state.health_digest = ClipboardHealthDigest {
+            database_bytes: 48 * 1_024 * 1_024,
+            stored_items: 642,
+            largest_clip_bytes: 3 * 1_024 * 1_024,
+            expiring_within_week: 8,
+            sensitive_items: 12,
+            suggested_pins: 3,
+            stale_pins: 1,
+        };
+        if let Some(clip) = state.clips.first_mut() {
+            clip.pinned = true;
+            clip.meta.created_at =
+                chrono::Utc::now() - chrono::Duration::days(120) - chrono::Duration::hours(1);
+        }
+    }
+    if surface == Surface::Alerts {
+        state.capture_health = CaptureHealth::StorageError;
+        state.health_alert = Some(CaptureHealth::StorageError);
+        state.size_budget_alert = Some(CaptureBudgetAlert::Skipped);
+    }
     state.security_posture = SecurityPostureSummary {
         level: SecurityPostureLevel::Partial,
         active: 3,

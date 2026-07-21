@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use eframe::App as _;
 use global_hotkey::GlobalHotKeyEvent;
 use vbuff_core::capture::SelfWriteLedger;
+use vbuff_core::onboarding::DefaultProfile;
+use vbuff_core::workflow::plain_text_clone;
 use vbuff_gui::{PopupApp, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend};
-use vbuff_types::{ClientIntent, NoticeLevel};
+use vbuff_types::{CapturePauseReason, ClientIntent, NoticeLevel};
 
 #[cfg(feature = "tray")]
 use crate::autostart;
@@ -41,6 +43,7 @@ pub(crate) struct AppServices {
     pub(crate) config: Config,
     pub(crate) self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
     pub(crate) strict_capture_blocked: bool,
+    pub(crate) automatic_pause_reason: Option<CapturePauseReason>,
 }
 
 pub(crate) fn run(
@@ -116,6 +119,7 @@ struct Runtime {
     event_waker: Arc<Mutex<Option<egui::Context>>>,
     paused: Arc<AtomicBool>,
     strict_capture_blocked: bool,
+    automatic_pause_reason: Option<CapturePauseReason>,
     config: Config,
     popup: PopupApp,
     paste: PasteCoordinator,
@@ -143,6 +147,7 @@ impl Runtime {
             config,
             self_writes,
             strict_capture_blocked,
+            automatic_pause_reason,
         } = services;
         let (intent_sender, instance_intents) = channel();
         let intent_waker = Arc::clone(&event_waker);
@@ -170,6 +175,7 @@ impl Runtime {
             event_waker,
             paused,
             strict_capture_blocked,
+            automatic_pause_reason,
             config,
             paste: PasteCoordinator::system(self_writes),
             #[cfg(feature = "tray")]
@@ -297,6 +303,39 @@ impl Runtime {
                     tracing::warn!("updating pin failed: {error}");
                 }
             }
+            AppCommand::SetSessionProtected(id, protected) => {
+                if let Err(error) = self.history.set_session_protected(id, protected) {
+                    self.notice(NoticeLevel::Error, "Couldn't update session protection");
+                    tracing::warn!("updating session protection failed: {error}");
+                } else {
+                    self.notice(
+                        NoticeLevel::Info,
+                        if protected {
+                            "Clip protected for this session"
+                        } else {
+                            "Session protection removed"
+                        },
+                    );
+                }
+            }
+            AppCommand::CreatePlainTextClone(id) => {
+                let result = self
+                    .history
+                    .find(id)
+                    .and_then(|source| {
+                        source
+                            .and_then(|clip| plain_text_clone(&clip, chrono::Utc::now()))
+                            .ok_or_else(|| anyhow::anyhow!("clip has no realized text flavor"))
+                    })
+                    .and_then(|clone| self.history.insert(&clone, self.config.max_history));
+                match result {
+                    Ok(()) => self.notice(NoticeLevel::Info, "Plain-text clone created"),
+                    Err(error) => {
+                        self.notice(NoticeLevel::Error, "Couldn't create a plain-text clone");
+                        tracing::warn!("creating plain-text clone failed: {error}");
+                    }
+                }
+            }
             AppCommand::Delete(id) => match self.history.delete(id) {
                 Ok(()) => self.notice(NoticeLevel::Info, "Clip deleted"),
                 Err(error) => {
@@ -319,7 +358,10 @@ impl Runtime {
             }
             AppCommand::ClearHistory => match self.history.clear_history() {
                 Ok(()) => {
-                    self.notice(NoticeLevel::Info, "History cleared; pinned clips kept");
+                    self.notice(
+                        NoticeLevel::Info,
+                        "History cleared; pinned and session-protected clips kept",
+                    );
                 }
                 Err(error) => {
                     self.notice(NoticeLevel::Error, "Couldn't clear clipboard history");
@@ -345,6 +387,17 @@ impl Runtime {
                         self.notice(NoticeLevel::Error, "Couldn't add starter examples");
                         tracing::warn!("installing starter pack failed: {error}");
                     }
+                }
+            }
+            AppCommand::ApplyDefaultProfile(profile) => self.apply_default_profile(profile),
+            AppCommand::DismissHealthAlert => {
+                if let Ok(mut state) = self.shared.lock() {
+                    state.health_alert = None;
+                }
+            }
+            AppCommand::DismissSizeBudgetAlert => {
+                if let Ok(mut state) = self.shared.lock() {
+                    state.size_budget_alert = None;
                 }
             }
             #[cfg(feature = "tray")]
@@ -427,6 +480,7 @@ impl Runtime {
             self.paused.store(true, Ordering::Relaxed);
             if let Ok(mut state) = self.shared.lock() {
                 state.paused = true;
+                state.pause_reason = Some(CapturePauseReason::SecurityPolicy);
             }
             self.diagnostics.notice(
                 NoticeLevel::Warning,
@@ -434,12 +488,44 @@ impl Runtime {
             );
             return;
         }
+        if let Some(reason) = self.automatic_pause_reason {
+            self.paused.store(true, Ordering::Relaxed);
+            if let Ok(mut state) = self.shared.lock() {
+                state.paused = true;
+                state.pause_reason = Some(reason);
+            }
+            self.diagnostics
+                .notice(NoticeLevel::Warning, reason.label());
+            return;
+        }
         let paused = !self.paused.load(Ordering::Relaxed);
         self.paused.store(paused, Ordering::Relaxed);
         if let Ok(mut state) = self.shared.lock() {
             state.paused = paused;
+            state.pause_reason = paused.then_some(CapturePauseReason::Manual);
         }
         tracing::info!(paused, "capture pause toggled");
+    }
+
+    fn apply_default_profile(&mut self, profile: DefaultProfile) {
+        let previous = self.config.clone();
+        self.config.apply_default_profile(profile);
+        if let Err(error) = self.config.save() {
+            self.config = previous;
+            self.notice(
+                NoticeLevel::Error,
+                "Couldn't save profile; preview config migration first",
+            );
+            tracing::warn!("saving default profile failed: {error}");
+            return;
+        }
+        if let Ok(mut state) = self.shared.lock() {
+            state.default_profile = Some(profile);
+        }
+        self.notice(
+            NoticeLevel::Info,
+            "Profile saved; restart vbuff to apply capture and auto-pause policy",
+        );
     }
 
     #[cfg(feature = "tray")]

@@ -15,9 +15,13 @@ fn capture_classification_and_hashing_stay_inside_budget() {
         black_box(content_hash_from_flavors(&flavors));
         black_box(detect_kind(&flavors));
     }
+    let elapsed = started.elapsed();
+    println!(
+        "metric=core_capture_hash_classify iterations=10000 elapsed_ms={} budget_ms=3000",
+        elapsed.as_millis()
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "core capture hot path exceeded 3 seconds: {:?}",
-        started.elapsed()
+        elapsed < Duration::from_secs(3),
+        "core capture hot path exceeded 3 seconds: {elapsed:?}"
     );
 }

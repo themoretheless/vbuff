@@ -21,9 +21,10 @@ use ulid::Ulid;
 
 pub use ipc::{ClientIntent, ServerResponse};
 pub use status::{
-    CapabilityView, CapabilityViewLevel, CaptureHealth, CaptureSessionStats, CommandNotice,
-    NoticeLevel, PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary,
-    SecurityPostureLevel, SecurityPostureSummary, SloMetricState, SloStatusSummary,
+    CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, CapturePauseReason,
+    CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyDecisionLevel,
+    PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary,
+    SloMetricState, SloStatusSummary,
 };
 
 /// A ULID-based identifier for a clip.

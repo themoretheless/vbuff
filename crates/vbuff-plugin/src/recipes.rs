@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use url::Url;
+use vbuff_core::workflow::clean_link;
 
 use crate::{PluginError, Result};
 
@@ -56,7 +56,9 @@ pub fn apply_starter_recipe(id: StarterRecipeId, input: &str) -> Result<String> 
         ));
     }
     match id {
-        StarterRecipeId::CleanUrl => clean_url(input),
+        StarterRecipeId::CleanUrl => {
+            clean_link(input).map_err(|error| PluginError::InvalidInput(error.to_string()))
+        }
         StarterRecipeId::NormalizeSmartQuotes => Ok(input
             .replace(['\u{2018}', '\u{2019}'], "'")
             .replace(['\u{201c}', '\u{201d}'], "\"")
@@ -69,55 +71,6 @@ pub fn apply_starter_recipe(id: StarterRecipeId, input: &str) -> Result<String> 
         }
         StarterRecipeId::MaskCardPreview => Ok(mask_card_numbers(input)),
     }
-}
-
-fn clean_url(input: &str) -> Result<String> {
-    let mut url =
-        Url::parse(input.trim()).map_err(|_| PluginError::InvalidInput("invalid URL".into()))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(PluginError::InvalidInput(
-            "clean-link recipe accepts only HTTP(S) URLs".into(),
-        ));
-    }
-    if let Some(unwrapped) = known_redirect_target(&url) {
-        url = unwrapped;
-    }
-    let retained = url
-        .query_pairs()
-        .filter(|(key, _)| !is_tracking_parameter(key))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    url.set_query(None);
-    if !retained.is_empty() {
-        url.query_pairs_mut().extend_pairs(retained);
-    }
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
-fn known_redirect_target(url: &Url) -> Option<Url> {
-    let host = url.host_str()?.to_ascii_lowercase();
-    let parameter = match (host.as_str(), url.path()) {
-        ("www.google.com" | "google.com", "/url") => "q",
-        ("l.facebook.com", "/l.php") => "u",
-        ("out.reddit.com", _) => "url",
-        _ => return None,
-    };
-    let target = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == parameter).then(|| value.into_owned()))?;
-    let target = Url::parse(&target).ok()?;
-    matches!(target.scheme(), "http" | "https").then_some(target)
-}
-
-fn is_tracking_parameter(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.starts_with("utm_")
-        || key.starts_with("mc_")
-        || matches!(
-            key.as_str(),
-            "fbclid" | "gclid" | "dclid" | "msclkid" | "igshid" | "ref_src" | "ref_url"
-        )
 }
 
 fn mask_card_numbers(input: &str) -> String {

@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use vbuff_core::onboarding::DefaultProfile;
 use vbuff_gui::{StarterPack, UiAction};
 use vbuff_types::{Clip, ClipId};
 
@@ -14,6 +15,8 @@ pub(crate) enum AppCommand {
     #[cfg(feature = "tray")]
     CopyLatest,
     SetPinned(ClipId, bool),
+    SetSessionProtected(ClipId, bool),
+    CreatePlainTextClone(ClipId),
     Delete(ClipId),
     RestoreClip(Box<Clip>),
     #[cfg(feature = "tray")]
@@ -22,6 +25,9 @@ pub(crate) enum AppCommand {
     TogglePause,
     RecoverSkipped,
     InstallStarterPack(StarterPack),
+    ApplyDefaultProfile(DefaultProfile),
+    DismissHealthAlert,
+    DismissSizeBudgetAlert,
     #[cfg(feature = "tray")]
     ToggleAutostart,
     DismissNotice,
@@ -47,6 +53,15 @@ impl fmt::Debug for AppCommand {
                 .field(id)
                 .field(pinned)
                 .finish(),
+            Self::SetSessionProtected(id, protected) => formatter
+                .debug_tuple("SetSessionProtected")
+                .field(id)
+                .field(protected)
+                .finish(),
+            Self::CreatePlainTextClone(id) => formatter
+                .debug_tuple("CreatePlainTextClone")
+                .field(id)
+                .finish(),
             Self::Delete(id) => formatter.debug_tuple("Delete").field(id).finish(),
             Self::RestoreClip(clip) => formatter
                 .debug_struct("RestoreClip")
@@ -63,6 +78,12 @@ impl fmt::Debug for AppCommand {
                 .debug_tuple("InstallStarterPack")
                 .field(pack)
                 .finish(),
+            Self::ApplyDefaultProfile(profile) => formatter
+                .debug_tuple("ApplyDefaultProfile")
+                .field(profile)
+                .finish(),
+            Self::DismissHealthAlert => formatter.write_str("DismissHealthAlert"),
+            Self::DismissSizeBudgetAlert => formatter.write_str("DismissSizeBudgetAlert"),
             #[cfg(feature = "tray")]
             Self::ToggleAutostart => formatter.write_str("ToggleAutostart"),
             Self::DismissNotice => formatter.write_str("DismissNotice"),
@@ -80,12 +101,19 @@ impl From<UiAction> for AppCommand {
             UiAction::Paste(id) => Self::Paste(id),
             UiAction::PasteText(text) => Self::PasteText(text),
             UiAction::SetPinned(id, pinned) => Self::SetPinned(id, pinned),
+            UiAction::SetSessionProtected(id, protected) => {
+                Self::SetSessionProtected(id, protected)
+            }
+            UiAction::CreatePlainTextClone(id) => Self::CreatePlainTextClone(id),
             UiAction::Delete(id) => Self::Delete(id),
             UiAction::RestoreClip(clip) => Self::RestoreClip(clip),
             UiAction::ClearHistory => Self::ClearHistory,
             UiAction::TogglePause => Self::TogglePause,
             UiAction::RecoverSkipped => Self::RecoverSkipped,
             UiAction::InstallStarterPack(pack) => Self::InstallStarterPack(pack),
+            UiAction::ApplyDefaultProfile(profile) => Self::ApplyDefaultProfile(profile),
+            UiAction::DismissHealthAlert => Self::DismissHealthAlert,
+            UiAction::DismissSizeBudgetAlert => Self::DismissSizeBudgetAlert,
             UiAction::DismissNotice => Self::DismissNotice,
             UiAction::DismissHotkeyCoachmark => Self::DismissHotkeyCoachmark,
             UiAction::Hide => Self::Hide,

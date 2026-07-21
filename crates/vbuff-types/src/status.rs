@@ -38,6 +38,44 @@ impl CaptureHealth {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePauseReason {
+    Manual,
+    Idle,
+    ScreenLocked,
+    RemoteControl,
+    SecurityPolicy,
+}
+
+impl CapturePauseReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Paused manually",
+            Self::Idle => "Paused while idle",
+            Self::ScreenLocked => "Paused while screen is locked",
+            Self::RemoteControl => "Paused during remote control",
+            Self::SecurityPolicy => "Paused by security policy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBudgetAlert {
+    PreviewOnly,
+    Skipped,
+}
+
+impl CaptureBudgetAlert {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PreviewOnly => "Large copy saved as text preview",
+            Self::Skipped => "Large copy skipped by size budget",
+        }
+    }
+}
+
 /// Severity for a redacted, user-visible command result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +98,18 @@ pub struct CaptureSessionStats {
     pub captured: u64,
     pub intentionally_skipped: u64,
     pub lost: u64,
+}
+
+/// Content-free database and retention summary for the optional health digest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardHealthDigest {
+    pub database_bytes: u64,
+    pub stored_items: usize,
+    pub largest_clip_bytes: u64,
+    pub expiring_within_week: usize,
+    pub sensitive_items: usize,
+    pub suggested_pins: usize,
+    pub stale_pins: usize,
 }
 
 /// Coarse security state suitable for compact UI and IPC surfaces.

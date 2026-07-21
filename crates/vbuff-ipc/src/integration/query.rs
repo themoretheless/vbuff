@@ -1,18 +1,9 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use vbuff_types::ContentKind;
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum IntegrationContractError {
-    #[error("integration field is invalid")]
-    InvalidField,
-    #[error("integration request has expired")]
-    Expired,
-    #[error("integration request is not scoped to one recipient")]
-    InvalidRecipient,
-}
+use super::IntegrationContractError;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +65,110 @@ impl LauncherRankSignals {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherClient {
+    Raycast,
+    Alfred,
+    Rofi,
+    Dmenu,
+    Fzf,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LauncherRequest {
+    pub client: LauncherClient,
+    pub query: String,
+    pub limit: u16,
+}
+
+impl fmt::Debug for LauncherRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LauncherRequest")
+            .field("client", &self.client)
+            .field(
+                "query",
+                &format_args!("[redacted; {} bytes]", self.query.len()),
+            )
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LauncherCandidate {
+    pub clip_id: String,
+    pub signals: LauncherRankSignals,
+}
+
+impl fmt::Debug for LauncherCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LauncherCandidate")
+            .field("clip_id", &"[redacted]")
+            .field("signals", &self.signals)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LauncherRankedResult {
+    pub clip_id: String,
+    pub score: i64,
+    pub rank: u16,
+}
+
+impl fmt::Debug for LauncherRankedResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LauncherRankedResult")
+            .field("clip_id", &"[redacted]")
+            .field("score", &self.score)
+            .field("rank", &self.rank)
+            .finish()
+    }
+}
+
+pub fn rank_launcher_candidates(
+    request: &LauncherRequest,
+    mut candidates: Vec<LauncherCandidate>,
+) -> Result<Vec<LauncherRankedResult>, IntegrationContractError> {
+    if request.query.len() > 4_096
+        || request.query.contains('\0')
+        || !(1..=100).contains(&request.limit)
+        || candidates.len() > 10_000
+        || candidates.iter().any(|candidate| {
+            candidate.clip_id.is_empty()
+                || candidate.clip_id.len() > 128
+                || !candidate
+                    .clip_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(IntegrationContractError::InvalidField);
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .signals
+            .score()
+            .cmp(&left.signals.score())
+            .then_with(|| left.clip_id.cmp(&right.clip_id))
+    });
+    Ok(candidates
+        .into_iter()
+        .take(usize::from(request.limit))
+        .enumerate()
+        .map(|(index, candidate)| LauncherRankedResult {
+            clip_id: candidate.clip_id,
+            score: candidate.signals.score(),
+            rank: (index + 1) as u16,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +205,44 @@ mod tests {
             include_explanation: false,
         };
         assert!(!format!("{query:?}").contains("medical"));
+    }
+
+    #[test]
+    fn launcher_endpoint_is_stable_bounded_and_redacted() {
+        let request = LauncherRequest {
+            client: LauncherClient::Raycast,
+            query: String::new(),
+            limit: 1,
+        };
+        let ranked = rank_launcher_candidates(
+            &request,
+            vec![
+                LauncherCandidate {
+                    clip_id: "older".into(),
+                    signals: LauncherRankSignals {
+                        lexical_score: 1,
+                        frecency_score: 1,
+                        age_seconds: 1_000,
+                        origin_is_remote: false,
+                        kind: ContentKind::Text,
+                    },
+                },
+                LauncherCandidate {
+                    clip_id: "fresh".into(),
+                    signals: LauncherRankSignals {
+                        lexical_score: 2,
+                        frecency_score: 2,
+                        age_seconds: 1,
+                        origin_is_remote: true,
+                        kind: ContentKind::Text,
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].clip_id, "fresh");
+        assert!(!format!("{:?}", ranked[0]).contains("fresh"));
+        assert!(!format!("{request:?}").contains("private"));
     }
 }

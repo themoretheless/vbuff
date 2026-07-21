@@ -492,6 +492,7 @@ fn run_worker(
                     continue;
                 };
                 captured.flavors = preview;
+                diagnostics.capture_budget_alert(vbuff_types::CaptureBudgetAlert::PreviewOnly);
                 record_drop(
                     &history,
                     &diagnostics,
@@ -503,6 +504,7 @@ fn run_worker(
             }
             Admission::Shed => {
                 last_shed = Some((observed_hash, observed_at));
+                diagnostics.capture_budget_alert(vbuff_types::CaptureBudgetAlert::Skipped);
                 record_drop(
                     &history,
                     &diagnostics,
