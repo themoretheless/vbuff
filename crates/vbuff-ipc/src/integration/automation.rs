@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use super::IntegrationContractError;
 
+mod remote;
+mod share;
+mod snippets;
+
+pub use remote::{RemotePasteLease, RemotePasteRequest, RemoteReplayWindow};
+pub use share::{ShareDraft, ShareDraftState};
+pub use snippets::{
+    SnippetBridgeCursor, SnippetMirrorAction, SnippetMirrorOperation, SnippetMirrorRecord,
+    VimRegisterAction, VimRegisterRequest, plan_snippet_mirror,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSurface {
@@ -60,122 +71,6 @@ impl fmt::Debug for AutomationCommand {
                 .field("device_id_bytes", &device_id.len())
                 .finish(),
         }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemotePasteRequest {
-    pub forwarded_socket: String,
-    pub session_nonce: String,
-    pub clip_id: String,
-}
-
-impl fmt::Debug for RemotePasteRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RemotePasteRequest")
-            .field("forwarded_socket_bytes", &self.forwarded_socket.len())
-            .field("session_nonce", &"[redacted]")
-            .field("clip_id", &"[redacted]")
-            .finish()
-    }
-}
-
-impl RemotePasteRequest {
-    pub fn validate(&self) -> Result<(), IntegrationContractError> {
-        for value in [&self.forwarded_socket, &self.session_nonce, &self.clip_id] {
-            if value.is_empty()
-                || value.len() > 256
-                || !value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
-                })
-            {
-                return Err(IntegrationContractError::InvalidField);
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShareDraftState {
-    Preview,
-    Committed,
-    Cancelled,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ShareDraft {
-    pub draft_id: String,
-    pub destination_collection: Option<String>,
-    pub tags: Vec<String>,
-    pub pinned: bool,
-    pub state: ShareDraftState,
-}
-
-impl fmt::Debug for ShareDraft {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ShareDraft")
-            .field("draft_id", &"[redacted]")
-            .field(
-                "destination_collection_bytes",
-                &self.destination_collection.as_ref().map(String::len),
-            )
-            .field("tag_count", &self.tags.len())
-            .field("pinned", &self.pinned)
-            .field("state", &self.state)
-            .finish()
-    }
-}
-
-impl ShareDraft {
-    pub fn commit(&mut self) -> Result<(), IntegrationContractError> {
-        if self.state != ShareDraftState::Preview
-            || !valid_identifier(&self.draft_id, 128)
-            || self
-                .destination_collection
-                .as_ref()
-                .is_some_and(|collection| !valid_label(collection, 128))
-            || self.tags.len() > 32
-            || self.tags.iter().any(|tag| !valid_label(tag, 64))
-        {
-            return Err(IntegrationContractError::InvalidField);
-        }
-        self.state = ShareDraftState::Committed;
-        Ok(())
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnippetBridgeCursor {
-    pub adapter: String,
-    pub source_revision: u64,
-    pub target_revision: u64,
-    pub last_manifest_hash: [u8; 32],
-}
-
-impl fmt::Debug for SnippetBridgeCursor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SnippetBridgeCursor")
-            .field("adapter_bytes", &self.adapter.len())
-            .field("source_revision", &self.source_revision)
-            .field("target_revision", &self.target_revision)
-            .field("last_manifest_hash", &"[redacted]")
-            .finish()
-    }
-}
-
-impl SnippetBridgeCursor {
-    pub fn accepts(&self, source_revision: u64, target_revision: u64) -> bool {
-        source_revision >= self.source_revision
-            && target_revision >= self.target_revision
-            && (source_revision > self.source_revision || target_revision > self.target_revision)
     }
 }
 
@@ -240,25 +135,35 @@ mod tests {
 
     #[test]
     fn share_ingress_cannot_commit_without_preview_state() {
-        let mut draft = ShareDraft {
-            draft_id: "draft-1".into(),
-            destination_collection: Some("work".into()),
-            tags: vec!["review".into()],
-            pinned: false,
-            state: ShareDraftState::Preview,
-        };
+        let mut draft = ShareDraft::preview(
+            "draft-1".into(),
+            Some("work".into()),
+            vec!["review".into()],
+            false,
+        )
+        .unwrap();
         draft.commit().unwrap();
-        assert_eq!(draft.state, ShareDraftState::Committed);
+        assert_eq!(draft.state(), ShareDraftState::Committed);
+        assert_eq!(draft.draft_id(), "draft-1");
+        assert_eq!(draft.destination_collection(), Some("work"));
+        assert_eq!(draft.tags(), &["review"]);
+        assert!(!draft.pinned());
         assert!(draft.commit().is_err());
 
-        let mut invalid_destination = ShareDraft {
-            draft_id: "draft-2".into(),
-            destination_collection: Some("bad\ncollection".into()),
-            tags: Vec::new(),
-            pinned: false,
-            state: ShareDraftState::Preview,
-        };
-        assert!(invalid_destination.commit().is_err());
+        let mut cancelled = ShareDraft::preview("draft-3".into(), None, Vec::new(), true).unwrap();
+        cancelled.cancel().unwrap();
+        assert_eq!(cancelled.state(), ShareDraftState::Cancelled);
+        assert!(cancelled.commit().is_err());
+
+        assert!(
+            ShareDraft::preview(
+                "draft-2".into(),
+                Some("bad\ncollection".into()),
+                Vec::new(),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -336,6 +241,89 @@ mod tests {
                 forwarded_socket: "socket;rm".into(),
                 session_nonce: "nonce".into(),
                 clip_id: "clip".into(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RemotePasteRequest {
+                forwarded_socket: "localhost:/run/../private/vbuff.sock".into(),
+                session_nonce: "nonce".into(),
+                clip_id: "clip".into(),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_paste_lease_is_short_lived_authenticated_and_one_shot() {
+        let request = RemotePasteRequest {
+            forwarded_socket: "localhost:/run/user/1000/vbuff.sock".into(),
+            session_nonce: "nonce-1".into(),
+            clip_id: "clip-1".into(),
+        };
+        let lease = RemotePasteLease::bind(&request, &[7; 32], 100, 1_000).unwrap();
+        let mut window = RemoteReplayWindow::default();
+        window
+            .verify_and_consume(&lease, &request, &[7; 32], 500)
+            .unwrap();
+        assert!(
+            window
+                .verify_and_consume(&lease, &request, &[7; 32], 501)
+                .is_err()
+        );
+        assert!(!format!("{lease:?}").contains("nonce-1"));
+        assert_eq!(
+            format!("{window:?}"),
+            "RemoteReplayWindow { consumed_count: 1 }"
+        );
+        assert!(
+            RemoteReplayWindow::default()
+                .verify_and_consume(&lease, &request, &[8; 32], 500)
+                .is_err()
+        );
+        assert!(RemotePasteLease::bind(&request, &[7; 32], 100, 60_001).is_err());
+        assert!(RemotePasteLease::bind(&request, &[0; 32], 100, 1_000).is_err());
+    }
+
+    #[test]
+    fn snippet_mirror_and_vim_register_are_bounded_and_content_free() {
+        let plan = plan_snippet_mirror(
+            &[SnippetMirrorRecord {
+                key: "deploy".into(),
+                content_hash: [1; 32],
+                revision: 2,
+            }],
+            &[SnippetMirrorRecord {
+                key: "deploy".into(),
+                content_hash: [2; 32],
+                revision: 1,
+            }],
+        )
+        .unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::UpsertTarget);
+        assert!(!format!("{:?}", plan[0]).contains("deploy"));
+        let source = SnippetMirrorRecord {
+            key: "deploy".into(),
+            content_hash: [1; 32],
+            revision: 2,
+        };
+        assert!(!format!("{source:?}").contains("deploy"));
+        assert!(
+            VimRegisterRequest {
+                namespace: "vbuff".into(),
+                slot: 12,
+                action: VimRegisterAction::ReadHistory,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            VimRegisterRequest {
+                namespace: "system".into(),
+                slot: 0,
+                action: VimRegisterAction::AddYank,
             }
             .validate()
             .is_err()

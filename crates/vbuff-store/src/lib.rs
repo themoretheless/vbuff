@@ -26,8 +26,8 @@ use vbuff_core::fingerprint::{
 };
 use vbuff_core::intelligence::{AiGate, AiOperation};
 use vbuff_types::{
-    CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta, ContentKind,
-    Flavor,
+    CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta,
+    ClipboardHealthDigest, ContentKind, Flavor,
 };
 
 mod cas;
@@ -296,6 +296,13 @@ impl Store {
             search_planner: RefCell::new(search::SearchPlanner::default()),
         };
         store.migrate()?;
+        store.conn.execute_batch(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS session_protected (
+                clip_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            "#,
+        )?;
         store.backfill_fingerprints(32)?;
         store.backfill_normalized_fingerprints(128)?;
         store.rebuild_dedup_filter()?;
@@ -1068,6 +1075,10 @@ impl Store {
                    byte_size, source_app, metadata_json, pinned, favorite
             FROM clips
             WHERE expires_at IS NULL OR expires_at > ?1
+               OR EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+               )
             ORDER BY pinned DESC, updated_at DESC, seq DESC
             LIMIT ?2
             "#,
@@ -1184,6 +1195,93 @@ impl Store {
             });
         }
         Ok(suggestions)
+    }
+
+    /// Protect one clip only for this process session. The TEMP table is never
+    /// written into the durable database and disappears when the connection closes.
+    pub fn set_session_protected(&self, id: ClipId, protected: bool) -> Result<()> {
+        if protected {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::ClipNotFound(id.to_string_repr()));
+            }
+            let protected_count: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM session_protected", [], |row| {
+                        row.get(0)
+                    })?;
+            let already_protected = self.session_protected(id)?;
+            if !already_protected && protected_count >= 10_000 {
+                return Err(StoreError::Maintenance(
+                    "session protection limit reached".into(),
+                ));
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_protected(clip_id) VALUES (?1)",
+                [id.to_string_repr()],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM session_protected WHERE clip_id = ?1",
+                [id.to_string_repr()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn session_protected(&self, id: ClipId) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_protected WHERE clip_id = ?1)",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Build a content-free health snapshot from row and page metadata only.
+    pub fn clipboard_health_digest(&self) -> Result<ClipboardHealthDigest> {
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let now = now_millis();
+        let week = now.saturating_add(7 * 24 * 60 * 60 * 1_000);
+        let stale_cutoff = now.saturating_sub(90 * 24 * 60 * 60 * 1_000);
+        let (stored_items, largest, expiring, sensitive, stale_pins) = self.conn.query_row(
+            r#"
+            SELECT COUNT(*), COALESCE(MAX(byte_size), 0),
+                   COALESCE(SUM(CASE WHEN expires_at > ?1 AND expires_at <= ?2 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN pinned = 1 AND created_at < ?3 THEN 1 ELSE 0 END), 0)
+            FROM clips
+            "#,
+            params![now, week, stale_cutoff],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        Ok(ClipboardHealthDigest {
+            database_bytes: page_count.max(0).saturating_mul(page_size.max(0)) as u64,
+            stored_items: stored_items.max(0) as usize,
+            largest_clip_bytes: largest.max(0) as u64,
+            expiring_within_week: expiring.max(0) as usize,
+            sensitive_items: sensitive.max(0) as usize,
+            suggested_pins: self.suggested_pins(3, 100)?.len(),
+            stale_pins: stale_pins.max(0) as usize,
+        })
     }
 
     /// Persist one per-kind or sensitive-content retention rule.
@@ -1336,7 +1434,10 @@ impl Store {
             SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
                    c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
             FROM clips c
-            WHERE (c.expires_at IS NULL OR c.expires_at > ?)
+            WHERE (c.expires_at IS NULL OR c.expires_at > ? OR EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = c.id
+                  ))
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
             "#,
         );
@@ -1938,6 +2039,10 @@ impl Store {
                     "DELETE FROM clips WHERE id = ?1",
                     params![clip.id.to_string_repr()],
                 )?;
+                transaction.execute(
+                    "DELETE FROM temp.session_protected WHERE clip_id = ?1",
+                    params![clip.id.to_string_repr()],
+                )?;
                 report.quarantined += 1;
             } else {
                 transaction.execute(
@@ -2043,6 +2148,10 @@ impl Store {
         if deleted != 1 {
             return Err(StoreError::ClipNotFound(id.to_string_repr()));
         }
+        transaction.execute(
+            "DELETE FROM temp.session_protected WHERE clip_id = ?1",
+            [id.to_string_repr()],
+        )?;
         transaction.commit()?;
         if scrub_after {
             self.scrub_deleted_pages()?;
@@ -2189,6 +2298,10 @@ impl Store {
                 r#"
                 SELECT id FROM clips
                 WHERE pinned = 0 AND favorite = 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
@@ -2215,6 +2328,10 @@ impl Store {
                 r#"
                 SELECT id FROM clips
                 WHERE pinned = 0 AND favorite = 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
@@ -2263,11 +2380,13 @@ impl Store {
                 ),
                 StoreMutation::Delete { id } => {
                     deleted = true;
-                    (
-                        id,
-                        transaction
-                            .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?,
-                    )
+                    let changed = transaction
+                        .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+                    transaction.execute(
+                        "DELETE FROM temp.session_protected WHERE clip_id = ?1",
+                        [id.to_string_repr()],
+                    )?;
+                    (id, changed)
                 }
             };
             if changed != 1 {
@@ -2287,17 +2406,29 @@ impl Store {
             "DELETE FROM clips WHERE id = ?1",
             params![id.to_string_repr()],
         )?;
+        self.conn.execute(
+            "DELETE FROM session_protected WHERE clip_id = ?1",
+            params![id.to_string_repr()],
+        )?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
         }
         Ok(())
     }
 
-    /// Delete every non-pinned clip. Pinned clips are preserved.
+    /// Delete every non-pinned, non-session-protected clip.
     pub fn clear(&self) -> Result<()> {
-        let deleted = self
-            .conn
-            .execute("DELETE FROM clips WHERE pinned = 0", [])?;
+        let deleted = self.conn.execute(
+            r#"
+            DELETE FROM clips
+            WHERE pinned = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM session_protected AS protected
+                WHERE protected.clip_id = clips.id
+              )
+            "#,
+            [],
+        )?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
         }
@@ -2307,6 +2438,7 @@ impl Store {
     /// Delete every clip, including pinned ones.
     pub fn clear_all(&self) -> Result<()> {
         let deleted = self.conn.execute("DELETE FROM clips", [])?;
+        self.conn.execute("DELETE FROM session_protected", [])?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
         }
@@ -2325,7 +2457,14 @@ impl Store {
     /// Delete clips whose hard privacy TTL elapsed, including pinned rows.
     pub fn purge_expired(&self) -> Result<usize> {
         let deleted = self.conn.execute(
-            "DELETE FROM clips WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            r#"
+            DELETE FROM clips
+            WHERE expires_at IS NOT NULL AND expires_at <= ?1
+              AND NOT EXISTS (
+                SELECT 1 FROM session_protected AS protected
+                WHERE protected.clip_id = clips.id
+              )
+            "#,
             params![now_millis()],
         )?;
         if deleted > 0 {
@@ -2381,6 +2520,10 @@ impl Store {
             DELETE FROM clips WHERE id IN (
                 SELECT id FROM clips
                 WHERE pinned = 0 AND favorite = 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )
                 ORDER BY updated_at ASC, seq ASC
                 LIMIT ?1
             )
@@ -2918,6 +3061,50 @@ mod tests {
         assert_eq!(store.count().unwrap(), 3);
         // Pinned survived.
         assert!(store.list(10).unwrap().iter().any(|c| c.pinned));
+    }
+
+    #[test]
+    fn session_protection_survives_automatic_cleanup_until_released() {
+        let store = Store::open_in_memory().unwrap();
+        let mut protected = make_clip("protected for this session");
+        protected.meta.expires_at = Some(chrono::Utc::now() - Duration::seconds(1));
+        let protected_id = store.insert(&protected).unwrap();
+        store.set_session_protected(protected_id, true).unwrap();
+        store.insert(&make_clip("ordinary")).unwrap();
+
+        assert_eq!(store.purge_expired().unwrap(), 0);
+        assert_eq!(store.enforce_cap(1).unwrap(), 1);
+        store.clear().unwrap();
+        assert!(store.session_protected(protected_id).unwrap());
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.list(10).unwrap()[0].id, protected_id);
+
+        store.set_session_protected(protected_id, false).unwrap();
+        assert_eq!(store.purge_expired().unwrap(), 1);
+    }
+
+    #[test]
+    fn clipboard_health_digest_contains_metadata_only_counts() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sensitive = make_clip("private digest value");
+        sensitive.meta.sensitive = true;
+        sensitive.meta.sync_eligible = false;
+        sensitive.meta.expires_at = Some(chrono::Utc::now() + Duration::days(1));
+        store.insert(&sensitive).unwrap();
+        store.insert(&make_clip("ordinary digest value")).unwrap();
+        let mut stale = make_clip("stale pin");
+        stale.pinned = true;
+        stale.meta.created_at = chrono::Utc::now() - Duration::days(91);
+        store.insert(&stale).unwrap();
+
+        let digest = store.clipboard_health_digest().unwrap();
+        assert_eq!(digest.stored_items, 3);
+        assert_eq!(digest.sensitive_items, 1);
+        assert_eq!(digest.expiring_within_week, 1);
+        assert_eq!(digest.stale_pins, 1);
+        assert!(digest.database_bytes > 0);
+        assert!(digest.largest_clip_bytes > 0);
+        assert!(!format!("{digest:?}").contains("private digest value"));
     }
 
     #[test]

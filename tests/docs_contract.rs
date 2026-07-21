@@ -109,6 +109,10 @@ fn top_docs_link_every_complete_implementation_batch() {
             "docs/implementation-batch-201-250.md",
             (201..=250).collect::<Vec<_>>(),
         ),
+        (
+            "docs/implementation-batch-251-300.md",
+            (251..=300).collect::<Vec<_>>(),
+        ),
     ] {
         for file in TOP_DOCS {
             assert!(
@@ -189,22 +193,27 @@ fn research_catalog_has_exact_repository_and_source_ids() {
         assert_evidence_ids(line);
     }
 
-    let candidate_tail = read("docs/ideas-601-610.md");
-    let candidate_lines = candidate_tail
-        .lines()
-        .filter(|line| numbered_backlog_item(line).is_some())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        candidate_lines
-            .iter()
-            .filter_map(|line| numbered_backlog_item(line))
-            .collect::<Vec<_>>(),
-        (601..=610).collect::<Vec<_>>()
-    );
-    assert_eq!(candidate_lines.len(), 10);
-    for line in candidate_lines {
-        assert!(line.contains("Evidence:"));
-        assert_evidence_ids(line);
+    for (file, expected) in [
+        ("docs/ideas-601-610.md", 601..=610),
+        ("docs/ideas-611-620.md", 611..=620),
+    ] {
+        let candidate_tail = read(file);
+        let candidate_lines = candidate_tail
+            .lines()
+            .filter(|line| numbered_backlog_item(line).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidate_lines
+                .iter()
+                .filter_map(|line| numbered_backlog_item(line))
+                .collect::<Vec<_>>(),
+            expected.collect::<Vec<_>>()
+        );
+        assert_eq!(candidate_lines.len(), 10);
+        for line in candidate_lines {
+            assert!(line.contains("Evidence:"));
+            assert_evidence_ids(line);
+        }
     }
 }
 
@@ -218,12 +227,17 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("read `src/diagnostics.rs`"));
     assert!(readme.contains("read `src/single_instance/mod.rs`"));
     assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
-    assert!(readme.contains("Sixteen checked-in golden images"));
+    assert!(readme.contains("Twenty-four checked-in golden images"));
     assert!(readme.contains("docs/decision-gates-151-200.md"));
     assert!(readme.contains("docs/decision-gates-201-250.md"));
+    assert!(readme.contains("docs/decision-gates-251-300.md"));
+    assert!(readme.contains("docs/limitations.md"));
+    assert!(readme.contains("docs/maintainer-handoff.md"));
+    assert!(readme.contains("docs/scope-review.md"));
     assert!(readme.contains("docs/data-contract-v1.md"));
     assert!(readme.contains("docs/data-contract-v2.md"));
     assert!(readme.contains("docs/ideas-601-610.md"));
+    assert!(readme.contains("docs/ideas-611-620.md"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -235,6 +249,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("`CaptureHealth::Stalled`"));
     assert!(architecture.contains("schema v6"));
     assert!(architecture.contains("History/Compose/Trust/Settings"));
+    assert!(architecture.contains("workflow/everyday.rs"));
+    assert!(architecture.contains("device_experience.rs"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
@@ -243,6 +259,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(recommendation.contains("pause-aware heartbeat/watchdog"));
     assert!(recommendation.contains("batch 151-200"));
     assert!(recommendation.contains("batch 201-250"));
+    assert!(recommendation.contains("batch 251-300"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
@@ -253,6 +270,62 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("M6 -> M7 data-contract gate"));
     assert!(plan.contains("Unknown` is a release blocker"));
     assert!(plan.contains("docs/ideas-601-610.md"));
+    assert!(plan.contains("docs/ideas-611-620.md"));
+    assert!(plan.contains("docs/decision-gates-251-300.md"));
+}
+
+#[test]
+fn operations_documents_keep_release_and_scope_claims_honest() {
+    let limitations = read("docs/limitations.md");
+    let limitation_ids = limitations
+        .lines()
+        .filter_map(|line| numbered_table_id(line, "LIM-"))
+        .collect::<Vec<_>>();
+    assert_eq!(limitation_ids, (1..=13).collect::<Vec<_>>());
+    assert!(limitations.contains("not encrypted at rest"));
+    assert!(
+        limitations
+            .to_ascii_lowercase()
+            .contains("whole-database encryption")
+    );
+
+    let release = read(".github/workflows/release-provenance.yml");
+    for evidence in [
+        "tests-${{ matrix.name }}.log",
+        "canary-scope.txt",
+        "cargo-deny.log",
+        "cargo-audit.log",
+        "cargo-vet.log",
+        "performance-core.log",
+        "performance-store.log",
+        "cargo cyclonedx",
+        "MANIFEST.sha256",
+    ] {
+        assert!(
+            release.contains(evidence),
+            "release evidence omits {evidence}"
+        );
+    }
+
+    let handoff = read("docs/maintainer-handoff.md");
+    for section in [
+        "## Access inventory",
+        "## Normal release",
+        "## Emergency patch",
+        "## Dependency cadence",
+        "## Sunset policy",
+        "## Handoff drill",
+    ] {
+        assert!(handoff.contains(section), "handoff omits {section}");
+    }
+
+    let scope = read("docs/scope-review.md");
+    for disposition in ["**Promote**", "**Keep**", "**Defer**", "**Cut**"] {
+        assert!(scope.contains(disposition));
+    }
+    let reminder = read(".github/workflows/quarterly-scope-review.yml");
+    assert!(reminder.contains("1,4,7,10"));
+    assert!(reminder.contains("gh issue create"));
 }
 
 #[test]
@@ -273,11 +346,16 @@ fn local_markdown_links_resolve() {
         "docs/implementation-batch-101-150.md",
         "docs/implementation-batch-151-200.md",
         "docs/implementation-batch-201-250.md",
+        "docs/implementation-batch-251-300.md",
         "docs/decision-gates-151-200.md",
         "docs/decision-gates-201-250.md",
+        "docs/decision-gates-251-300.md",
         "docs/data-contract-v1.md",
         "docs/data-contract-v2.md",
         "docs/product-strategy-decisions.md",
+        "docs/limitations.md",
+        "docs/maintainer-handoff.md",
+        "docs/scope-review.md",
     ];
 
     for file in docs {

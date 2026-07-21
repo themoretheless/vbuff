@@ -91,7 +91,7 @@ vbuff is designed around a single hard rule: **fail closed.** Every uncertainty 
 
 ## Status
 
-vbuff is in active early development. The current executable uses `arboard`, `global-hotkey`, `egui`, and `enigo` for the resident copy -> store -> popup -> paste loop. SQLite schema v6 includes adaptive prose/code FTS5 search, exact/near fingerprints, a dedup reuse ledger, transactional CAS, verified migrations, per-kind retention rules, encrypted grace-bin primitives, expiry/clawback, and fail-closed local embeddings. Capture adds adaptive cadence, restart supervision, byte/RSS pressure policy, structural-secret detection, redacted metrics, an external heartbeat, and a live hash-chained privacy ledger. The popup has compact History, Compose, Trust, and Settings surfaces with a menu-bar action icon, command palette, adaptive density, large preview, transform rail, accessibility live announcements, sensitive peek, one-handed controls, and short Undo for pin/stack/delete. Durable recovery is not wired until an OS-keystore provider supplies its key. `vbuff doctor`, config handoff, `vbuff ask`, and offline artifact verification are active. A fake-data WASM popup compiles and was browser-reviewed at desktop/compact sizes, but is not hosted and cannot access real clipboard data. IPC/plugin/sync/update contracts remain tested foundations, not live network, extension, replication, or update-install features. Native all-flavor backends, SQLCipher, per-OS conformance, daemon extraction, the full history CLI, and live sync remain target work.
+vbuff is in active early development. The current executable uses `arboard`, `global-hotkey`, `egui`, and `enigo` for the resident copy -> store -> popup -> paste loop. SQLite schema v6 includes adaptive prose/code FTS5 search, exact/near fingerprints, a dedup reuse ledger, transactional CAS, verified migrations, per-kind retention rules, session protection, encrypted grace-bin primitives, expiry/clawback, and fail-closed local embeddings. Capture adds adaptive cadence, restart supervision, byte/RSS pressure policy, structural-secret detection, typed health/size alerts, remote-session startup pause, redacted metrics, an external heartbeat, and a live hash-chained privacy ledger. The popup has compact History, Compose, Trust, and Settings surfaces with a menu-bar action icon, command palette, sticky kind/source filters, default profiles, an optional metadata-only health digest, stale-pin review, plain-text cloning, calendar expiry labels, adaptive density, large preview, accessibility live announcements, sensitive peek, and short Undo. Config schema 2 upgrades require explicit `migrate preview/apply` and preserve an owner-only rollback copy. Durable recovery is not wired until an OS-keystore provider supplies its key. `vbuff doctor`, config handoff, `vbuff ask`, and offline artifact verification are active. A fake-data WASM popup compiles and was browser-reviewed at desktop/compact sizes, but is not hosted and cannot access real clipboard data. IPC/plugin/sync/update contracts, including device UX and browser/editor/automation/MCP/launcher/terminal/webhook boundaries, remain tested foundations, not live network, extension, replication, or update-install features. The exact gaps and workarounds live in the [public limitation ledger](docs/limitations.md). Native all-flavor backends, SQLCipher, per-OS conformance, daemon extraction, the full history CLI, and live sync remain target work.
 
 ---
 
@@ -102,15 +102,15 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | Crate | Role | In MVP? |
 |---|---|---|
 | `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
-| `vbuff-core` | Pure dedup/eviction/classification plus capture, composition, privacy/AI gates, embeddings, delivery gates, feedback redaction, and observability | Yes (partial) |
+| `vbuff-core` | Pure dedup/eviction/classification plus capture, composition, everyday workflow, privacy/AI, embedding, delivery, feedback, and observability policy | Yes (partial) |
 | `vbuff-store` | Bundled SQLite schema v6, FTS5, migrations, sharded CAS, exact/near dedup lifecycle, externally keyed recovery primitives, eligible local embeddings, expiry, and audits; SQLCipher/keystore wiring remains a release gate | Yes (partial) |
 | `vbuff-platform` | Current trait layer plus `arboard` / `global-hotkey` / `enigo` adapters; target adds native per-OS clipboard, hotkey, paste and tray impls | Yes (partial) |
-| `vbuff-gui` | Current `eframe` History/Trust/Compose popup plus a fake-data WASM demo target; settings/a11y depth remains | Yes (partial) |
+| `vbuff-gui` | Current `eframe` History/Trust/Compose/Settings popup plus a fake-data WASM demo target; native assistive-technology evidence remains | Yes (partial) |
 | *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, paste timing, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
-| `vbuff-ipc` | Tested handshake, filtered events, scoped tokens, batches, and bounded browser/editor/automation/access/query contracts; no live daemon dispatch yet | Foundation only |
-| `vbuff-plugin` | Tested WIT/consent/typed-plugin contracts plus four curated recipes; no Wasmtime host or install gallery yet | Foundation only |
-| `vbuff-sync` | Current protocol/crypto foundation plus gated encrypted embedding artifacts; target adds discovery, transport, pairing UX, persistence, and replication | Foundation only |
+| `vbuff-ipc` | Tested handshake, filtered events, scoped tokens, batches, and bounded browser/editor/Vim/automation/MCP/launcher/terminal/webhook contracts; no live daemon dispatch yet | Foundation only |
+| `vbuff-plugin` | Tested WIT/consent/typed-plugin contracts, bounded import/export adapters, and four curated recipes; no Wasmtime host or install gallery yet | Foundation only |
+| `vbuff-sync` | Protocol/crypto plus bounded device trust, rehearsal, replay, outbox, retention, travel, handoff, and approval policy; no discovery, transport, persistence, or replication | Foundation only |
 | `vbuff-update` | Signed manifests, key rotation, downgrade/replay defense, staged rollout, build attestation, and streaming checksum verification | Foundation + verifier CLI |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
@@ -123,7 +123,7 @@ The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for
 The repo is intentionally split so you can understand it without loading the whole product into your head at once:
 
 1. **Data shapes and wire contracts:** start with `crates/vbuff-types/src/lib.rs`, then `status.rs` and `ipc.rs` (`Clip`, flavors, ids, `CaptureHealth`, redacted notices, and the minimal startup intents).
-2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, eviction, `compose.rs`, then one small `workflow/` or `intelligence/` module. This crate stays OS-free and GUI-free.
+2. **Pure behavior:** read `crates/vbuff-core/src/*` for hashing, classification, filtering, eviction, and `compose.rs`, then one small `workflow/` module such as `everyday.rs`/`links.rs` or one `intelligence/` module. This crate stays OS-free and GUI-free.
 3. **Persistence:** read `crates/vbuff-store/src/lib.rs`, then `search.rs`, `migration.rs`, `cas.rs`, and `lifecycle.rs` for schema/query ownership, verified upgrades, blob lifecycle, dedup/recovery, and retention.
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first; native per-OS backends should hang behind those traits.
 5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `experience.rs`, `view.rs`, and finally `app.rs`.
@@ -132,13 +132,14 @@ The repo is intentionally split so you can understand it without loading the who
 8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
 9. **Startup handoff:** read `src/single_instance/mod.rs` for framing/ownership, then `unix.rs` or `windows_fallback.rs` for one transport; this slice owns bind-or-forward, liveness, stale recovery, and cleanup.
 10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
-11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). It is intentionally not linked into the resident runtime yet.
+11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). For device UX, start at the `device_experience.rs` facade and open only `policy.rs`, `outbox.rs`, `travel.rs`, or another focused submodule. It is intentionally not linked into the resident runtime yet.
 12. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `app.rs` owns event-driven hotkey/tray/second-instance wakeups; `main.rs` only constructs and starts focused services. A duplicate launch forwards `ShowPopup` to the running instance.
 13. **Reliability and security policy:** read `crates/vbuff-core/src/reliability.rs`, `secret.rs`, and `security_audit.rs`; then read `src/memory_pressure.rs`, `src/maintenance.rs`, and `src/doctor.rs` for the runtime adapters.
 14. **Capability and lifecycle contracts:** read `crates/vbuff-platform/src/capabilities.rs`, `security.rs`, `lifecycle.rs`, `wayland.rs`, and `windows.rs`. These files describe honest fallback decisions; they are not native backend implementations.
-15. **IPC and plugin foundations:** read `crates/vbuff-ipc/src/lib.rs`, then `integration/`; read `crates/vbuff-plugin/src/lib.rs`, then `recipes.rs`. Neither crate is connected to an ambient network listener or plugin runtime.
+15. **IPC and plugin foundations:** read `crates/vbuff-ipc/src/lib.rs`, then one file in `integration/`; read `crates/vbuff-plugin/src/lib.rs`, then `recipes.rs` or `adapter.rs`. Neither crate is connected to an ambient network listener or plugin runtime.
 16. **Release trust:** read `crates/vbuff-update/src/lib.rs`, then `manifest.rs` and `attestation.rs`; `src/verify.rs` is the narrow offline CLI adapter.
 17. **Delivery evidence:** read `crates/vbuff-core/src/delivery.rs`, `slo.rs`, and [decision-gates-151-200.md](docs/decision-gates-151-200.md); machine/human evidence remains separate from deterministic gate logic.
+18. **Operations and honest claims:** read [limitations.md](docs/limitations.md), [maintainer-handoff.md](docs/maintainer-handoff.md), [scope-review.md](docs/scope-review.md), then `.github/workflows/release-provenance.yml`.
 
 The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, single-instance transport stays isolated, and `main.rs` only composes the pieces.
 
@@ -146,7 +147,7 @@ The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contract
 
 vbuff should feel like a quiet resident tool, not a marketing page or a scripting console. The first screen is the usable popup: dense enough for repeated work, calm enough for secrets, and fully keyboard-driven.
 
-The current design baseline is implemented rather than aspirational: one token module controls stable popup and row dimensions; familiar actions are fixed icon buttons with tooltips; empty/search-empty states are distinct; and delete/clear require explicit confirmation. Popup and tray share one typed capture-health vocabulary, while content-free notices report command outcomes. History keeps privacy and status scannable; Trust holds detailed capability/SLO/release evidence; Compose keeps stack/form/merge work out of nested cards and uses stable full-width editors with a separate action row. Empty history offers two explicit local starter sets and remains empty if declined. Sixteen checked-in golden images cover empty, populated, Trust, and Compose across theme and DPI. Hotkey, tray, and second-instance events wake the UI directly instead of forcing a 100 ms idle poll; a visible popup refreshes at one hertz rather than every frame.
+The current design baseline is implemented rather than aspirational: one token module controls stable popup and row dimensions; familiar actions are fixed icon buttons with tooltips; empty/search-empty states are distinct; and delete/clear require explicit confirmation. Popup and tray share one typed capture-health vocabulary, while content-free notices report command outcomes. History keeps privacy and status scannable with a restrained kind/source filter row, one clear affordance, calendar expiry, session-protection state, and a side preview; Trust holds detailed capability/SLO/release evidence; Settings contains review-before-apply profiles, the optional metadata-only digest, and stale-pin review; Compose keeps stack/form/merge work out of nested cards. Empty history offers two explicit local starter sets and remains empty if declined. Twenty-four checked-in golden images cover empty, populated, alerts, Trust, Compose, and Settings across theme and DPI. Hotkey, tray, and second-instance events wake the UI directly instead of forcing a 100 ms idle poll; a visible popup refreshes at one hertz rather than every frame.
 
 - **Popup:** stable row dimensions, clear selected state, type icon, source/time metadata, and small state badges for pinned, sensitive, paused, degraded, local-only, and synced.
 - **Actions:** repeated row tools should use icon buttons with tooltips; destructive actions such as clear history, wipe, revoke, or reset should use explicit text and confirmation.
@@ -167,7 +168,8 @@ The 600-point review is executed in batches of 50. Each batch gets an item-by-it
 | 101-150 | Implemented/reviewed with release, Trust UI, migration, sync, and policy boundaries explicit | [Batch 101-150 ledger](docs/implementation-batch-101-150.md) |
 | 151-200 | Implemented/reviewed with Compose, privacy/AI, integration contracts, data freeze, and delivery gates explicit | [Batch 151-200 ledger](docs/implementation-batch-151-200.md) |
 | 201-250 | Implemented/reviewed with power workflows, responsive/a11y UI, schema 6 lifecycle, and native/key-provider gates explicit | [Batch 201-250 ledger](docs/implementation-batch-201-250.md) |
-| 251-600 | Queued in sequential groups of 50 | Canonical range map below |
+| 251-300 | Implemented/reviewed with everyday runtime UX, device/integration foundations, and operational evidence boundaries explicit | [Batch 251-300 ledger](docs/implementation-batch-251-300.md) |
+| 301-600 | Queued in sequential groups of 50 | Canonical range map below |
 
 "Foundation" is not a synonym for shipped: the `vbuff-sync` algorithms compile and are tested, but the app still has no live sync transport; provenance and generation contracts exist, but `arboard` cannot populate native metadata. The ledger is the source of truth for those distinctions.
 
@@ -186,7 +188,7 @@ The 600 proposals, improvements, problems, bugs and "done badly" notes are kept 
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY slices, design fixes, review hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Evidence-backed native correctness, text/search, security, local-first sync, verification |
 
-The separately sourced [post-600 candidates 601-610](docs/ideas-601-610.md) are follow-up research input, not an expansion of the canonical 1-600 execution goal.
+The separately sourced post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/ideas-611-620.md) are follow-up research input, not an expansion of the canonical 1-600 execution goal.
 
 ---
 
@@ -305,8 +307,13 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/implementation-batch-101-150.md](docs/implementation-batch-101-150.md) - release verification, Trust UI, migration/sync contracts, policy decisions, and review evidence for the third batch.
 - [docs/implementation-batch-151-200.md](docs/implementation-batch-151-200.md) - privacy/AI gates, integration contracts, delivery decisions, Compose workflows, and three review passes for the fourth batch.
 - [docs/implementation-batch-201-250.md](docs/implementation-batch-201-250.md) - power-workflow contracts, responsive/accessibility UI, store lifecycle behavior, and three review passes for the fifth batch.
+- [docs/implementation-batch-251-300.md](docs/implementation-batch-251-300.md) - everyday runtime UX, device/integration foundations, operations, and three review passes for the sixth batch.
 - [docs/decision-gates-151-200.md](docs/decision-gates-151-200.md) - numeric stop/go rules, owner roles, fallback ladders, and external evidence boundaries.
 - [docs/decision-gates-201-250.md](docs/decision-gates-201-250.md) - native caret, assistive-technology, plugin-host, display, and recovery-key gates.
+- [docs/decision-gates-251-300.md](docs/decision-gates-251-300.md) - native auto-pause, live sync/client authority, release evidence, migration, and governance gates.
+- [docs/limitations.md](docs/limitations.md) - versioned current-product limitations, practical workarounds, and exit evidence.
+- [docs/maintainer-handoff.md](docs/maintainer-handoff.md) - release custody, emergency patch, dependency cadence, sunset, and handoff drill.
+- [docs/scope-review.md](docs/scope-review.md) - quarterly Promote/Keep/Defer/Cut decisions and the mechanical breadth cut line.
 - [docs/data-contract-v1.md](docs/data-contract-v1.md) - frozen schema/hash/format/IPC fixtures and compatibility procedure.
 - [docs/data-contract-v2.md](docs/data-contract-v2.md) - schema 6 normalized-dedup, encrypted grace-bin, retention, and migration contract.
 - [docs/product-strategy-decisions.md](docs/product-strategy-decisions.md) - coherent licensing, pricing, and governance decisions for mutually exclusive items 128-140.
@@ -318,6 +325,7 @@ Sync features were tagged early in the raw feature list but depend on a stable s
 - [docs/ideas-401-500.md](docs/ideas-401-500.md) - review backlog items 401-500: problems, SOLID/DRY cuts, UX/design fixes, and roadmap hygiene.
 - [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed backlog items 501-600: native correctness, international text/search, privacy, sync, and release verification.
 - [docs/ideas-601-610.md](docs/ideas-601-610.md) - ten evidence-backed post-600 candidates kept outside the active 1-600 goal.
+- [docs/ideas-611-620.md](docs/ideas-611-620.md) - ten review-derived state-machine, replay, configuration, and release-evidence candidates, also outside the active goal.
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 verified high-signal repositories plus the scientific papers, standards, and concrete lessons behind items 501-600.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 

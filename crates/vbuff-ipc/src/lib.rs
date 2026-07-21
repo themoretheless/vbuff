@@ -21,7 +21,14 @@ pub use handshake::{
 };
 pub use integration::{
     AutomationCommand, AutomationSurface, BrowserIngress, BrowserIngressDecision,
-    ClipAccessContext, ClipAccessFilter, EditorCaptureMetadata, EditorPasteContext,
-    EditorTargetKind, HistoryQuery, IntegrationContractError, LauncherRankSignals, McpReadPolicy,
-    RemotePasteRequest, ShareDraft, ShareDraftState, SnippetBridgeCursor, TargetedSendRequest,
+    BrowserSourceReport, CleanLinkRequest, ClipAccessContext, ClipAccessFilter,
+    EditorCaptureMetadata, EditorPasteContext, EditorTargetKind, HistoryQuery,
+    IntegrationContractError, LauncherCandidate, LauncherClient, LauncherRankSignals,
+    LauncherRankedResult, LauncherRequest, McpReadPolicy, McpSessionLease, Osc52Decision,
+    Osc52Observation, Osc52Policy, Osc52Target, RemotePasteLease, RemotePasteRequest,
+    RemoteReplayWindow, SelectedLinkMetadata, ShareDraft, ShareDraftState, SignedWebhookEvent,
+    SnippetBridgeCursor, SnippetMirrorAction, SnippetMirrorOperation, SnippetMirrorRecord,
+    TargetedSendRequest, VimRegisterAction, VimRegisterRequest, WebhookEvent, WebhookEventKind,
+    WebhookReplayWindow, WebhookSigner, adapt_text_for_editor, plan_snippet_mirror,
+    rank_launcher_candidates,
 };

@@ -14,7 +14,10 @@ pub mod snippet_pack;
 
 use thiserror::Error;
 
-pub use adapter::{ExportAdapter, ExportRecord, ImportAdapter, ImportRecord};
+pub use adapter::{
+    AdapterLimits, ExportAdapter, ExportRecord, ImportAdapter, ImportRecord, run_export_adapter,
+    run_import_adapter,
+};
 pub use bundle::{LockedPlugin, PluginBundle, PluginLock, SignedBundle};
 pub use manifest::{
     ActionCapabilityGrant, ActionPermissionRequest, CapabilityGrant, PluginCapability,

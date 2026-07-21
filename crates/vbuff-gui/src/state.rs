@@ -1,12 +1,15 @@
 //! Shared state and action types exchanged between the GUI and the app wiring.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vbuff_core::onboarding::DefaultProfile;
 use vbuff_types::{
-    CapabilityView, CaptureHealth, CaptureSessionStats, Clip, ClipId, CommandNotice, NoticeLevel,
-    PrivacyLedgerSummary, SecurityPostureSummary, SloStatusSummary,
+    CapabilityView, CaptureBudgetAlert, CaptureHealth, CapturePauseReason, CaptureSessionStats,
+    Clip, ClipId, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyLedgerSummary,
+    SecurityPostureSummary, SloStatusSummary,
 };
 
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
@@ -17,10 +20,22 @@ pub struct AppState {
     pub clips: Vec<Clip>,
     /// True if clipboard capture is currently paused.
     pub paused: bool,
+    /// Why capture is paused; `None` while capture is running.
+    pub pause_reason: Option<CapturePauseReason>,
     /// Current health of the resident capture worker.
     pub capture_health: CaptureHealth,
     /// Content-free accounting for this resident-process session.
     pub capture_stats: CaptureSessionStats,
+    /// A de-duplicated capture failure that links into the Trust surface.
+    pub health_alert: Option<CaptureHealth>,
+    /// A de-duplicated large-payload event that links into Settings.
+    pub size_budget_alert: Option<CaptureBudgetAlert>,
+    /// Content-free store-health snapshot refreshed outside the capture path.
+    pub health_digest: ClipboardHealthDigest,
+    /// Clips exempt from automatic lifecycle cleanup for this process session.
+    pub session_protected: HashSet<ClipId>,
+    /// Applied first-run profile, when one was chosen.
+    pub default_profile: Option<DefaultProfile>,
     /// Capability-honest security state derived by the platform layer.
     pub security_posture: SecurityPostureSummary,
     /// Detailed capability evidence; no inferred green states.
@@ -74,6 +89,17 @@ impl AppState {
             return false;
         }
         self.capture_health = health;
+        if !matches!(health, CaptureHealth::Starting | CaptureHealth::Watching) {
+            self.health_alert = Some(health);
+        }
+        true
+    }
+
+    pub fn set_size_budget_alert(&mut self, alert: CaptureBudgetAlert) -> bool {
+        if self.size_budget_alert == Some(alert) {
+            return false;
+        }
+        self.size_budget_alert = Some(alert);
         true
     }
 
@@ -143,11 +169,15 @@ pub enum UiAction {
     PasteText(String),
     /// Pin or unpin a clip.
     SetPinned(ClipId, bool),
+    /// Protect or unprotect a clip until this resident process exits.
+    SetSessionProtected(ClipId, bool),
+    /// Create a text-only derivative while preserving the canonical clip.
+    CreatePlainTextClone(ClipId),
     /// Delete a single clip.
     Delete(ClipId),
     /// Restore one recently deleted in-memory clip.
     RestoreClip(Box<Clip>),
-    /// Clear history while preserving pinned clips.
+    /// Clear history while preserving pinned and session-protected clips.
     ClearHistory,
     /// Toggle capture pause.
     TogglePause,
@@ -155,6 +185,12 @@ pub enum UiAction {
     RecoverSkipped,
     /// Install a small, explicit set of local example clips.
     InstallStarterPack(StarterPack),
+    /// Apply one bounded first-run default profile.
+    ApplyDefaultProfile(DefaultProfile),
+    /// Dismiss a de-duplicated health alert.
+    DismissHealthAlert,
+    /// Dismiss a de-duplicated size-budget alert.
+    DismissSizeBudgetAlert,
     /// Dismiss the current command result.
     DismissNotice,
     /// Permanently dismiss the first-run hotkey coachmark.
@@ -176,6 +212,15 @@ impl fmt::Debug for UiAction {
                 .field(id)
                 .field(pinned)
                 .finish(),
+            Self::SetSessionProtected(id, protected) => formatter
+                .debug_tuple("SetSessionProtected")
+                .field(id)
+                .field(protected)
+                .finish(),
+            Self::CreatePlainTextClone(id) => formatter
+                .debug_tuple("CreatePlainTextClone")
+                .field(id)
+                .finish(),
             Self::Delete(id) => formatter.debug_tuple("Delete").field(id).finish(),
             Self::RestoreClip(clip) => formatter
                 .debug_struct("RestoreClip")
@@ -190,6 +235,12 @@ impl fmt::Debug for UiAction {
                 .debug_tuple("InstallStarterPack")
                 .field(pack)
                 .finish(),
+            Self::ApplyDefaultProfile(profile) => formatter
+                .debug_tuple("ApplyDefaultProfile")
+                .field(profile)
+                .finish(),
+            Self::DismissHealthAlert => formatter.write_str("DismissHealthAlert"),
+            Self::DismissSizeBudgetAlert => formatter.write_str("DismissSizeBudgetAlert"),
             Self::DismissNotice => formatter.write_str("DismissNotice"),
             Self::DismissHotkeyCoachmark => formatter.write_str("DismissHotkeyCoachmark"),
             Self::Hide => formatter.write_str("Hide"),

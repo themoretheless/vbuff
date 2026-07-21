@@ -10,6 +10,7 @@ pub mod collection_vault;
 pub mod conflict;
 pub mod crdt;
 pub mod crypto;
+pub mod device_experience;
 pub mod ledger;
 pub mod membership;
 pub mod merkle;

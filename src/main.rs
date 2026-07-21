@@ -34,7 +34,8 @@ use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, ClientIntent, SecurityPostureLevel, SecurityPostureSummary,
+    CapabilityView, CapabilityViewLevel, CapturePauseReason, ClientIntent, SecurityPostureLevel,
+    SecurityPostureSummary,
 };
 
 use config::Config;
@@ -86,6 +87,8 @@ fn main() -> anyhow::Result<()> {
         process_hardening.ptrace_blocked,
     );
     let strict_capture_blocked = !security_posture.strict_allows_capture();
+    let session_context = vbuff_platform::lifecycle::SessionContext::detect();
+    let remote_auto_paused = config.auto_pause_remote && session_context.remote;
     tracing::info!(?config.hotkey, config.poll_interval_ms, "vbuff starting");
     if config.launch_at_login
         && let Err(error) = autostart::set_enabled(true)
@@ -97,9 +100,21 @@ fn main() -> anyhow::Result<()> {
     store
         .enforce_cap(config.max_history)
         .context("enforcing history cap")?;
+    let health_digest = store
+        .clipboard_health_digest()
+        .context("building clipboard health digest")?;
     let recent = store.load_recent(GUI_LIMIT).context("loading history")?;
     let mut initial_state = AppState::with_clips(recent);
-    initial_state.paused = strict_capture_blocked;
+    initial_state.health_digest = health_digest;
+    initial_state.paused = strict_capture_blocked || remote_auto_paused;
+    initial_state.pause_reason = if strict_capture_blocked {
+        Some(CapturePauseReason::SecurityPolicy)
+    } else if remote_auto_paused {
+        Some(CapturePauseReason::RemoteControl)
+    } else {
+        None
+    };
+    initial_state.default_profile = config.default_profile;
     initial_state.security_posture = summarize_security_posture(&security_posture);
     initial_state.capabilities = summarize_capabilities(&security_posture);
     let shared: SharedState = Arc::new(Mutex::new(initial_state));
@@ -110,12 +125,19 @@ fn main() -> anyhow::Result<()> {
             vbuff_types::NoticeLevel::Warning,
             "Strict security mode blocked capture; run vbuff doctor --json",
         );
+    } else if remote_auto_paused {
+        diagnostics.notice(
+            vbuff_types::NoticeLevel::Warning,
+            "Capture auto-paused for the detected remote session",
+        );
     }
     diagnostics.install_panic_hook();
     let _heartbeat_thread = heartbeat::spawn(diagnostics.clone());
     let _maintenance_thread =
         maintenance::spawn(history.clone(), diagnostics.clone(), config.clone());
-    let paused = Arc::new(AtomicBool::new(strict_capture_blocked));
+    let paused = Arc::new(AtomicBool::new(
+        strict_capture_blocked || remote_auto_paused,
+    ));
     let self_writes = Arc::new(Mutex::new(SelfWriteLedger::default()));
 
     let _capture_thread = (!strict_capture_blocked).then(|| {
@@ -148,6 +170,7 @@ fn main() -> anyhow::Result<()> {
         config,
         self_writes,
         strict_capture_blocked,
+        automatic_pause_reason: remote_auto_paused.then_some(CapturePauseReason::RemoteControl),
     };
     app::run(app_services, hotkey_backend, hotkey_id)
 }

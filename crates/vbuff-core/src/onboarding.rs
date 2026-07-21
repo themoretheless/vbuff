@@ -2,7 +2,72 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::clock::Clock;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultProfile {
+    #[default]
+    Casual,
+    Developer,
+    PrivacyMax,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileDefaults {
+    pub max_history: usize,
+    pub secret_ttl_seconds: u64,
+    pub capture_soft_limit_bytes: usize,
+    pub capture_hard_limit_bytes: usize,
+    pub auto_pause_idle_seconds: u64,
+    pub auto_pause_remote: bool,
+    pub detect_secrets: bool,
+}
+
+impl DefaultProfile {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Casual => "Casual",
+            Self::Developer => "Developer",
+            Self::PrivacyMax => "Privacy Max",
+        }
+    }
+
+    pub const fn defaults(self) -> ProfileDefaults {
+        const MIB: usize = 1024 * 1024;
+        match self {
+            Self::Casual => ProfileDefaults {
+                max_history: 500,
+                secret_ttl_seconds: 10 * 60,
+                capture_soft_limit_bytes: 16 * MIB,
+                capture_hard_limit_bytes: 128 * MIB,
+                auto_pause_idle_seconds: 15 * 60,
+                auto_pause_remote: true,
+                detect_secrets: true,
+            },
+            Self::Developer => ProfileDefaults {
+                max_history: 2_000,
+                secret_ttl_seconds: 10 * 60,
+                capture_soft_limit_bytes: 32 * MIB,
+                capture_hard_limit_bytes: 256 * MIB,
+                auto_pause_idle_seconds: 30 * 60,
+                auto_pause_remote: true,
+                detect_secrets: true,
+            },
+            Self::PrivacyMax => ProfileDefaults {
+                max_history: 200,
+                secret_ttl_seconds: 60,
+                capture_soft_limit_bytes: 4 * MIB,
+                capture_hard_limit_bytes: 32 * MIB,
+                auto_pause_idle_seconds: 5 * 60,
+                auto_pause_remote: true,
+                detect_secrets: true,
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BehaviorEvent {
@@ -89,5 +154,19 @@ mod tests {
         let recap = day_seven_recap(&clock, 0, 42, 80, 6).unwrap();
         assert_eq!(recap.recalled, 42);
         assert_eq!(recap.estimated_retypes_avoided, 42);
+    }
+
+    #[test]
+    fn first_run_profiles_are_concrete_and_privacy_max_is_stricter() {
+        let casual = DefaultProfile::Casual.defaults();
+        let developer = DefaultProfile::Developer.defaults();
+        let private = DefaultProfile::PrivacyMax.defaults();
+
+        assert!(developer.max_history > casual.max_history);
+        assert!(private.max_history < casual.max_history);
+        assert!(private.secret_ttl_seconds < casual.secret_ttl_seconds);
+        assert!(private.auto_pause_idle_seconds < casual.auto_pause_idle_seconds);
+        assert!(private.auto_pause_remote);
+        assert!(developer.auto_pause_remote);
     }
 }

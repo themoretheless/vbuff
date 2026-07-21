@@ -8,8 +8,8 @@ use vbuff_core::capture::{CaptureOutcome, DropClass};
 use vbuff_core::privacy::{PrivacyDecisionKind, PrivacyLedger};
 use vbuff_gui::SharedState;
 use vbuff_types::{
-    CaptureHealth, NoticeLevel, PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary,
-    SloMetricState,
+    CaptureBudgetAlert, CaptureHealth, NoticeLevel, PrivacyDecisionLevel, PrivacyEventSummary,
+    PrivacyLedgerSummary, SloMetricState,
 };
 
 use crate::runtime_metrics::{RuntimeMetrics, RuntimeSnapshot};
@@ -47,6 +47,16 @@ impl Diagnostics {
 
     pub(crate) fn poll_interval(&self, interval: std::time::Duration) {
         self.runtime.poll_interval(interval);
+    }
+
+    pub(crate) fn capture_budget_alert(&self, alert: CaptureBudgetAlert) -> bool {
+        self.shared
+            .lock()
+            .map(|mut state| state.set_size_budget_alert(alert))
+            .unwrap_or_else(|_| {
+                tracing::error!("cannot publish size-budget alert: GUI state mutex poisoned");
+                false
+            })
     }
 
     pub(crate) fn capture_outcome(&self, outcome: CaptureOutcome, count: u64) {
