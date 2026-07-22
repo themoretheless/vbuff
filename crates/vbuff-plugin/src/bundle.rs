@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::validate_relative_path;
 use crate::{PluginError, PluginManifest, Result};
 
-const MAX_COMPONENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ASSETS: usize = 1_024;
 const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PluginBundle {
     pub manifest: PluginManifest,
-    pub component: Vec<u8>,
+    pub executable: Vec<u8>,
     pub assets: BTreeMap<String, Vec<u8>>,
 }
 
@@ -22,7 +22,7 @@ impl std::fmt::Debug for PluginBundle {
         formatter
             .debug_struct("PluginBundle")
             .field("manifest", &self.manifest)
-            .field("component_bytes", &self.component.len())
+            .field("executable_bytes", &self.executable.len())
             .field("asset_count", &self.assets.len())
             .finish()
     }
@@ -31,9 +31,9 @@ impl std::fmt::Debug for PluginBundle {
 impl PluginBundle {
     pub fn reproducible_bytes(&self) -> Result<Vec<u8>> {
         self.manifest.validate()?;
-        if self.component.is_empty() || self.component.len() > MAX_COMPONENT_BYTES {
+        if self.executable.is_empty() || self.executable.len() > MAX_EXECUTABLE_BYTES {
             return Err(PluginError::InvalidBundle(
-                "component is empty or too large".into(),
+                "native plugin executable is empty or too large".into(),
             ));
         }
         if self.assets.len() > MAX_ASSETS {
@@ -54,9 +54,9 @@ impl PluginBundle {
         }
         let manifest = self.manifest.canonical_bytes()?;
         let mut output = Vec::new();
-        output.extend_from_slice(b"vbuff-plugin-bundle-v1\0");
+        output.extend_from_slice(b"vbuff-native-plugin-bundle-v2\0");
         append_field(&mut output, &manifest)?;
-        append_field(&mut output, &self.component)?;
+        append_field(&mut output, &self.executable)?;
         append_u64(&mut output, self.assets.len())?;
         for (path, bytes) in &self.assets {
             append_field(&mut output, path.as_bytes())?;
@@ -175,7 +175,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::component::ABI_VERSION;
+    use crate::protocol::PROTOCOL_VERSION;
 
     fn bundle() -> PluginBundle {
         PluginBundle {
@@ -183,14 +183,14 @@ mod tests {
                 id: "dev.vbuff.sample".into(),
                 name: "Sample".into(),
                 version: "1.0.0".into(),
-                abi_version: ABI_VERSION,
-                component_path: "plugin.wasm".into(),
+                protocol_version: PROTOCOL_VERSION,
+                executable_path: "bin/plugin".into(),
                 requested_capabilities: BTreeSet::new(),
                 network_hosts: BTreeSet::new(),
                 file_paths: BTreeSet::new(),
                 process_commands: BTreeSet::new(),
             },
-            component: b"wasm-component".to_vec(),
+            executable: b"native-test-executable".to_vec(),
             assets: BTreeMap::from([
                 ("icons/16.png".into(), vec![1, 2]),
                 ("locale/en.json".into(), vec![3, 4]),
@@ -218,10 +218,10 @@ mod tests {
     }
 
     #[test]
-    fn signature_detects_component_tampering() {
+    fn signature_detects_executable_tampering() {
         let mut bundle = bundle();
         let signed = bundle.sign(&SigningKey::from_bytes(&[4; 32])).unwrap();
-        bundle.component.push(0);
+        bundle.executable.push(0);
         assert_eq!(signed.verify(&bundle), Err(PluginError::InvalidSignature));
     }
 }

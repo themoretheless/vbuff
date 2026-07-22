@@ -19,6 +19,6 @@ pub use ledger::{
 };
 pub use policy::{
     CaptureAction, CaptureDecision, CaptureInput, CaptureOutcome, CapturePolicy, CaptureRule,
-    DropClass, DropReason, SelectionSource, SourcePredicate,
+    DropClass, DropReason, SelectionSource, SourcePredicate, text_requires_sensitive_handling,
 };
 pub use scheduler::{AdaptivePollScheduler, BudgetObservation, PollObservation, SubsystemBudget};

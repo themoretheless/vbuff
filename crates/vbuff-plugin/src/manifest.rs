@@ -21,8 +21,8 @@ pub struct PluginManifest {
     pub id: String,
     pub name: String,
     pub version: String,
-    pub abi_version: u16,
-    pub component_path: String,
+    pub protocol_version: u16,
+    pub executable_path: String,
     pub requested_capabilities: BTreeSet<PluginCapability>,
     #[serde(default)]
     pub network_hosts: BTreeSet<String>,
@@ -53,23 +53,23 @@ impl PluginManifest {
         if !valid_version(&self.version) {
             return Err(PluginError::InvalidManifest("version must be x.y.z".into()));
         }
-        if self.abi_version != crate::component::ABI_VERSION {
+        if self.protocol_version != crate::protocol::PROTOCOL_VERSION {
             return Err(PluginError::InvalidManifest(
-                "unsupported component ABI".into(),
+                "unsupported native plugin protocol".into(),
             ));
         }
         if self.version.len() > 64 {
             return Err(PluginError::InvalidManifest("version is too long".into()));
         }
-        if self.component_path.len() > 512 {
+        if self.executable_path.len() > 512 {
             return Err(PluginError::InvalidManifest(
-                "component path is too long".into(),
+                "executable path is too long".into(),
             ));
         }
-        validate_relative_path(&self.component_path)?;
-        if !self.component_path.ends_with(".wasm") {
+        validate_relative_path(&self.executable_path)?;
+        if !self.executable_path.starts_with("bin/") {
             return Err(PluginError::InvalidManifest(
-                "component path must end in .wasm".into(),
+                "native plugin executable must be stored under bin/".into(),
             ));
         }
         let requests_network = self
@@ -333,8 +333,8 @@ mod tests {
             id: "dev.vbuff.sample".into(),
             name: "Sample".into(),
             version: "1.2.3".into(),
-            abi_version: crate::component::ABI_VERSION,
-            component_path: "plugin.wasm".into(),
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            executable_path: "bin/plugin".into(),
             requested_capabilities: BTreeSet::from([PluginCapability::ReadClipContent]),
             network_hosts: BTreeSet::new(),
             file_paths: BTreeSet::new(),
@@ -357,11 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn traversal_component_paths_are_rejected() {
+    fn traversal_and_non_bin_executable_paths_are_rejected() {
         let mut manifest = manifest();
-        manifest.component_path = "../plugin.wasm".into();
+        manifest.executable_path = "../plugin".into();
         assert!(manifest.validate().is_err());
-        manifest.component_path = "C:plugin.wasm".into();
+        manifest.executable_path = "C:plugin.exe".into();
+        assert!(manifest.validate().is_err());
+        manifest.executable_path = "plugin".into();
         assert!(manifest.validate().is_err());
     }
 

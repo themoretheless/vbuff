@@ -31,7 +31,6 @@ blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 similar = "3.1.1"
-web-time = "1.1.0"
 url = "2"
 semver = { version = "1", features = ["serde"] }
 
@@ -80,6 +79,11 @@ zeroize = "1.8"
 rlimit = "0.11"
 prctl = "1.0"
 memory-stats = { version = "1.2", default-features = false, features = ["always_use_statm"] }
+
+[patch.crates-io]
+# The crates.io 0.31.10 release still selects vulnerable quick-xml 0.39.
+# Pin the accepted upstream dependency-only fix until the next release.
+wayland-scanner = { git = "https://github.com/Smithay/wayland-rs", rev = "d07c4f91f28b42e5a485823ffd9d8d5a210b1053" }
 
 [package]
 name = "vbuff"

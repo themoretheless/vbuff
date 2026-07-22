@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use vbuff_core::capture::SelfWriteLedger;
+use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
@@ -48,6 +49,7 @@ const GUI_LIMIT: usize = 1000;
 
 fn main() -> anyhow::Result<()> {
     logging::init();
+    let background_launch = autostart::background_requested();
     let process_hardening = vbuff_platform::harden_current_process();
     if !process_hardening.core_dumps_blocked {
         tracing::warn!("core-dump suppression is unavailable on this platform");
@@ -72,8 +74,13 @@ fn main() -> anyhow::Result<()> {
         return ask::run(command);
     }
 
+    let initial_intent = if background_launch {
+        ClientIntent::Ping
+    } else {
+        ClientIntent::ShowPopup
+    };
     let (_instance_guard, instance_intents) =
-        match single_instance::acquire_or_forward(ClientIntent::ShowPopup)
+        match single_instance::acquire_or_forward(initial_intent)
             .context("acquiring single-instance endpoint")?
         {
             LaunchOutcome::Primary { guard, intents } => (guard, intents),
@@ -90,10 +97,11 @@ fn main() -> anyhow::Result<()> {
     let session_context = vbuff_platform::lifecycle::SessionContext::detect();
     let remote_auto_paused = config.auto_pause_remote && session_context.remote;
     tracing::info!(?config.hotkey, config.poll_interval_ms, "vbuff starting");
-    if config.launch_at_login
-        && let Err(error) = autostart::set_enabled(true)
-    {
-        tracing::warn!("failed to register launch-at-login: {error}");
+    if let Err(error) = autostart::set_enabled(config.launch_at_login) {
+        tracing::warn!(
+            desired = config.launch_at_login,
+            "failed to reconcile launch-at-login registration: {error}"
+        );
     }
 
     let store = Store::open_default().context("opening store")?;
@@ -115,8 +123,16 @@ fn main() -> anyhow::Result<()> {
         None
     };
     initial_state.default_profile = config.default_profile;
+    initial_state.launch_at_login = config.launch_at_login;
+    if !background_launch {
+        initial_state.request_show();
+    }
     initial_state.security_posture = summarize_security_posture(&security_posture);
     initial_state.capabilities = summarize_capabilities(&security_posture);
+    initial_state.privacy_score = Some(PrivacyScore::calculate(privacy_posture_input(
+        &config,
+        &security_posture,
+    )));
     let shared: SharedState = Arc::new(Mutex::new(initial_state));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
     let diagnostics = Diagnostics::new(Arc::clone(&shared));
@@ -150,16 +166,36 @@ fn main() -> anyhow::Result<()> {
         )
     });
 
-    let mut hotkey_backend = GlobalHotkeyBackend::new().context("creating hotkey backend")?;
-    let combo = parse_combo(&config.hotkey)
-        .with_context(|| format!("parsing hotkey {:?}", config.hotkey))?;
-    let hotkey_id = match hotkey_backend.register(&combo) {
-        Ok(id) => Some(id),
+    let mut hotkey_backend = match GlobalHotkeyBackend::new() {
+        Ok(backend) => Some(backend),
         Err(error) => {
-            tracing::warn!("failed to register hotkey {:?}: {error}", config.hotkey);
+            tracing::warn!("global hotkey backend unavailable: {error}");
             None
         }
     };
+    let combo = parse_combo(&config.hotkey).map_err(|error| {
+        tracing::warn!("failed to parse hotkey {:?}: {error}", config.hotkey);
+        error
+    });
+    let hotkey_id = match (hotkey_backend.as_mut(), combo) {
+        (Some(backend), Ok(combo)) => match backend.register(&combo) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::warn!("failed to register hotkey {:?}: {error}", config.hotkey);
+                None
+            }
+        },
+        _ => None,
+    };
+    if hotkey_id.is_none() {
+        diagnostics.notice(
+            vbuff_types::NoticeLevel::Warning,
+            "Global shortcut unavailable; use this window, the menu bar, or relaunch vbuff",
+        );
+        if background_launch && let Ok(mut state) = shared.lock() {
+            state.request_show();
+        }
+    }
 
     let app_services = app::AppServices {
         history,
@@ -171,6 +207,7 @@ fn main() -> anyhow::Result<()> {
         self_writes,
         strict_capture_blocked,
         automatic_pause_reason: remote_auto_paused.then_some(CapturePauseReason::RemoteControl),
+        hotkey_registered: hotkey_id.is_some(),
     };
     app::run(app_services, hotkey_backend, hotkey_id)
 }
@@ -218,4 +255,39 @@ fn summarize_security_posture(posture: &vbuff_platform::SecurityPosture) -> Secu
         SecurityPostureLevel::Protected
     };
     summary
+}
+
+fn privacy_posture_input(
+    config: &Config,
+    posture: &vbuff_platform::SecurityPosture,
+) -> PrivacyPostureInput {
+    let encryption_at_rest = posture.capabilities.iter().any(|capability| {
+        capability.feature == "encryption_at_rest" && capability.level == CapabilityLevel::Active
+    });
+    let foreground_identity_active = posture.capabilities.iter().any(|capability| {
+        capability.feature == "foreground_identity" && capability.level == CapabilityLevel::Active
+    });
+    let denied_source_count = if foreground_identity_active {
+        let denied_rules = config
+            .source_rules
+            .iter()
+            .filter(|rule| matches!(rule.action, config::SourceRuleAction::Skip))
+            .count();
+        config
+            .excluded_apps
+            .len()
+            .saturating_add(denied_rules)
+            .min(u32::MAX as usize) as u32
+    } else {
+        0
+    };
+    PrivacyPostureInput {
+        encryption_at_rest,
+        strict_local_only: false,
+        sensitive_memory_only: false,
+        telemetry_enabled: false,
+        sync_enabled: false,
+        denied_source_count,
+        retention_days: None,
+    }
 }

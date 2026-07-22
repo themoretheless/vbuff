@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use vbuff_core::onboarding::DefaultProfile;
+use vbuff_gui::{DensityMode, HandedMode, UiPreferences};
 
 const CONFIG_SCHEMA_VERSION: u16 = 2;
 const LEGACY_CONFIG_SCHEMA_VERSION: u16 = 1;
@@ -67,6 +68,18 @@ pub struct Config {
     pub auto_pause_remote: bool,
     /// The summon-shortcut coachmark has been acknowledged on this profile.
     pub hotkey_coachmark_seen: bool,
+    /// Native history-row density: auto, compact, or comfortable.
+    pub ui_density: String,
+    /// Disable non-essential native popup animation.
+    pub ui_reduced_motion: Option<bool>,
+    /// Show the wide clip preview when the viewport has enough room.
+    pub ui_large_preview: bool,
+    /// Optional one-handed keyboard layout: off, left, or right.
+    pub ui_handed_mode: String,
+    /// Show the local frame/scroll diagnostic overlay.
+    pub ui_motion_inspector: bool,
+    /// Expand the metadata-only clipboard health digest.
+    pub ui_show_health_digest: bool,
 }
 
 impl fmt::Debug for Config {
@@ -95,6 +108,12 @@ impl fmt::Debug for Config {
             .field("auto_pause_on_lock", &self.auto_pause_on_lock)
             .field("auto_pause_remote", &self.auto_pause_remote)
             .field("hotkey_coachmark_seen", &self.hotkey_coachmark_seen)
+            .field("ui_density", &self.ui_density)
+            .field("ui_reduced_motion", &self.ui_reduced_motion)
+            .field("ui_large_preview", &self.ui_large_preview)
+            .field("ui_handed_mode", &self.ui_handed_mode)
+            .field("ui_motion_inspector", &self.ui_motion_inspector)
+            .field("ui_show_health_digest", &self.ui_show_health_digest)
             .finish()
     }
 }
@@ -124,6 +143,12 @@ impl Default for Config {
             auto_pause_on_lock: true,
             auto_pause_remote: true,
             hotkey_coachmark_seen: false,
+            ui_density: "auto".into(),
+            ui_reduced_motion: None,
+            ui_large_preview: true,
+            ui_handed_mode: "off".into(),
+            ui_motion_inspector: false,
+            ui_show_health_digest: false,
         }
     }
 }
@@ -262,10 +287,12 @@ impl Config {
         let path = config_path()?;
         if path.exists() {
             let text = read_bounded(std::fs::File::open(&path)?)?;
-            let cfg: Config = toml::from_str(&text)?;
+            let cfg = parse_runtime_config(&text)?;
+            cfg.validate()?;
             Ok(cfg)
         } else {
             let cfg = Config::default();
+            cfg.validate()?;
             cfg.save()?;
             Ok(cfg)
         }
@@ -275,19 +302,19 @@ impl Config {
     pub fn load_for_inspection() -> anyhow::Result<Config> {
         let path = config_path()?;
         if path.exists() {
-            Ok(toml::from_str(&read_bounded(std::fs::File::open(path)?)?)?)
+            let cfg = parse_runtime_config(&read_bounded(std::fs::File::open(path)?)?)?;
+            cfg.validate()?;
+            Ok(cfg)
         } else {
-            Ok(Config::default())
+            let cfg = Config::default();
+            cfg.validate()?;
+            Ok(cfg)
         }
     }
 
     /// Persist the config to the default path.
     pub fn save(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.schema_version == CONFIG_SCHEMA_VERSION,
-            "config schema {} needs previewed migration; run `vbuff config migrate preview`",
-            self.schema_version
-        );
+        self.validate()?;
         let path = config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -357,6 +384,95 @@ impl Config {
         self.auto_pause_idle_seconds = defaults.auto_pause_idle_seconds;
         self.auto_pause_remote = defaults.auto_pause_remote;
         self.detect_secrets = defaults.detect_secrets;
+    }
+
+    pub fn ui_preferences(&self) -> UiPreferences {
+        UiPreferences {
+            density: match self.ui_density.as_str() {
+                "compact" => DensityMode::Compact,
+                "comfortable" => DensityMode::Comfortable,
+                _ => DensityMode::Auto,
+            },
+            reduced_motion: self
+                .ui_reduced_motion
+                .or_else(vbuff_platform::desktop::reduced_motion_preference)
+                .unwrap_or(false),
+            large_preview: self.ui_large_preview,
+            handed_mode: match self.ui_handed_mode.as_str() {
+                "left" => HandedMode::Left,
+                "right" => HandedMode::Right,
+                _ => HandedMode::Off,
+            },
+            motion_inspector: self.ui_motion_inspector,
+            show_health_digest: self.ui_show_health_digest,
+        }
+    }
+
+    pub fn apply_ui_preferences(
+        &mut self,
+        preferences: &UiPreferences,
+        reduced_motion_changed: bool,
+    ) {
+        self.ui_density = match preferences.density {
+            DensityMode::Auto => "auto",
+            DensityMode::Compact => "compact",
+            DensityMode::Comfortable => "comfortable",
+        }
+        .into();
+        if reduced_motion_changed {
+            self.ui_reduced_motion = Some(preferences.reduced_motion);
+        }
+        self.ui_large_preview = preferences.large_preview;
+        self.ui_handed_mode = match preferences.handed_mode {
+            HandedMode::Off => "off",
+            HandedMode::Left => "left",
+            HandedMode::Right => "right",
+        }
+        .into();
+        self.ui_motion_inspector = preferences.motion_inspector;
+        self.ui_show_health_digest = preferences.show_health_digest;
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == CONFIG_SCHEMA_VERSION,
+            "config schema {} needs previewed migration; run `vbuff config migrate preview`",
+            self.schema_version
+        );
+        self.shareable().validate()?;
+        anyhow::ensure!(self.excluded_apps.len() <= 1_024, "too many excluded apps");
+        for app in &self.excluded_apps {
+            anyhow::ensure!(
+                !app.is_empty() && app.len() <= 512 && !app.chars().any(char::is_control),
+                "invalid excluded app"
+            );
+        }
+        anyhow::ensure!(self.source_rules.len() <= 1_024, "too many source rules");
+        anyhow::ensure!(
+            matches!(self.ui_density.as_str(), "auto" | "compact" | "comfortable"),
+            "invalid UI density"
+        );
+        anyhow::ensure!(
+            matches!(self.ui_handed_mode.as_str(), "off" | "left" | "right"),
+            "invalid handed mode"
+        );
+        for rule in &self.source_rules {
+            for value in [&rule.app_contains, &rule.url_host_suffix]
+                .into_iter()
+                .flatten()
+            {
+                anyhow::ensure!(
+                    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control),
+                    "invalid source rule"
+                );
+            }
+            if let Some(pattern) = &rule.title_regex {
+                anyhow::ensure!(pattern.len() <= 4_096, "source rule regex is too long");
+                regex::Regex::new(pattern)
+                    .map_err(|_| anyhow::anyhow!("invalid source rule regex"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -439,41 +555,7 @@ impl ConfigHandoff {
             self.payload_hash == hash_config(&self.config)?,
             "handoff checksum mismatch"
         );
-        anyhow::ensure!(
-            self.config.schema_version == CONFIG_SCHEMA_VERSION,
-            "handoff config needs migration before import"
-        );
-        self.config.shareable().validate()?;
-        anyhow::ensure!(
-            self.config.excluded_apps.len() <= 1_024,
-            "too many excluded apps"
-        );
-        for app in &self.config.excluded_apps {
-            anyhow::ensure!(
-                !app.is_empty() && app.len() <= 512 && !app.chars().any(char::is_control),
-                "invalid excluded app"
-            );
-        }
-        anyhow::ensure!(
-            self.config.source_rules.len() <= 1_024,
-            "too many source rules"
-        );
-        for rule in &self.config.source_rules {
-            for value in [&rule.app_contains, &rule.url_host_suffix]
-                .into_iter()
-                .flatten()
-            {
-                anyhow::ensure!(
-                    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control),
-                    "invalid source rule"
-                );
-            }
-            if let Some(pattern) = &rule.title_regex {
-                anyhow::ensure!(pattern.len() <= 4_096, "source rule regex is too long");
-                regex::Regex::new(pattern)?;
-            }
-        }
-        Ok(())
+        self.config.validate()
     }
 }
 
@@ -595,7 +677,7 @@ pub(crate) fn run(command: ConfigCommand) -> anyhow::Result<()> {
         }
         ConfigCommand::HandoffApply(path) => {
             let text = read_bounded(std::fs::File::open(path)?)?;
-            let handoff: ConfigHandoff = toml::from_str(&text)?;
+            let handoff = parse_runtime_handoff(&text)?;
             handoff.validate()?;
             handoff.config.save()?;
             println!("vbuff config: applied full setup handoff");
@@ -635,6 +717,7 @@ pub(crate) fn run(command: ConfigCommand) -> anyhow::Result<()> {
 
 fn preview_migration(text: &str) -> anyhow::Result<ConfigMigrationPreview> {
     let raw: toml::Value = toml::from_str(text)?;
+    validate_runtime_config_keys(&raw)?;
     let from_schema = raw
         .get("schema_version")
         .and_then(toml::Value::as_integer)
@@ -664,8 +747,87 @@ fn preview_migration(text: &str) -> anyhow::Result<ConfigMigrationPreview> {
     })
 }
 
+fn parse_runtime_config(text: &str) -> anyhow::Result<Config> {
+    let value: toml::Value = toml::from_str(text)?;
+    validate_runtime_config_keys(&value)?;
+    Ok(toml::from_str(text)?)
+}
+
+fn parse_runtime_handoff(text: &str) -> anyhow::Result<ConfigHandoff> {
+    let value: toml::Value = toml::from_str(text)?;
+    let table = value
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("handoff must be a TOML table"))?;
+    let config = table
+        .get("config")
+        .ok_or_else(|| anyhow::anyhow!("handoff is missing config"))?;
+    validate_runtime_config_keys(config)?;
+    Ok(toml::from_str(text)?)
+}
+
+fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
+    const CONFIG_KEYS: &[&str] = &[
+        "schema_version",
+        "hotkey",
+        "poll_interval_ms",
+        "max_history",
+        "paste_modifier",
+        "excluded_apps",
+        "source_rules",
+        "skip_whitespace_only",
+        "detect_secrets",
+        "secret_ttl_seconds",
+        "capture_soft_limit_bytes",
+        "capture_hard_limit_bytes",
+        "capture_preview_bytes",
+        "memory_soft_limit_mb",
+        "memory_hard_limit_mb",
+        "strict_security_mode",
+        "launch_at_login",
+        "default_profile",
+        "auto_pause_idle_seconds",
+        "auto_pause_on_lock",
+        "auto_pause_remote",
+        "hotkey_coachmark_seen",
+        "ui_density",
+        "ui_reduced_motion",
+        "ui_large_preview",
+        "ui_handed_mode",
+        "ui_motion_inspector",
+        "ui_show_health_digest",
+    ];
+    const SOURCE_RULE_KEYS: &[&str] = &["app_contains", "title_regex", "url_host_suffix", "action"];
+
+    let table = value
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("config must be a TOML table"))?;
+    for key in table.keys() {
+        anyhow::ensure!(
+            CONFIG_KEYS.contains(&key.as_str()),
+            "unknown config key `{key}`"
+        );
+    }
+    if let Some(rules) = table.get("source_rules") {
+        let rules = rules
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("source_rules must be an array"))?;
+        for rule in rules {
+            let rule = rule
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("source rule must be a TOML table"))?;
+            for key in rule.keys() {
+                anyhow::ensure!(
+                    SOURCE_RULE_KEYS.contains(&key.as_str()),
+                    "unknown source rule key `{key}`"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn migrate_config_text(text: &str) -> anyhow::Result<String> {
-    let config: Config = toml::from_str(text)?;
+    let config = parse_runtime_config(text)?;
     let mut document = text.parse::<toml_edit::Document>()?;
     document["schema_version"] = toml_edit::value(i64::from(CONFIG_SCHEMA_VERSION));
     if document.get("auto_pause_idle_seconds").is_none() {
@@ -825,6 +987,82 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_rejects_invalid_private_regex_without_echoing_it() {
+        let mut config = Config::default();
+        config.source_rules.push(SourceRuleConfig {
+            title_regex: Some("(?P<private-pattern>".into()),
+            ..SourceRuleConfig::default()
+        });
+
+        let error = config.validate().unwrap_err().to_string();
+        assert_eq!(error, "invalid source rule regex");
+        assert!(!error.contains("private-pattern"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_top_level_and_nested_security_typos() {
+        let top_level = "schema_version = 2\nstrict_security_mod = true\n";
+        assert!(
+            parse_runtime_config(top_level)
+                .unwrap_err()
+                .to_string()
+                .contains("strict_security_mod")
+        );
+
+        let nested = r#"
+schema_version = 2
+[[source_rules]]
+app_contians = "private-app"
+action = "skip"
+"#;
+        assert!(
+            parse_runtime_config(nested)
+                .unwrap_err()
+                .to_string()
+                .contains("app_contians")
+        );
+    }
+
+    #[test]
+    fn config_migration_rejects_unknown_keys_before_writing() {
+        let typo = "schema_version = 1\nstrict_security_mod = true\n";
+        assert!(preview_migration(typo).is_err());
+        assert!(migrate_config_text(typo).is_err());
+    }
+
+    #[test]
+    fn native_ui_preferences_roundtrip_through_owner_config() {
+        let mut config = Config::default();
+        let preferences = UiPreferences {
+            density: DensityMode::Compact,
+            reduced_motion: true,
+            large_preview: false,
+            handed_mode: HandedMode::Left,
+            motion_inspector: true,
+            show_health_digest: true,
+        };
+
+        config.apply_ui_preferences(&preferences, true);
+        config.validate().unwrap();
+        assert_eq!(config.ui_preferences(), preferences);
+    }
+
+    #[test]
+    fn unrelated_ui_change_preserves_os_reduced_motion_inheritance() {
+        let mut config = Config::default();
+        assert_eq!(config.ui_reduced_motion, None);
+        let mut preferences = config.ui_preferences();
+        preferences.density = DensityMode::Compact;
+
+        config.apply_ui_preferences(&preferences, false);
+
+        assert_eq!(config.ui_reduced_motion, None);
+        preferences.reduced_motion = !preferences.reduced_motion;
+        config.apply_ui_preferences(&preferences, true);
+        assert_eq!(config.ui_reduced_motion, Some(preferences.reduced_motion));
+    }
+
+    #[test]
     fn command_parser_rejects_ambiguous_trailing_arguments() {
         assert!(
             parse_requested(["config", "export", "one.toml", "two.toml"].map(str::to_owned))
@@ -876,11 +1114,11 @@ auto_pause_idle_seconds = 900
         assert!(preview_migration("schema_version = 65536").is_err());
 
         let migrated = migrate_config_text(
-            "# keep this comment\nhotkey = \"Ctrl+Shift+V\"\nfuture_owner_key = \"keep\"\n",
+            "# keep this comment\nhotkey = \"Ctrl+Shift+V\"\nexcluded_apps = [\"private-bank-app\"]\n",
         )
         .unwrap();
         assert!(migrated.contains("# keep this comment"));
-        assert!(migrated.contains("future_owner_key = \"keep\""));
+        assert!(migrated.contains("excluded_apps = [\"private-bank-app\"]"));
         assert!(migrated.contains("schema_version = 2"));
         assert!(migrated.contains("auto_pause_on_lock = true"));
     }

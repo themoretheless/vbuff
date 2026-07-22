@@ -10,6 +10,13 @@ use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
+const BACKGROUND_ARG: &str = "--background";
+
+/// True when the process was launched by the native login registration.
+pub fn background_requested() -> bool {
+    std::env::args_os().any(|argument| argument == BACKGROUND_ARG)
+}
+
 /// Register or unregister vbuff for launch at login.
 pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
@@ -49,6 +56,7 @@ fn platform_set_enabled(enabled: bool, exe: &Path) -> anyhow::Result<()> {
     let exe = exe
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vbuff executable path is not valid UTF-8"))?;
+    let run_value = windows_run_value(exe);
     let status = if enabled {
         std::process::Command::new("reg")
             .args([
@@ -59,11 +67,22 @@ fn platform_set_enabled(enabled: bool, exe: &Path) -> anyhow::Result<()> {
                 "/t",
                 "REG_SZ",
                 "/d",
-                exe,
+                &run_value,
                 "/f",
             ])
             .status()?
     } else {
+        let exists = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "vbuff",
+            ])
+            .status()?;
+        if !exists.success() {
+            return Ok(());
+        }
         std::process::Command::new("reg")
             .args([
                 "delete",
@@ -110,6 +129,7 @@ fn macos_launch_agent_plist(exe: &Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
+    <string>{BACKGROUND_ARG}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -130,8 +150,13 @@ fn linux_desktop_entry_path() -> anyhow::Result<PathBuf> {
 fn linux_desktop_entry(exe: &Path) -> String {
     let exe = desktop_exec_escape(&exe.to_string_lossy());
     format!(
-        "[Desktop Entry]\nType=Application\nName=vbuff\nComment=Private clipboard manager\nExec={exe}\nTryExec={exe}\nTerminal=false\nDBusActivatable=false\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=2\n"
+        "[Desktop Entry]\nType=Application\nName=vbuff\nComment=Private clipboard manager\nExec={exe} {BACKGROUND_ARG}\nTryExec={exe}\nTerminal=false\nDBusActivatable=false\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=2\n"
     )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_run_value(exe: &str) -> String {
+    format!("\"{exe}\" {BACKGROUND_ARG}")
 }
 
 #[cfg(target_os = "linux")]
@@ -169,5 +194,23 @@ mod tests {
     fn macos_plist_escapes_xml() {
         let escaped = super::xml_escape("/tmp/a&b<vbuff>");
         assert_eq!(escaped, "/tmp/a&amp;b&lt;vbuff&gt;");
+    }
+
+    #[test]
+    fn startup_commands_are_explicitly_backgrounded() {
+        assert_eq!(
+            super::windows_run_value(r"C:\\Program Files\\vbuff.exe"),
+            r#""C:\\Program Files\\vbuff.exe" --background"#
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            super::macos_launch_agent_plist(std::path::Path::new("/Applications/vbuff"))
+                .contains("<string>--background</string>")
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            super::linux_desktop_entry(std::path::Path::new("/opt/vbuff"))
+                .contains("Exec=/opt/vbuff --background")
+        );
     }
 }

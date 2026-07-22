@@ -3,7 +3,10 @@ use vbuff_types::ContentKind;
 
 #[test]
 fn data_contract_v2_lifecycle_vectors_are_frozen() {
-    assert_eq!(vbuff_store::SCHEMA_VERSION, 6);
+    assert_eq!(vbuff_store::DATA_CONTRACT_V2_SCHEMA_VERSION, 6);
+    const {
+        assert!(vbuff_store::SCHEMA_VERSION >= vbuff_store::DATA_CONTRACT_V2_SCHEMA_VERSION);
+    }
     assert_eq!(
         normalized_text_fingerprint("Hello,\nworld -- next").unwrap(),
         [

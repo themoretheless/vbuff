@@ -3,11 +3,13 @@
 //! The SQLite store remains the source of truth. This facade keeps mutex and
 //! snapshot-refresh plumbing out of capture, tray, and command handling.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::anyhow;
+use chrono::Utc;
 use vbuff_core::capture::CaptureOutcome;
 use vbuff_gui::SharedState;
 use vbuff_store::Store;
@@ -31,6 +33,8 @@ pub(crate) struct MaintenanceSummary {
 #[derive(Clone)]
 pub(crate) struct History {
     store: Arc<Mutex<Store>>,
+    volatile: Arc<Mutex<Vec<Clip>>>,
+    volatile_origins: Arc<Mutex<VecDeque<ClipId>>>,
     shared: SharedState,
     snapshot_limit: Arc<AtomicUsize>,
 }
@@ -39,6 +43,8 @@ impl History {
     pub(crate) fn new(store: Store, shared: SharedState, snapshot_limit: usize) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
+            volatile: Arc::new(Mutex::new(Vec::new())),
+            volatile_origins: Arc::new(Mutex::new(VecDeque::new())),
             shared,
             snapshot_limit: Arc::new(AtomicUsize::new(snapshot_limit.max(1))),
         }
@@ -51,6 +57,35 @@ impl History {
             store.enforce_cap(max_history)?;
             Ok(())
         })
+    }
+
+    /// Publish a short-lived clip without writing its payload to SQLite.
+    pub(crate) fn insert_volatile(&self, clip: Clip) -> anyhow::Result<()> {
+        const MAX_VOLATILE_CLIPS: usize = 32;
+        const MAX_VOLATILE_ORIGINS: usize = 256;
+        {
+            let mut origins = self
+                .volatile_origins
+                .lock()
+                .map_err(|_| anyhow!("volatile origin mutex poisoned"))?;
+            origins.retain(|id| *id != clip.id);
+            origins.push_back(clip.id);
+            while origins.len() > MAX_VOLATILE_ORIGINS {
+                origins.pop_front();
+            }
+        }
+        {
+            let mut volatile = self
+                .volatile
+                .lock()
+                .map_err(|_| anyhow!("volatile history mutex poisoned"))?;
+            volatile.retain(|candidate| {
+                candidate.content_hash != clip.content_hash && !is_expired(candidate)
+            });
+            volatile.insert(0, clip);
+            volatile.truncate(MAX_VOLATILE_CLIPS);
+        }
+        self.refresh_snapshot()
     }
 
     /// Insert one explicit starter pack and refresh the snapshot once.
@@ -77,10 +112,18 @@ impl History {
     }
 
     pub(crate) fn set_pinned(&self, id: ClipId, pinned: bool) -> anyhow::Result<()> {
+        if self.is_memory_only(id)? {
+            return Err(anyhow!("memory-only clips cannot be pinned"));
+        }
         self.mutate_and_refresh(|store| store.set_pinned(id, pinned))
     }
 
     pub(crate) fn set_session_protected(&self, id: ClipId, protected: bool) -> anyhow::Result<()> {
+        if self.is_memory_only(id)? {
+            return Err(anyhow!(
+                "memory-only clips cannot receive session protection"
+            ));
+        }
         self.store
             .lock()
             .map_err(|_| anyhow!("history store mutex poisoned"))?
@@ -99,6 +142,19 @@ impl History {
     }
 
     pub(crate) fn delete(&self, id: ClipId) -> anyhow::Result<()> {
+        let removed_volatile = {
+            let mut volatile = self
+                .volatile
+                .lock()
+                .map_err(|_| anyhow!("volatile history mutex poisoned"))?;
+            let previous_len = volatile.len();
+            volatile.retain(|clip| clip.id != id);
+            volatile.len() != previous_len
+        };
+        if removed_volatile {
+            self.refresh_snapshot()?;
+            return Ok(());
+        }
         self.mutate_and_refresh(|store| store.delete(id))?;
         self.shared
             .lock()
@@ -110,24 +166,71 @@ impl History {
 
     /// Clear non-pinned history. The command name is shared across all surfaces.
     pub(crate) fn clear_history(&self) -> anyhow::Result<()> {
+        self.volatile
+            .lock()
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?
+            .clear();
         self.mutate_and_refresh(Store::clear)
     }
 
     pub(crate) fn find(&self, id: ClipId) -> anyhow::Result<Option<Clip>> {
-        let state = self
-            .shared
+        if let Some(clip) = self
+            .volatile
             .lock()
-            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
-        Ok(state.clips.iter().find(|clip| clip.id == id).cloned())
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?
+            .iter()
+            .find(|clip| clip.id == id && !is_expired(clip))
+            .cloned()
+        {
+            return Ok(Some(clip));
+        }
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("history store mutex poisoned"))?
+            .get_clip(id)?)
+    }
+
+    pub(crate) fn is_memory_only(&self, id: ClipId) -> anyhow::Result<bool> {
+        Ok(self
+            .volatile_origins
+            .lock()
+            .map_err(|_| anyhow!("volatile origin mutex poisoned"))?
+            .contains(&id))
+    }
+
+    pub(crate) fn restore(&self, clip: Clip, max_history: usize) -> anyhow::Result<()> {
+        if self.is_memory_only(clip.id)? {
+            self.insert_volatile(clip)
+        } else {
+            self.insert(&clip, max_history)
+        }
     }
 
     #[cfg(feature = "tray")]
     pub(crate) fn latest(&self) -> anyhow::Result<Option<Clip>> {
-        let state = self
-            .shared
+        let volatile = self
+            .volatile
             .lock()
-            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
-        Ok(state.clips.first().cloned())
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?
+            .iter()
+            .filter(|clip| !is_expired(clip))
+            .max_by_key(|clip| clip.meta.created_at)
+            .cloned();
+        let persistent = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("history store mutex poisoned"))?
+            .latest_by_recency()?;
+        Ok(match (volatile, persistent) {
+            (Some(volatile), Some(persistent))
+                if persistent.meta.created_at > volatile.meta.created_at =>
+            {
+                Some(persistent)
+            }
+            (Some(volatile), _) => Some(volatile),
+            (None, persistent) => persistent,
+        })
     }
 
     pub(crate) fn maintain_idle(
@@ -135,6 +238,8 @@ impl History {
         background_work: bool,
         secret_ttl: Duration,
     ) -> anyhow::Result<Option<MaintenanceSummary>> {
+        let volatile_expired = self.purge_expired_volatile()?;
+        self.prune_expired_snapshot()?;
         let (summary, refreshed_clips, digest) = {
             let store = match self.store.try_lock() {
                 Ok(store) => store,
@@ -163,7 +268,8 @@ impl History {
             let audit = store.audit_content_hashes(32)?;
             let fts_optimized = background_work && store.maintain_search_index(256)?;
             let blobs_collected = store.gc_blobs()?;
-            let changed_visible_rows = expired > 0
+            let changed_visible_rows = volatile_expired > 0
+                || expired > 0
                 || clawback.reclassified > 0
                 || audit.repaired > 0
                 || audit.quarantined > 0;
@@ -189,6 +295,10 @@ impl History {
             )
         };
 
+        let refreshed_clips = refreshed_clips
+            .map(|clips| self.merge_volatile(clips, self.snapshot_limit.load(Ordering::Relaxed)))
+            .transpose()?;
+        let memory_only_clips = self.current_volatile_ids()?;
         let mut state = self
             .shared
             .lock()
@@ -196,6 +306,7 @@ impl History {
         if let Some(clips) = refreshed_clips {
             state.set_clips(clips);
         }
+        state.memory_only_clips = memory_only_clips;
         state.health_digest = digest;
         Ok(Some(summary))
     }
@@ -212,12 +323,15 @@ impl History {
             };
             store.load_recent(limit)?
         };
+        let clips = self.merge_volatile(clips, limit)?;
         self.snapshot_limit.store(limit, Ordering::Relaxed);
+        let memory_only_clips = self.current_volatile_ids()?;
         let mut state = self
             .shared
             .lock()
             .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
         state.set_clips(clips);
+        state.memory_only_clips = memory_only_clips;
         Ok(true)
     }
 
@@ -233,14 +347,103 @@ impl History {
             mutation(&store)?;
             store.load_recent(self.snapshot_limit.load(Ordering::Relaxed))?
         };
+        let limit = self.snapshot_limit.load(Ordering::Relaxed);
+        let clips = self.merge_volatile(clips, limit)?;
+        let memory_only_clips = self.current_volatile_ids()?;
 
         let mut state = self
             .shared
             .lock()
             .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
         state.set_clips(clips);
+        state.memory_only_clips = memory_only_clips;
         Ok(())
     }
+
+    fn current_volatile_ids(&self) -> anyhow::Result<HashSet<ClipId>> {
+        Ok(self
+            .volatile
+            .lock()
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?
+            .iter()
+            .filter(|clip| !is_expired(clip))
+            .map(|clip| clip.id)
+            .collect())
+    }
+
+    fn purge_expired_volatile(&self) -> anyhow::Result<usize> {
+        let mut volatile = self
+            .volatile
+            .lock()
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?;
+        let previous_len = volatile.len();
+        volatile.retain(|clip| !is_expired(clip));
+        Ok(previous_len - volatile.len())
+    }
+
+    fn prune_expired_snapshot(&self) -> anyhow::Result<()> {
+        let memory_only_clips = self.current_volatile_ids()?;
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
+        if state.clips.iter().any(is_expired) {
+            let active = state
+                .clips
+                .iter()
+                .filter(|clip| !is_expired(clip))
+                .cloned()
+                .collect::<Vec<_>>();
+            state.set_clips(active);
+        }
+        state.memory_only_clips = memory_only_clips;
+        Ok(())
+    }
+
+    fn refresh_snapshot(&self) -> anyhow::Result<()> {
+        let limit = self.snapshot_limit.load(Ordering::Relaxed);
+        let persistent = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("history store mutex poisoned"))?
+            .load_recent(limit)?;
+        let clips = self.merge_volatile(persistent, limit)?;
+        let memory_only_clips = self.current_volatile_ids()?;
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| anyhow!("GUI state mutex poisoned"))?;
+        state.set_clips(clips);
+        state.memory_only_clips = memory_only_clips;
+        Ok(())
+    }
+
+    fn merge_volatile(&self, persistent: Vec<Clip>, limit: usize) -> anyhow::Result<Vec<Clip>> {
+        let volatile = self
+            .volatile
+            .lock()
+            .map_err(|_| anyhow!("volatile history mutex poisoned"))?
+            .iter()
+            .filter(|clip| !is_expired(clip))
+            .cloned()
+            .collect::<Vec<_>>();
+        let pinned_end = persistent
+            .iter()
+            .position(|clip| !clip.pinned)
+            .unwrap_or(persistent.len());
+        let mut merged = Vec::with_capacity(persistent.len().saturating_add(volatile.len()));
+        merged.extend_from_slice(&persistent[..pinned_end]);
+        merged.extend(volatile);
+        merged.extend_from_slice(&persistent[pinned_end..]);
+        merged.truncate(limit.max(1));
+        Ok(merged)
+    }
+}
+
+fn is_expired(clip: &Clip) -> bool {
+    clip.meta
+        .expires_at
+        .is_some_and(|expiry| expiry <= Utc::now())
 }
 
 #[cfg(test)]
@@ -304,5 +507,85 @@ mod tests {
         history.set_pinned(first_id, true).unwrap();
 
         assert_eq!(shared.lock().unwrap().clips.len(), 1);
+    }
+
+    #[test]
+    fn memory_only_clip_never_enters_store_and_undo_restores_volatile_lane() {
+        let flavors = vec![Flavor::inline("text/plain", b"123456".to_vec())];
+        let mut meta = ClipMeta::now(ContentKind::Text, 6, None);
+        meta.sensitive = true;
+        meta.sync_eligible = false;
+        meta.sensitivity_reason = Some(vbuff_types::SensitivityReason::OneTimePassword);
+        meta.expires_at = Some(Utc::now() + Duration::seconds(60));
+        let clip = Clip {
+            id: ClipId::new(),
+            content_hash: vbuff_core::content_hash_from_flavors(&flavors),
+            flavors,
+            meta,
+            pinned: false,
+            favorite: false,
+        };
+        let id = clip.id;
+        let shared = Arc::new(Mutex::new(AppState::default()));
+        let history = History::new(Store::open_in_memory().unwrap(), Arc::clone(&shared), 100);
+
+        history.insert_volatile(clip.clone()).unwrap();
+        assert!(
+            history
+                .store
+                .lock()
+                .unwrap()
+                .get_clip(id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(shared.lock().unwrap().memory_only_clips.contains(&id));
+        assert!(history.set_pinned(id, true).is_err());
+        assert!(history.set_session_protected(id, true).is_err());
+
+        history.delete(id).unwrap();
+        assert!(history.find(id).unwrap().is_none());
+        history.restore(clip, 100).unwrap();
+        assert!(history.find(id).unwrap().is_some());
+        assert!(
+            history
+                .store
+                .lock()
+                .unwrap()
+                .get_clip(id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_payload_leaves_snapshot_even_when_store_is_busy() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(vbuff_gui::AppState::default()));
+        let history = History::new(Store::open_in_memory().unwrap(), shared.clone(), 10);
+        let flavors = vec![Flavor::inline("text/plain", b"short lived".to_vec())];
+        let mut meta = ClipMeta::now(ContentKind::Text, 11, None);
+        meta.sensitive = true;
+        meta.expires_at = Some(Utc::now() + chrono::Duration::milliseconds(5));
+        let clip = Clip {
+            id: ClipId::new(),
+            content_hash: vbuff_core::content_hash_from_flavors(&flavors),
+            flavors,
+            meta,
+            pinned: false,
+            favorite: false,
+        };
+        history.insert_volatile(clip).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let _store_guard = history.store.lock().unwrap();
+        assert!(
+            history
+                .maintain_idle(false, std::time::Duration::from_secs(60))
+                .unwrap()
+                .is_none()
+        );
+        let state = shared.lock().unwrap();
+        assert!(state.clips.is_empty());
+        assert!(state.memory_only_clips.is_empty());
     }
 }

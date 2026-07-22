@@ -27,10 +27,11 @@ use vbuff_core::fingerprint::{
 use vbuff_core::intelligence::{AiGate, AiOperation};
 use vbuff_types::{
     CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta,
-    ClipboardHealthDigest, ContentKind, Flavor,
+    ClipboardHealthDigest, ContentKind, Flavor, SensitivityReason,
 };
 
 mod cas;
+mod data_lifecycle;
 mod error;
 mod image_fingerprint;
 mod lifecycle;
@@ -38,6 +39,13 @@ mod migration;
 mod search;
 mod serde_clip;
 
+pub use data_lifecycle::{
+    ArchiveVisibility, AttachmentManifest, BackupFreshness, BlobIntegrityReport, ClipAnnotations,
+    CollectionRecord, CollectionRetentionPolicy, CollectionRetentionPreview, CompactionForecast,
+    ExportSchemaVersion, FlavorManifest, FlavorStorage, GarbageCollectionPreview,
+    ImportQuarantineEntry, PartialRestoreReport, ResidencyTransition, RestoreSelection,
+    SensitiveDataResidency, export_clips_json,
+};
 pub use error::StoreError;
 pub use lifecycle::{
     DeletionReason, GraceBinEntry, MergeLedgerEntry, RetentionReport, RetentionRule,
@@ -50,8 +58,11 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// Schema frozen by the original v1 data-contract fixture.
 pub const DATA_CONTRACT_V1_SCHEMA_VERSION: i64 = 5;
 
+/// Schema frozen by the v2 lifecycle data-contract fixture.
+pub const DATA_CONTRACT_V2_SCHEMA_VERSION: i64 = 6;
+
 /// The current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StoreOpenProfile {
@@ -173,6 +184,7 @@ pub struct Store {
     cas: Option<cas::CasStore>,
     dedup_filter: RefCell<BloomFilter>,
     search_planner: RefCell<search::SearchPlanner>,
+    blob_scrub_cursor: RefCell<Option<(String, i64)>>,
 }
 
 impl Store {
@@ -225,6 +237,10 @@ impl Store {
                     guard.rollback()?;
                     return Err(error);
                 }
+                if let Some(guard) = &migration {
+                    guard.commit()?;
+                }
+                migration::cleanup_stale_after_verified_open(path, SCHEMA_VERSION, &store.conn)?;
                 Ok((
                     store,
                     StoreOpenProfile {
@@ -262,6 +278,7 @@ impl Store {
             cas: None,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
         Ok((
             store,
@@ -294,6 +311,7 @@ impl Store {
             cas,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
         store.migrate()?;
         store.conn.execute_batch(
@@ -535,6 +553,72 @@ impl Store {
                 CHECK(max_items IS NULL OR max_items >= 0)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS collection_policies (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                max_age_days INTEGER,
+                max_items INTEGER,
+                max_bytes INTEGER,
+                CHECK(max_age_days IS NOT NULL OR max_items IS NOT NULL OR max_bytes IS NOT NULL),
+                CHECK(max_age_days IS NULL OR max_age_days BETWEEN 1 AND 3650),
+                CHECK(max_items IS NULL OR max_items BETWEEN 0 AND 1000000),
+                CHECK(max_bytes IS NULL OR max_bytes > 0)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS clip_annotations (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+                collection_id TEXT REFERENCES collection_policies(id) ON DELETE SET NULL,
+                preferred_mime TEXT,
+                legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0, 1))
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_archive
+                ON clip_annotations(archived, clip_id);
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_collection
+                ON clip_annotations(collection_id, clip_id)
+                WHERE collection_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_hold
+                ON clip_annotations(legal_hold, clip_id)
+                WHERE legal_hold = 1;
+
+            CREATE TABLE IF NOT EXISTS clip_residency (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                ever_on_disk INTEGER NOT NULL DEFAULT 1 CHECK(ever_on_disk IN (0, 1)),
+                ever_synced INTEGER NOT NULL DEFAULT 0 CHECK(ever_synced IN (0, 1)),
+                ever_exported INTEGER NOT NULL DEFAULT 0 CHECK(ever_exported IN (0, 1))
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS blob_quarantine (
+                hash TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                quarantined_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY(hash, kind)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS backup_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                verified_at INTEGER NOT NULL,
+                checksum TEXT NOT NULL CHECK(length(checksum) = 64)
+            );
+
+            CREATE TABLE IF NOT EXISTS import_quarantine (
+                import_id TEXT PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                clip_id TEXT NOT NULL,
+                staged_at INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+                sensitive INTEGER NOT NULL CHECK(sensitive IN (0, 1)),
+                payload_json TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_import_quarantine_staged
+                ON import_quarantine(staged_at, import_id);
+
+            CREATE TRIGGER IF NOT EXISTS clips_lifecycle_ai AFTER INSERT ON clips BEGIN
+                INSERT OR IGNORE INTO clip_annotations(clip_id) VALUES (new.id);
+                INSERT OR IGNORE INTO clip_residency(clip_id, ever_on_disk) VALUES (new.id, 1);
+            END;
+
             CREATE INDEX IF NOT EXISTS idx_clips_simhash ON clips(simhash);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b0 ON clips(simhash_b0);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b1 ON clips(simhash_b1);
@@ -623,6 +707,22 @@ impl Store {
                     SET refcount = refcount + excluded.refcount;
             END;
             "#,
+        )?;
+        conn.execute(
+            "INSERT INTO clip_fts_prose(clip_fts_prose, rank) VALUES('secure-delete', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO clip_fts_code(clip_fts_code, rank) VALUES('secure-delete', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO clip_annotations(clip_id) SELECT id FROM clips",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO clip_residency(clip_id, ever_on_disk) SELECT id, 1 FROM clips",
+            [],
         )?;
         for rule in lifecycle::default_retention_rules() {
             let (kind, sensitive) = rule.scope.database_values();
@@ -840,6 +940,15 @@ impl Store {
     /// is bumped to now (moving it to the top) and its existing [`ClipId`] is
     /// returned. Otherwise the new clip is inserted and its id returned.
     pub fn insert(&self, clip: &Clip) -> Result<ClipId> {
+        if clip
+            .meta
+            .sensitivity_reason
+            .is_some_and(memory_only_sensitivity)
+        {
+            return Err(StoreError::Maintenance(
+                "memory-only sensitive content cannot be persisted".into(),
+            ));
+        }
         self.purge_expired()?;
         let now = now_millis();
         let might_exist = self
@@ -871,6 +980,9 @@ impl Store {
             && stored.sensitive
         {
             effective_meta.sensitive = true;
+            if effective_meta.sensitivity_reason.is_none() {
+                effective_meta.sensitivity_reason = stored.sensitivity_reason;
+            }
             if !clip.meta.sensitive {
                 effective_meta.expires_at = stored.expires_at;
             }
@@ -1069,24 +1181,7 @@ impl Store {
 
     /// List the most recent clips (pinned first, then by recency), up to `limit`.
     pub fn list(&self, limit: usize) -> Result<Vec<Clip>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
-            FROM clips
-            WHERE expires_at IS NULL OR expires_at > ?1
-               OR EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-               )
-            ORDER BY pinned DESC, updated_at DESC, seq DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![now_millis(), limit as i64], row_to_clip)?;
-        let mut clips = collect_clips(rows)?;
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.list_with_archive(ArchiveVisibility::Active, limit)
     }
 
     /// Load the most recent clips (alias used at startup to hydrate the GUI).
@@ -1434,11 +1529,13 @@ impl Store {
             SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
                    c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
             FROM clips c
+            LEFT JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ? OR EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = c.id
-                  ))
+              ))
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
+              AND COALESCE(a.archived, 0) = 0
             "#,
         );
         let mut values = vec![Value::Integer(now_millis())];
@@ -2095,6 +2192,7 @@ impl Store {
         window: Duration,
         reason: DeletionReason,
     ) -> Result<String> {
+        self.ensure_not_legal_hold(id)?;
         self.purge_grace_bin()?;
         self.delete_with_grace_inner(id, key, window, reason, true)
     }
@@ -2302,6 +2400,10 @@ impl Store {
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
                   )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
+                  )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
@@ -2331,6 +2433,10 @@ impl Store {
                   AND NOT EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
                   )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
@@ -2379,6 +2485,16 @@ impl Store {
                     )?,
                 ),
                 StoreMutation::Delete { id } => {
+                    let held: bool = transaction.query_row(
+                        "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1), 0)",
+                        [id.to_string_repr()],
+                        |row| row.get(0),
+                    )?;
+                    if held {
+                        return Err(StoreError::Maintenance(
+                            "clip is under legal hold; release it before deletion".into(),
+                        ));
+                    }
                     deleted = true;
                     let changed = transaction
                         .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
@@ -2402,6 +2518,7 @@ impl Store {
 
     /// Delete a single clip by id.
     pub fn delete(&self, id: ClipId) -> Result<()> {
+        self.ensure_not_legal_hold(id)?;
         let deleted = self.conn.execute(
             "DELETE FROM clips WHERE id = ?1",
             params![id.to_string_repr()],
@@ -2423,6 +2540,10 @@ impl Store {
             DELETE FROM clips
             WHERE pinned = 0
               AND NOT EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
+              )
+              AND NOT EXISTS (
                 SELECT 1 FROM session_protected AS protected
                 WHERE protected.clip_id = clips.id
               )
@@ -2437,8 +2558,20 @@ impl Store {
 
     /// Delete every clip, including pinned ones.
     pub fn clear_all(&self) -> Result<()> {
-        let deleted = self.conn.execute("DELETE FROM clips", [])?;
-        self.conn.execute("DELETE FROM session_protected", [])?;
+        let deleted = self.conn.execute(
+            r#"
+            DELETE FROM clips
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
+            )
+            "#,
+            [],
+        )?;
+        self.conn.execute(
+            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
+            [],
+        )?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
         }
@@ -2460,12 +2593,12 @@ impl Store {
             r#"
             DELETE FROM clips
             WHERE expires_at IS NOT NULL AND expires_at <= ?1
-              AND NOT EXISTS (
-                SELECT 1 FROM session_protected AS protected
-                WHERE protected.clip_id = clips.id
-              )
             "#,
             params![now_millis()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
+            [],
         )?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
@@ -2521,6 +2654,10 @@ impl Store {
                 SELECT id FROM clips
                 WHERE pinned = 0 AND favorite = 0
                   AND NOT EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
+                  )
+                  AND NOT EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
                   )
@@ -2547,6 +2684,15 @@ impl Store {
         }
         Ok(())
     }
+}
+
+const fn memory_only_sensitivity(reason: SensitivityReason) -> bool {
+    matches!(
+        reason,
+        SensitivityReason::PrivateKey
+            | SensitivityReason::OneTimePassword
+            | SensitivityReason::RecoveryCode
+    )
 }
 
 /// The default database path: `<data_dir>/vbuff/history.db`.
@@ -2714,6 +2860,7 @@ struct StoredMetadata {
     lineage: CaptureLineage,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     sensitive: bool,
+    sensitivity_reason: Option<vbuff_types::SensitivityReason>,
     sync_eligible: Option<bool>,
     ai_allowed: bool,
 }
@@ -2726,6 +2873,7 @@ impl From<&ClipMeta> for StoredMetadata {
             lineage: meta.lineage.clone(),
             expires_at: meta.expires_at,
             sensitive: meta.sensitive,
+            sensitivity_reason: meta.sensitivity_reason,
             sync_eligible: Some(meta.sync_eligible),
             ai_allowed: meta.ai_allowed,
         }
@@ -2739,6 +2887,7 @@ impl StoredMetadata {
         meta.lineage = self.lineage;
         meta.expires_at = self.expires_at;
         meta.sensitive = self.sensitive;
+        meta.sensitivity_reason = self.sensitivity_reason;
         meta.sync_eligible = self.sync_eligible.unwrap_or(true);
         meta.ai_allowed = self.ai_allowed;
     }
@@ -2895,6 +3044,7 @@ mod tests {
     use vbuff_core::content_hash_from_flavors;
     use vbuff_types::{
         Body, CaptureGeneration, CaptureLineage, CaptureProvenance, ClipMeta, ContentKind, Flavor,
+        SensitivityReason,
     };
 
     fn make_clip(text: &str) -> Clip {
@@ -2999,6 +3149,7 @@ mod tests {
 
         let mut sensitive = make_clip("upgrade privacy needle");
         sensitive.meta.sensitive = true;
+        sensitive.meta.sensitivity_reason = Some(SensitivityReason::AccessToken);
         sensitive.meta.ai_allowed = true;
         sensitive.meta.sync_eligible = true;
         sensitive.meta.expires_at = Some(chrono::Utc::now() + Duration::minutes(10));
@@ -3014,6 +3165,10 @@ mod tests {
         assert_eq!(store.insert(&ordinary_again).unwrap(), original_id);
         let stored = store.list(1).unwrap().pop().unwrap();
         assert!(stored.meta.sensitive);
+        assert_eq!(
+            stored.meta.sensitivity_reason,
+            Some(SensitivityReason::AccessToken)
+        );
         assert!(!stored.meta.sync_eligible);
         assert!(!stored.meta.ai_allowed);
         assert!(store.search("upgrade", 10).unwrap().is_empty());
@@ -3021,6 +3176,23 @@ mod tests {
             query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn store_rejects_memory_only_secret_classes() {
+        let store = Store::open_in_memory().unwrap();
+        for reason in [
+            SensitivityReason::PrivateKey,
+            SensitivityReason::OneTimePassword,
+            SensitivityReason::RecoveryCode,
+        ] {
+            let mut clip = make_clip("must stay in memory");
+            clip.meta.sensitive = true;
+            clip.meta.sensitivity_reason = Some(reason);
+            clip.meta.sync_eligible = false;
+            assert!(store.insert(&clip).is_err());
+        }
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[test]
@@ -3064,15 +3236,14 @@ mod tests {
     }
 
     #[test]
-    fn session_protection_survives_automatic_cleanup_until_released() {
+    fn session_protection_survives_capacity_cleanup_until_released() {
         let store = Store::open_in_memory().unwrap();
         let mut protected = make_clip("protected for this session");
-        protected.meta.expires_at = Some(chrono::Utc::now() - Duration::seconds(1));
+        protected.meta.expires_at = None;
         let protected_id = store.insert(&protected).unwrap();
         store.set_session_protected(protected_id, true).unwrap();
         store.insert(&make_clip("ordinary")).unwrap();
 
-        assert_eq!(store.purge_expired().unwrap(), 0);
         assert_eq!(store.enforce_cap(1).unwrap(), 1);
         store.clear().unwrap();
         assert!(store.session_protected(protected_id).unwrap());
@@ -3080,7 +3251,23 @@ mod tests {
         assert_eq!(store.list(10).unwrap()[0].id, protected_id);
 
         store.set_session_protected(protected_id, false).unwrap();
+        store.clear().unwrap();
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn hard_privacy_ttl_overrides_pin_and_session_protection() {
+        let store = Store::open_in_memory().unwrap();
+        let mut expired = make_clip("expired secret");
+        expired.pinned = true;
+        expired.meta.sensitive = true;
+        expired.meta.expires_at = Some(chrono::Utc::now() - Duration::seconds(1));
+        let id = store.insert(&expired).unwrap();
+        store.set_session_protected(id, true).unwrap();
+
         assert_eq!(store.purge_expired().unwrap(), 1);
+        assert!(!store.session_protected(id).unwrap());
+        assert!(store.list(10).unwrap().is_empty());
     }
 
     #[test]
@@ -3232,6 +3419,7 @@ mod tests {
             cas: None,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
 
         assert!(store.migrate().is_err());

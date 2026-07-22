@@ -6,3 +6,9 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.2.0"
 notes = "Automated full-source review of 1.2.0: checked Linux /proc parsing and page-size cache, Darwin task_info, Windows GetProcessMemoryInfo, FreeBSD kinfo_getproc ownership, dependencies, tests, and build metadata; vbuff enables always_use_statm to avoid expensive smaps reads on the resident path."
+
+[[audits.web-time]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Full-source review of 1.1.0: native targets only re-export std::time; the cfg-isolated browser implementation wraps Performance.now and Date.now with checked Duration arithmetic and bounded serde decoding. The crate denies unsafe code, has no build script, and performs no filesystem, process, or network access."

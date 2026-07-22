@@ -3,7 +3,7 @@
 use std::fmt;
 
 use vbuff_core::onboarding::DefaultProfile;
-use vbuff_gui::{StarterPack, UiAction};
+use vbuff_gui::{StarterPack, UiAction, UiPreferences};
 use vbuff_types::{Clip, ClipId};
 
 /// One vocabulary for every user-facing command surface.
@@ -11,7 +11,10 @@ use vbuff_types::{Clip, ClipId};
 pub(crate) enum AppCommand {
     Show,
     Paste(ClipId),
-    PasteText(String),
+    PasteText {
+        text: String,
+        sensitive: bool,
+    },
     #[cfg(feature = "tray")]
     CopyLatest,
     SetPinned(ClipId, bool),
@@ -26,6 +29,11 @@ pub(crate) enum AppCommand {
     RecoverSkipped,
     InstallStarterPack(StarterPack),
     ApplyDefaultProfile(DefaultProfile),
+    SetLaunchAtLogin(bool),
+    SetUiPreferences {
+        preferences: UiPreferences,
+        reduced_motion_changed: bool,
+    },
     DismissHealthAlert,
     DismissSizeBudgetAlert,
     #[cfg(feature = "tray")]
@@ -42,9 +50,10 @@ impl fmt::Debug for AppCommand {
         match self {
             Self::Show => formatter.write_str("Show"),
             Self::Paste(id) => formatter.debug_tuple("Paste").field(id).finish(),
-            Self::PasteText(text) => formatter
+            Self::PasteText { text, sensitive } => formatter
                 .debug_struct("PasteText")
                 .field("text", &format_args!("[redacted; {} bytes]", text.len()))
+                .field("sensitive", sensitive)
                 .finish(),
             #[cfg(feature = "tray")]
             Self::CopyLatest => formatter.write_str("CopyLatest"),
@@ -82,6 +91,18 @@ impl fmt::Debug for AppCommand {
                 .debug_tuple("ApplyDefaultProfile")
                 .field(profile)
                 .finish(),
+            Self::SetLaunchAtLogin(enabled) => formatter
+                .debug_tuple("SetLaunchAtLogin")
+                .field(enabled)
+                .finish(),
+            Self::SetUiPreferences {
+                preferences,
+                reduced_motion_changed,
+            } => formatter
+                .debug_struct("SetUiPreferences")
+                .field("preferences", preferences)
+                .field("reduced_motion_changed", reduced_motion_changed)
+                .finish(),
             Self::DismissHealthAlert => formatter.write_str("DismissHealthAlert"),
             Self::DismissSizeBudgetAlert => formatter.write_str("DismissSizeBudgetAlert"),
             #[cfg(feature = "tray")]
@@ -99,7 +120,7 @@ impl From<UiAction> for AppCommand {
     fn from(action: UiAction) -> Self {
         match action {
             UiAction::Paste(id) => Self::Paste(id),
-            UiAction::PasteText(text) => Self::PasteText(text),
+            UiAction::PasteText { text, sensitive } => Self::PasteText { text, sensitive },
             UiAction::SetPinned(id, pinned) => Self::SetPinned(id, pinned),
             UiAction::SetSessionProtected(id, protected) => {
                 Self::SetSessionProtected(id, protected)
@@ -112,6 +133,14 @@ impl From<UiAction> for AppCommand {
             UiAction::RecoverSkipped => Self::RecoverSkipped,
             UiAction::InstallStarterPack(pack) => Self::InstallStarterPack(pack),
             UiAction::ApplyDefaultProfile(profile) => Self::ApplyDefaultProfile(profile),
+            UiAction::SetLaunchAtLogin(enabled) => Self::SetLaunchAtLogin(enabled),
+            UiAction::SetUiPreferences {
+                preferences,
+                reduced_motion_changed,
+            } => Self::SetUiPreferences {
+                preferences,
+                reduced_motion_changed,
+            },
             UiAction::DismissHealthAlert => Self::DismissHealthAlert,
             UiAction::DismissSizeBudgetAlert => Self::DismissSizeBudgetAlert,
             UiAction::DismissNotice => Self::DismissNotice,
@@ -151,8 +180,12 @@ mod tests {
 
     #[test]
     fn composed_text_is_redacted_from_command_debug() {
-        let command = AppCommand::from(UiAction::PasteText("private draft".into()));
+        let command = AppCommand::from(UiAction::PasteText {
+            text: "private draft".into(),
+            sensitive: true,
+        });
         assert!(!format!("{command:?}").contains("private draft"));
+        assert!(format!("{command:?}").contains("sensitive: true"));
     }
 
     #[test]

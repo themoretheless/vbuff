@@ -2,7 +2,20 @@
 
 This is the executable, milestone-sequenced build plan for vbuff. It is derived from and subordinate to `architecture.md`, which is canonical for the workspace layout, crate names, the crate stack, the data model, and every technical decision. Where this plan and `architecture.md` ever disagree, `architecture.md` wins; treat such a disagreement as a bug in this document. The decision spine (positioning, pillars, roadmap phases, success metrics, non-goals) is canonical for *what* we ship in which phase and *why*; this plan is canonical for *the order in which an engineer builds it*.
 
-The product wedge, restated so every milestone can be checked against it: vbuff is the first clipboard manager that a macOS + Windows + Linux user can install everywhere, sync privately end-to-end, and actually enjoy using. The four corners no competitor occupies at once are: truly cross-platform, genuinely polished, privately synced, and approachable. Every milestone below must move at least one corner forward without regressing another.
+All milestone goals and acceptance criteria below describe the **target** unless a paragraph is explicitly labeled current. They are not evidence that the current binary has passed that milestone.
+
+### Current implementation snapshot
+
+- Native desktop `eframe`/`egui` is the only UI/runtime target. Web/WASM demo, binary, and CI paths are removed.
+- Generic `arboard` polling reads text or image content. It cannot prove source application, concealed/private markers, clipboard generation/provenance, complete flavor enumeration, or OS-history exclusion.
+- Automatic paste is disabled until a native adapter confirms the intended destination immediately before injection. Eligible non-sensitive selection is copy-only; sensitive copy is blocked without proven OS-history exclusion.
+- One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery use an at-most-32-item process-memory lane with hard expiry. It never enters SQLite/import, cannot be pinned or session-protected, and vanishes on exit.
+- The schema-v7 SQLite database is unencrypted. Strict security mode may block capture while SQLCipher or required native privacy proof is unavailable.
+- UI preferences persist through the root configuration, reduced motion follows the OS while unset, and unknown configuration keys fail validation.
+- Migration safety copies are temporary and removed only after the upgraded or next-start live store opens fully and passes `quick_check`; a failed open preserves them. They are not durable rollback backups, and backup-evidence APIs do not create a backup.
+- The native executable plugin protocol has bounded length-prefixed JSON framing but is contract-only. Process launch, OS sandboxing, host-side capability enforcement, installation, and clipboard grants are release-gated and inactive.
+
+The target product wedge, restated so every milestone can be checked against it: vbuff should become the first clipboard manager that a macOS + Windows + Linux user can install everywhere, sync privately end-to-end, and enjoy using. The four corners no competitor occupies at once are: truly cross-platform, genuinely polished, privately synced, and approachable. Every milestone below must move at least one corner forward without regressing another.
 
 ---
 
@@ -12,12 +25,12 @@ The product wedge, restated so every milestone can be checked against it: vbuff 
 
 `vbuff-types`, `vbuff-core`, `vbuff-store`, `vbuff-platform`, `vbuff-daemon`, `vbuff-gui`, `vbuff-ipc`, `vbuff-plugin`, `vbuff-sync`, `vbuff-update`, `vbuff-cli`, and the root `src/main.rs` binary.
 
-The shippable MVP is a deliberate **single-process subset** of that workspace. The target MVP links and runs:
+The planned shippable MVP is a deliberate **single-process subset** of that workspace. The target MVP links and runs:
 
 - `vbuff-types` (plain data: `Clip`, `Flavor`, `ContentKind`, `ClipMeta`, ids)
 - `vbuff-core` (engine: dedup, eviction, retention, capture-gate policy, search, classify)
-- `vbuff-store` (currently bundled SQLite schema v6 + FTS5 + migrations + blob CAS + exact/near dedup lifecycle + externally keyed grace-bin primitives + eligible local embeddings + WAL; SQLCipher and OS-keystore integration are still required)
-- `vbuff-platform` (the four backend traits + per-OS impls + `MockBackend`)
+- `vbuff-store` (currently bundled SQLite schema v7 + FTS5 + migrations + blob CAS + exact/near dedup + lifecycle annotations/quarantine/export + externally keyed grace-bin primitives + eligible local embeddings + WAL; SQLCipher and OS-keystore integration are still required)
+- `vbuff-platform` (currently traits, generic `arboard` text-or-image polling/write, and capability decisions; native per-OS proof and confirmed-target paste remain milestone work)
 - `vbuff-gui` (eframe popup + settings viewports, the egui hot path)
 - `vbuff-update` (signed release contracts and the offline checksum verifier; network fetch/install remains deferred)
 - the root binary (`src/main.rs`): single-instance guard, role dispatch, wiring
@@ -28,7 +41,7 @@ The later crates are explicitly deferred:
 - `vbuff-ipc` - the framed control-socket protocol and client/server; deferred to M7. Browser/editor/Vim/automation/MCP/launcher/terminal/webhook message contracts are bounded foundations only. The MVP still needs a single-instance guard (bind-or-forward) but its forwarded intent is minimal (just "show popup"), not the full IPC verb surface.
 - `vbuff-cli` - the `vbuff` verb surface (`list`/`get`/`copy`/`add`/`search`/`delete`, `--json`, completions); deferred to M8. It is a pure IPC client, so it cannot exist before `vbuff-ipc`.
 - `vbuff-sync` runtime integration - the crate now contains tested CRDT/HLC, envelope, membership, policy, anti-entropy, recovery, receipt, capability, padding, and device-experience foundations. Discovery, authenticated transport, pairing UI, durable replication, and app wiring remain deferred to M9 (v1) and M11 (v2 transports).
-- `vbuff-plugin` runtime integration - manifests, typed transforms, migrations, offline evidence, signed packs, bounded adapters, and four curated recipes are tested foundations; Wasmtime execution and installation remain deferred.
+- `vbuff-plugin` runtime integration - manifests, a bounded native executable protocol, typed transforms, migrations, offline evidence, signed packs, adapters, and curated recipes are contract foundations only. No process host or sandbox is active; execution, installation, publisher trust, and host-side capability enforcement remain release-gated.
 
 This means: in MVP, the root binary is both daemon and GUI host in one process, exactly as `architecture.md` describes ("the GUI runs inside the daemon process on the main thread, while capture/store/sync run on background threads"). The "daemon" is a *role*, not yet a separate crate. The crate split into `vbuff-daemon`/`vbuff-ipc` is a refactor we perform once the single-process loop is proven, precisely so the CLI and sync have something to talk to.
 
@@ -70,7 +83,7 @@ Post-600 research candidates: [601-610](docs/ideas-601-610.md) and [611-620](doc
 
 The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 
-Current baseline before the formal M7 crate extraction: the single-process root is divided into `capture`, `history`, `paste`, `commands`, `diagnostics`, `single_instance`, `tray`, `autostart`, `config`, `ask`, `seed_pack`, `verify`, `heartbeat`, `maintenance`, `memory_pressure`, `doctor`, `runtime_metrics`, `logging`, and event-loop `app` modules. Serializable status contracts live in `vbuff-types`; the same crate also owns minimal `ShowPopup`/`Ping` framing. Capture and commands publish through `Diagnostics`; popup/tray consume typed health, pause reasons, byte-budget alerts, capabilities, a content-free privacy ledger, explicit SLO states, notices, expiry/local/incomplete state, and saved/skipped/lost totals. The popup keeps History, Compose, Trust, and Settings compact and responsive; History adds sticky kind/source scopes, calendar expiry, plain clones, and session protection, while Settings owns typed profiles, an opt-in metadata-only digest, and stale-pin review. Config schema 2 upgrades are explicit preview/apply operations with an owner-only rollback copy. Hotkey, tray, and second-instance messages wake egui directly, while tiered capture supervision, byte/RSS pressure policy, secret clawback, pre-injection clipboard verification, and maintenance budgets protect the resident loop. Store schema v6 owns FTS5, facets/fingerprints, exact reuse events, normalized variant groups, keyset sessions, transactions, CAS, verified migration, per-kind retention rules, session exemptions, externally keyed encrypted grace records, expiry/audits, and fail-closed content-hash-keyed local embeddings. IPC/plugin/sync/update contracts, including device-experience and external-client boundaries, are tested, but no daemon listener, third-party Wasmtime host, browser/editor/mobile client, MCP/webhook endpoint, sync transport, auto-update install loop, native caret/continuous lock provider, or durable OS-keystore Undo key is enabled. Preserve these boundaries through M0-M6; M7 adds native re-subscribe/restart, the canonical Windows named pipe, live dispatch, and moves stable modules behind daemon/IPC contracts.
+Current baseline before the formal M7 crate extraction: the single-process root is divided into focused capture, history, guarded clipboard staging, command, diagnostics, single-instance, tray, autostart, configuration, maintenance, and event-loop modules. Serializable status contracts live in `vbuff-types`. Native egui is woken by hotkey, tray, and second-instance messages; a normal launch opens the popup and login registration uses `--background`. GUI navigation, projection, media, and Trust rendering are focused modules; UI preferences persist and reduced motion follows the OS while unset. The active clipboard adapter is generic `arboard` text-or-image polling, so source/concealed/generation/provenance and OS-history-exclusion capabilities are unavailable. Automatic injection is disabled; non-sensitive selection is copy-only and sensitive copy fails closed without history exclusion. Memory-only secret classes use a bounded, hard-expiring process lane and never enter SQLite/import. Store schema v7 provides SQLite/FTS/lifecycle machinery, but the live database is unencrypted and strict mode may block capture. A temporary migration safety copy is removed only after the upgraded or next-start store opens fully and passes `quick_check`; no durable rollback backup exists. IPC/plugin/sync/update and trust/recall/lifecycle types remain contracts unless a ledger identifies a connected runtime path; specifically, there is no daemon command listener, plugin process host or sandbox, browser/editor/mobile client, MCP/webhook endpoint, sync transport, or update installer. There is no web UI or WASM target. Preserve these boundaries until the corresponding milestone gates are actually passed.
 
 ### Batch execution overlay
 
@@ -79,14 +92,15 @@ The 600-item list is now executed in sequential batches of 50 without rewriting 
 | Batch | State | Evidence / next gate |
 |---|---|---|
 | 001-050 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-001-050.md) |
-| 051-100 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-051-100.md); native APIs, SQLCipher, daemon dispatch, and Wasmtime remain milestone gates |
+| 051-100 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-051-100.md); native APIs, SQLCipher, daemon dispatch, and sandboxed plugin-process execution remain milestone gates |
 | 101-150 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-101-150.md); native OS conformance, release credentials, live updater/sync/plugin paths, and SQLCipher remain gates |
 | 151-200 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-151-200.md); models, native integrations, daemon dispatch, SQLCipher, real compositor evidence, dogfood, and live sync remain gates |
 | 201-250 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-201-250.md); plugin host, native caret/AT evidence, SQLCipher, OS-keystore recovery key, and native display validation remain gates |
 | 251-300 | Reviewed implementation/foundation complete | [Item ledger and three review passes](docs/implementation-batch-251-300.md); continuous native auto-pause, live sync/transports/clients, SQLCipher, release credentials, and maintainer drills remain gates |
-| 301-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
+| 301-350 | Reviewed implementation/foundation complete | [Item ledger](docs/implementation-batch-301-350.md); three review iterations and local verification pass, while SQLCipher, native privacy/target proof, and plugin-host activation remain milestone gates |
+| 351-600 | Queued in groups of 50 | Follow the shared range map and existing milestone ownership |
 
-Batch completion does not override milestone acceptance. For example, item 163 can seal an embedding artifact and items 266-280 can define device UX while M9 remains open until pairing, authenticated transport, persistence, policy, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite schema v6 lifecycle work. Batch 151-200 adds [registered decision gates](docs/decision-gates-151-200.md) and a [v1 data-contract freeze](docs/data-contract-v1.md); batch 201-250 adds [native/recovery gates](docs/decision-gates-201-250.md) and [data contract v2](docs/data-contract-v2.md); batch 251-300 adds [device/integration/operations gates](docs/decision-gates-251-300.md), the [public limitation ledger](docs/limitations.md), [maintainer handoff](docs/maintainer-handoff.md), and [quarterly scope review](docs/scope-review.md). Missing real-world evidence remains Unknown rather than passing by documentation.
+Batch completion does not override milestone acceptance. For example, item 163 can seal an embedding artifact and items 266-280 can define device UX while M9 remains open until pairing, authenticated transport, persistence, policy, and two-device replication work end to end. Likewise, SQLCipher remains an M1/M4 release blocker despite schema v7 lifecycle work. Batch 151-200 adds [registered decision gates](docs/decision-gates-151-200.md) and a [v1 data-contract freeze](docs/data-contract-v1.md); batch 201-250 adds [native/recovery gates](docs/decision-gates-201-250.md) and [data contract v2](docs/data-contract-v2.md); batch 251-300 adds [device/integration/operations gates](docs/decision-gates-251-300.md) plus the public operations records; batch 301-350 adds [trust/recall/lifecycle/native gates](docs/decision-gates-301-350.md) and [data contract v3](docs/data-contract-v3.md). Missing real-world evidence remains Unknown rather than passing by documentation.
 
 From the first resident milestone onward, every milestone records the same SLO budget: zero unaccounted loss, search p99 at or below 16 ms, idle CPU at or below 0.5%, and login-ready at or below 500 ms. `Unknown` is a release blocker. Scope is similarly mechanical: more than nine current workspace crates, more than one added MVP milestone, or one milestone open beyond 42 days forces a cut-line review before new work starts.
 
@@ -94,7 +108,7 @@ From the first resident milestone onward, every milestone records the same SLO b
 
 ## 2. Milestones in detail
 
-For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task checklist**, **Acceptance criteria**, **Feature tiers delivered**, and **Pitfalls guarded**. Pitfall references use the catalog in `docs/mistakes-top-500.md` (numbered 1-N within its 18 categories) and the consolidated 25-row competitor-mistakes table in `architecture.md`; where a pitfall is the same item viewed twice, both are cited.
+For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task checklist**, **Acceptance criteria**, **Target feature tiers on completion**, and **Pitfalls guarded**. Pitfall references use the catalog in `docs/mistakes-top-500.md` (numbered 1-N within its 18 categories) and the consolidated 25-row competitor-mistakes table in `architecture.md`; where a pitfall is the same item viewed twice, both are cited.
 
 ---
 
@@ -120,7 +134,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - The dependency-direction lint fails the build if `vbuff-core` gains an illegal dependency.
 - `vbuff` launched twice: the second invocation detects the bound endpoint and exits via `Forwarded` (even though it does nothing yet).
 
-**Feature tiers delivered.** None user-facing. Foundation for all tiers.
+**Target feature tiers on completion.** None user-facing. Foundation for all tiers.
 
 **Pitfalls guarded.**
 - Business/maintenance pitfalls (`mistakes-top-500.md` section 18): set up the project so it is buildable and testable on all three OSes from commit one, the structural defense against the "abandonware / breaks on each OS" pattern that killed ClipX, 1Clipboard, ClipMenu, Flycut.
@@ -154,7 +168,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Golden content-hash vector matches; identical flavor sets produce identical hashes; any byte change changes the hash.
 - WAL crash-recovery test: SIGKILL mid-transaction, reopen, last committed clip present, `integrity_check` clean.
 
-**Feature tiers delivered.** MVP storage substrate: encrypt-at-rest, transactional-per-capture durability, content-hash dedup key, out-of-row blob CAS (the v1 perf feature, but the store is built for it now), FTS5 schema present (substring tier shipped later), schema migration on upgrade.
+**Target feature tiers on completion.** MVP storage substrate: encrypt-at-rest, transactional-per-capture durability, content-hash dedup key, out-of-row blob CAS, FTS5 schema present, and schema migration on upgrade.
 
 **Pitfalls guarded.**
 - History-wiped-on-update / no-schema-versioning / non-transactional migrations (`mistakes-top-500.md` 37, 50, 51, 75; architecture table #12): forward-only versioned migrations, pre-migration backup, refuse-don't-wipe.
@@ -190,7 +204,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Eviction proptest: under randomized cap pressure, pinned/favorite/permanent items survive every cap type.
 - All M2 logic runs with zero OS dependencies in the headless CI lane.
 
-**Feature tiers delivered.** MVP: dedup-by-hash + move-to-top, count cap with pin exemption, incognito/pause, concealed-flag policy, app blacklist policy, whitespace skip, content-type detection/labeling (the `[MVP]` extras items 7, 8), MVP snippets (date/time placeholders), MVP transforms scaffolding (case/trim/strip live in `vbuff-core` as pure transforms).
+**Target feature tiers on completion.** MVP: dedup-by-hash + move-to-top, count cap with pin exemption, incognito/pause, concealed-flag policy, app blacklist policy, whitespace skip, content-type detection/labeling (the `[MVP]` extras items 7, 8), MVP snippets (date/time placeholders), and MVP transform scaffolding.
 
 **Pitfalls guarded.**
 - Ignoring concealed/transient hints, capturing from every source, no default deny-list (`mistakes-top-500.md` 7, 8, 10, 69, 70; architecture table #7, #8): the gate honors hints and applies the default deny-list before any byte persists.
@@ -229,7 +243,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - First-session idle CPU is within budget over a multi-hour run; a rapid-copy loop yields one entry per distinct change with no misses or echo duplicates.
 - The crate-maturity spike report is committed; any swapped crate is reflected in pinned versions.
 
-**Feature tiers delivered.** MVP platform set (first risk-retiring Linux scope): honest capture monitoring or capture-on-summon, portal/manual hotkey behavior, proven paste or copy-only fallback, tray UI, key access, and autostart on one documented session class.
+**Target feature tiers on completion.** MVP platform set (first risk-retiring Linux scope): honest capture monitoring or capture-on-summon, portal/manual hotkey behavior, proven paste or copy-only fallback, tray UI, key access, and autostart on one documented session class.
 
 **Pitfalls guarded.**
 - Fixed-interval polling misses copies / re-reading content every tick / idle CPU burn (`mistakes-top-500.md` 1, 2, 32; architecture table #1, #2): poll only the integer changeCount, read content once per edge, adaptive backoff.
@@ -266,7 +280,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Search-as-you-type stays under ~16 ms/frame at 50,000+ seeded items (virtualized, keyset-paged, no `SELECT *`).
 - Restored/self-written clips do not create new rows (suppression confirmed in the live loop).
 
-**Feature tiers delivered.** MVP core: the headline copy->store->hotkey->popup->paste-back loop; substring search-as-you-type with highlight; recency default; keyboard nav; paste-back (plain/rich); tray item; popup near cursor; thumbnails; pin/favorite badges; restore-session-on-launch.
+**Target feature tiers on completion.** MVP core: the headline copy->store->hotkey->popup->paste-back loop; substring search-as-you-type with highlight; recency default; keyboard nav; paste-back (plain/rich); tray item; popup near cursor; thumbnails; pin/favorite badges; restore-session-on-launch.
 
 **Pitfalls guarded.**
 - Core paste silently fails / pastes wrong window / leaks modifiers / popup steals focus (`mistakes-top-500.md` section 4; architecture table #17): capture_focus first, confirm target frontmost, clear modifiers, surface failures.
@@ -304,7 +318,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - The capture-health indicator shows "capturing / paused" so silent loss is visible.
 - Before M6 fan-out, complete a 14-day first-scope dogfood window as the only clipboard manager with zero silent-loss incidents and zero wrong-target pastes; missing evidence blocks fan-out.
 
-**Feature tiers delivered.** MVP security/privacy set (encrypt-at-rest, skip password fields, honor concealed markers, per-app exclusion, incognito, auto-clear-on-timer, wipe-on-demand, local-by-default, zero telemetry); MVP organization set; MVP settings set; MVP snippets set; MVP transforms set. Extras items tagged `[MVP]`: 34 (strip formatting), 49 (set phrases/snippet bank), 57 (app exclusion), 59 (auto-search quick paste), 69 (paste-as), 79 (per-app exclusion rules), 80 (type-ahead picker), 106 (paste as plain text), 122 (pinned persisting as snippet bank).
+**Target feature tiers on completion.** MVP security/privacy set (encrypt-at-rest, skip password fields, honor concealed markers, per-app exclusion, incognito, auto-clear-on-timer, wipe-on-demand, local-by-default, zero telemetry); MVP organization, settings, snippets, and transforms. Extras items tagged `[MVP]`: 34 (strip formatting), 49 (set phrases/snippet bank), 57 (app exclusion), 59 (auto-search quick paste), 69 (paste-as), 79 (per-app exclusion rules), 80 (type-ahead picker), 106 (paste as plain text), 122 (pinned persisting as snippet bank).
 
 **Pitfalls guarded.**
 - Secrets into history / no default exclusion / OTP capture / unverifiable trust (`mistakes-top-500.md` section 10; pain-points security): default deny-list + secure-field skip + secret detectors + masked sensitive + zero telemetry.
@@ -343,7 +357,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Cross-world test: copy in a Wayland-native app, paste in an XWayland app and vice versa, no duplicate entry.
 - Canary-grep at-rest test green on all three OSes (re-run; M1 covers the store, this confirms per-OS file paths).
 
-**Feature tiers delivered.** Completes the MVP platform set across all targets: per-OS paste-back, hotkey registration, capture monitoring, tray UI, X11-vs-Wayland auto-detect, Wayland capability detection, clipboard-persistence daemon behavior (X11 ownership), window-class ignore rules, DPI awareness.
+**Target feature tiers on completion.** Completes the MVP platform set across all targets: per-OS paste-back, hotkey registration, capture monitoring, tray UI, X11-vs-Wayland auto-detect, Wayland capability detection, clipboard-persistence daemon behavior (X11 ownership), window-class ignore rules, and DPI awareness.
 
 **Pitfalls guarded.**
 - Clip lost when source closes on X11/Wayland (`mistakes-top-500.md` 4; architecture table #4): eager materialize + X11 ownership.
@@ -384,7 +398,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Watchdog test: simulate a stalled listener, assert re-subscribe and a visible health change.
 - Stale-socket-after-crash: unlink and rebind once, verified.
 
-**Feature tiers delivered.** v1 platform/robustness: supervised always-on capture, capture-health observability, single-instance handoff hardening, daemon control socket (the substrate the CLI needs).
+**Target feature tiers on completion.** v1 platform/robustness: supervised always-on capture, capture-health observability, single-instance handoff hardening, and the daemon control socket the CLI needs.
 
 **Pitfalls guarded.**
 - Capture monitor crash/hang takes down recording silently / capture stops when another process owns clipboard (`mistakes-top-500.md` 22, 36, 77; architecture table #21): watchdog + re-subscribe + visible health.
@@ -416,7 +430,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Export then import round-trips content, pins, order, timestamps, types losslessly with no duplicate rows.
 - Bulk delete is a single transaction that GC's blobs and updates the index.
 
-**Feature tiers delivered.** v1 capture/types, store/perf, search, paste, organization, transformations, and the full CLI/integration set. Extras `[v1]` items including 27 (color convert), 33 (line ops), 46 (tags), 56/69 (paste-as-format), 58 (provenance filtering), 60 (inline editor), 62 (numbered quick-paste), 75/104 (pinboards), 82 (bulk delete by time), 113 (power search), 117 (inline editing), 119 (retention policy).
+**Target feature tiers on completion.** v1 capture/types, store/perf, search, paste, organization, transformations, and the full CLI/integration set. Extras `[v1]` items including 27 (color convert), 33 (line ops), 46 (tags), 56/69 (paste-as-format), 58 (provenance filtering), 60 (inline editor), 62 (numbered quick-paste), 75/104 (pinboards), 82 (bulk delete by time), 113 (power search), 117 (inline editing), 119 (retention policy).
 
 **Pitfalls guarded.**
 - Slow search / full scans / no index at scale (`mistakes-top-500.md` 64, section 3; architecture table #16): FTS5 + virtualized keyset list.
@@ -450,7 +464,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Sensitive and local-only clips never replicate (verified).
 - Conflict test: concurrent edits on both devices converge deterministically via Lamport+LWW; duplicate arrivals do not create duplicate rows.
 
-**Feature tiers delivered.** v1 sync foundation: mDNS discovery, LAN P2P replication, in-transit encryption, device-list management, pairing with verification code, auto-sync-on-copy, sync of typed content, sync exclusion. Extras `[v1]` items 83 (directed push - groundwork), 84 (QR pairing), 87 (LAN-only serverless), 88 (E2E), 89 (typed sync), 97 (cross-device pinboards), 98 (auto-skip sensitive on sync), 102 (SAS).
+**Target feature tiers on completion.** v1 sync foundation: mDNS discovery, LAN P2P replication, in-transit encryption, device-list management, pairing with verification code, auto-sync-on-copy, sync of typed content, and sync exclusion. Extras `[v1]` items 83 (directed push - groundwork), 84 (QR pairing), 87 (LAN-only serverless), 88 (E2E), 89 (typed sync), 97 (cross-device pinboards), 98 (auto-skip sensitive on sync), 102 (SAS).
 
 **Pitfalls guarded.**
 - Insecure/paywalled/LAN-only/dead-backend sync (`mistakes-top-500.md` section 9; architecture table #19): E2E encrypted, no vendor backend that can be killed, self-host posture.
@@ -484,7 +498,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - Master-password wrap/unwrap works; wrong password fails without wiping; password change preserves DB readability.
 - Signed/notarized artifacts install cleanly on a fresh machine per OS; no "damaged / cannot be opened" Gatekeeper dialog; no SmartScreen block.
 
-**Feature tiers delivered.** Full v1 UI/i18n/a11y set, security/privacy hardening set, performance/reliability/data-integrity set, and the packaging/distribution set. Extras `[v1]` items 119 (retention), 121 (highlight), plus 120 (resizable window) and 116 (rich previews) land here or trail into v2.
+**Target feature tiers on completion.** Full v1 UI/i18n/a11y, security/privacy hardening, performance/reliability/data-integrity, and packaging/distribution sets. Extras `[v1]` items 119 (retention), 121 (highlight), plus 120 (resizable window) and 116 (rich previews) land here or trail into v2.
 
 **Pitfalls guarded.**
 - egui weak BiDi/complex-script blocks RTL/CJK/Indic users (architecture risk table): cosmic-text content layer.
@@ -514,7 +528,7 @@ For each milestone: **Goal**, **Phase**, **Crates/modules touched**, **Task chec
 - A clip syncs between two devices off-LAN via relay or cloud-drive, E2E encrypted, with deterministic conflict resolution; the relay/drive holds only ciphertext.
 - Directed push delivers to the chosen device only; QR handoff transfers a single clip to an unpaired camera device.
 
-**Feature tiers delivered.** v2 sync transports and conveniences. Out of scope (future): AI actions/OCR/MCP, mobile peers, team shared libraries with roles/expiry/revocation, shared collaborative boards.
+**Target feature tiers on completion.** v2 sync transports and conveniences. Out of scope (future): AI actions/OCR/MCP, mobile peers, team shared libraries with roles/expiry/revocation, and shared collaborative boards.
 
 **Pitfalls guarded.**
 - Vendor-backend lock-in / dead backend (architecture table #19; pain-points Clipt/1Clipboard): relay is optional and zero-knowledge; never a single killable backend.

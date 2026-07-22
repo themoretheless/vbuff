@@ -122,6 +122,17 @@ pub trait ClipboardBackend: Send {
         })
     }
 
+    /// Atomically write sensitive bytes only when the backend can guarantee
+    /// exclusion from OS clipboard history. The default returns Unsupported
+    /// without passing payload bytes to the system clipboard.
+    fn write_sensitive_excluding_history(
+        &mut self,
+        _flavors: &[Flavor],
+        _lineage: &CaptureLineage,
+    ) -> Result<ClipboardWriteReceipt> {
+        Ok(ClipboardWriteReceipt::RetentionHintUnsupported)
+    }
+
     /// Clear every representation from the clipboard.
     fn clear(&mut self) -> Result<()>;
 }

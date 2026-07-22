@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use thiserror::Error;
 use url::Url;
-use vbuff_types::{ContentKind, Flavor};
+use vbuff_types::{Body, ContentKind, Flavor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntentAction {
@@ -333,7 +333,43 @@ pub enum PasteGuardDecision {
 
 impl PasteGuardFingerprint {
     pub fn from_flavors(flavors: &[Flavor]) -> Option<Self> {
-        if let Some(text) = flavors.iter().find_map(Flavor::as_text) {
+        if flavors.is_empty() {
+            return None;
+        }
+        let mut ordered = flavors.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            guard_mime(left)
+                .cmp(guard_mime(right))
+                .then_with(|| left.mime.cmp(&right.mime))
+        });
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(ordered.len() as u64).to_le_bytes());
+        for flavor in ordered {
+            let mime = guard_mime(flavor);
+            hasher.update(&(mime.len() as u64).to_le_bytes());
+            hasher.update(mime.as_bytes());
+            if flavor.is_text()
+                && let Some(text) = flavor.as_text()
+            {
+                let normalized = text.replace("\r\n", "\n");
+                hasher.update(&(normalized.len() as u64).to_le_bytes());
+                hasher.update(normalized.as_bytes());
+            } else {
+                let bytes = match &flavor.body {
+                    Body::Inline(bytes) => bytes.as_slice(),
+                    Body::Spilled { blob_ref, .. } => blob_ref.as_bytes(),
+                };
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        let digest = *hasher.finalize().as_bytes();
+
+        if let Some(text) = flavors
+            .iter()
+            .find(|flavor| flavor.is_text())
+            .and_then(|flavor| flavor.as_text())
+        {
             let normalized = text.replace("\r\n", "\n");
             let trimmed = normalized.trim();
             let parsed_url = Url::parse(trimmed).ok();
@@ -348,15 +384,14 @@ impl PasteGuardFingerprint {
                 .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
                 .map(|host| *blake3::hash(host.as_bytes()).as_bytes());
             return Some(Self {
-                digest: *blake3::hash(normalized.as_bytes()).as_bytes(),
+                digest,
                 identity,
                 host_hash,
             });
         }
-        let image = flavors.iter().find(|flavor| flavor.is_image())?;
-        let bytes = image.body.inline_bytes()?;
+        flavors.iter().find(|flavor| flavor.is_image())?;
         Some(Self {
-            digest: *blake3::hash(bytes).as_bytes(),
+            digest,
             identity: StructuralIdentity::Image,
             host_hash: None,
         })
@@ -381,6 +416,14 @@ impl PasteGuardFingerprint {
             return PasteGuardDecision::BlockDomainSubstitution;
         }
         PasteGuardDecision::BlockContentChanged
+    }
+}
+
+fn guard_mime(flavor: &Flavor) -> &str {
+    if flavor.is_plain_text() {
+        "text/plain"
+    } else {
+        flavor.mime.as_str()
     }
 }
 
@@ -514,5 +557,49 @@ mod tests {
             url.compare(Some(&lookalike)),
             PasteGuardDecision::BlockDomainSubstitution
         );
+    }
+
+    #[test]
+    fn paste_guard_covers_the_complete_flavor_set() {
+        let expected = PasteGuardFingerprint::from_flavors(&[
+            Flavor::inline("text/plain", b"hello".to_vec()),
+            Flavor::inline("text/html", b"<strong>hello</strong>".to_vec()),
+        ])
+        .unwrap();
+        let changed_html = PasteGuardFingerprint::from_flavors(&[
+            Flavor::inline("text/plain;charset=utf-8", b"hello".to_vec()),
+            Flavor::inline("text/html", b"<em>hello</em>".to_vec()),
+        ])
+        .unwrap();
+        let plain_only = PasteGuardFingerprint::from_flavors(&[Flavor::inline(
+            "text/plain;charset=utf-8",
+            b"hello".to_vec(),
+        )])
+        .unwrap();
+
+        assert_eq!(
+            expected.compare(Some(&changed_html)),
+            PasteGuardDecision::BlockContentChanged
+        );
+        assert_eq!(
+            expected.compare(Some(&plain_only)),
+            PasteGuardDecision::BlockContentChanged
+        );
+    }
+
+    #[test]
+    fn paste_guard_accepts_plain_text_mime_aliases() {
+        let expected = PasteGuardFingerprint::from_flavors(&[Flavor::inline(
+            "text/plain",
+            b"hello\r\nworld".to_vec(),
+        )])
+        .unwrap();
+        let observed = PasteGuardFingerprint::from_flavors(&[Flavor::inline(
+            "text/plain;charset=utf-8",
+            b"hello\nworld".to_vec(),
+        )])
+        .unwrap();
+
+        assert_eq!(expected.compare(Some(&observed)), PasteGuardDecision::Allow);
     }
 }

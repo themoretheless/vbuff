@@ -111,7 +111,7 @@ fn signing_bytes(evidence: &OfflineRunEvidence) -> Result<Vec<u8>> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::component::ABI_VERSION;
+    use crate::protocol::PROTOCOL_VERSION;
 
     use super::*;
 
@@ -120,8 +120,8 @@ mod tests {
             id: "dev.vbuff.local-model".into(),
             name: "Local model".into(),
             version: "1.0.0".into(),
-            abi_version: ABI_VERSION,
-            component_path: "model.wasm".into(),
+            protocol_version: PROTOCOL_VERSION,
+            executable_path: "bin/model".into(),
             requested_capabilities: BTreeSet::from([PluginCapability::ReadClipContent]),
             network_hosts: BTreeSet::new(),
             file_paths: BTreeSet::new(),

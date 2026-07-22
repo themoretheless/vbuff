@@ -26,6 +26,8 @@ pub struct WaylandCapabilities {
     pub virtual_keyboard: bool,
     pub wtype: bool,
     pub ydotool: bool,
+    pub global_shortcuts_portal: bool,
+    pub foreground_identity: bool,
 }
 
 impl WaylandCapabilities {
@@ -52,6 +54,46 @@ impl WaylandCapabilities {
             WaylandPasteMethod::CopyOnly
         }
     }
+
+    pub const fn probe_report(self) -> WaylandProbeReport {
+        WaylandProbeReport {
+            hotkeys: if self.global_shortcuts_portal {
+                WaylandFeatureState::Available
+            } else {
+                WaylandFeatureState::Unavailable
+            },
+            capture: match self.clipboard_protocol() {
+                WaylandClipboardProtocol::ExtDataControlV1
+                | WaylandClipboardProtocol::WlrDataControlV1 => WaylandFeatureState::Available,
+                WaylandClipboardProtocol::FocusedClipboardOnly => WaylandFeatureState::Degraded,
+            },
+            paste: if matches!(self.paste_method(), WaylandPasteMethod::CopyOnly) {
+                WaylandFeatureState::Unavailable
+            } else {
+                WaylandFeatureState::Available
+            },
+            foreground_identity: if self.foreground_identity {
+                WaylandFeatureState::Available
+            } else {
+                WaylandFeatureState::Unavailable
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaylandFeatureState {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaylandProbeReport {
+    pub hotkeys: WaylandFeatureState,
+    pub capture: WaylandFeatureState,
+    pub paste: WaylandFeatureState,
+    pub foreground_identity: WaylandFeatureState,
 }
 
 pub struct PortalRestoreToken(String);
@@ -114,6 +156,10 @@ mod tests {
             WaylandClipboardProtocol::ExtDataControlV1
         );
         assert_eq!(capabilities.paste_method(), WaylandPasteMethod::LibeiPortal);
+        let report = capabilities.probe_report();
+        assert_eq!(report.capture, WaylandFeatureState::Available);
+        assert_eq!(report.paste, WaylandFeatureState::Available);
+        assert_eq!(report.hotkeys, WaylandFeatureState::Unavailable);
     }
 
     #[test]
