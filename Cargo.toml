@@ -69,7 +69,7 @@ chacha20poly1305 = "0.11"
 ed25519-dalek = "3.0"
 x25519-dalek = { version = "2.0.1", features = ["getrandom", "static_secrets", "zeroize"] }
 bip39 = "2.2.2"
-hkdf = "0.12"
+hkdf = "0.13"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
