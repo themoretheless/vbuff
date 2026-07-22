@@ -1124,7 +1124,7 @@ version = "2.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.quick-xml]]
-version = "0.39.4"
+version = "0.41.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.quote]]
@@ -1529,10 +1529,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.web-sys]]
 version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.web-time]]
-version = "1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.webbrowser]]

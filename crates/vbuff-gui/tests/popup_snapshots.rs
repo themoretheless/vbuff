@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use std::sync::{Arc, Mutex};
 
 use egui_kittest::{Harness, SnapshotOptions};
@@ -112,7 +110,7 @@ fn snapshot_state(surface: Surface) -> AppState {
             suggested_pins: 3,
             stale_pins: 1,
         };
-        if let Some(clip) = state.clips.first_mut() {
+        if let Some(clip) = Arc::make_mut(&mut state.clips).first_mut() {
             clip.pinned = true;
             clip.meta.created_at =
                 chrono::Utc::now() - chrono::Duration::days(120) - chrono::Duration::hours(1);

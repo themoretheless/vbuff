@@ -1,7 +1,7 @@
 //! Small, deterministic policies behind the popup's adaptive presentation.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use vbuff_types::{Clip, ContentKind};
@@ -57,7 +57,6 @@ impl HistoryScope {
         }
     }
 }
-use web_time::Instant;
 
 const RAPID_SCROLL_POINTS_PER_SECOND: f32 = 1_400.0;
 const MAX_DELTA_TEXT_BYTES: usize = 16 * 1024;
@@ -71,12 +70,12 @@ pub enum DensityMode {
 }
 
 impl DensityMode {
-    pub fn row_height(self, viewport_height: f32, pixels_per_point: f32) -> f32 {
+    pub fn row_height(self, viewport_height: f32) -> f32 {
         match self {
             Self::Compact => 54.0,
             Self::Comfortable => 68.0,
-            Self::Auto if viewport_height < 560.0 || pixels_per_point >= 1.75 => 54.0,
-            Self::Auto => 58.0,
+            Self::Auto if viewport_height < 560.0 => 54.0,
+            Self::Auto => 60.0,
         }
     }
 }
@@ -97,6 +96,26 @@ pub struct UiPreferences {
     pub handed_mode: HandedMode,
     pub motion_inspector: bool,
     pub show_health_digest: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryCapabilities {
+    pub automatic_paste: bool,
+    pub sensitive_copy: bool,
+}
+
+impl DeliveryCapabilities {
+    pub const fn action_label(self) -> &'static str {
+        if self.automatic_paste {
+            "Paste"
+        } else {
+            "Copy"
+        }
+    }
+
+    pub const fn allows(self, sensitive: bool) -> bool {
+        !sensitive || self.sensitive_copy
+    }
 }
 
 impl Default for UiPreferences {
@@ -441,5 +460,21 @@ mod tests {
         );
         assert_eq!(HistoryScope::from_jump_key('x'), None);
         assert!(!format!("{:?}", HistoryScope::Source("private.app".into())).contains("private"));
+    }
+
+    #[test]
+    fn delivery_defaults_to_non_sensitive_copy_only() {
+        let delivery = DeliveryCapabilities::default();
+        assert_eq!(delivery.action_label(), "Copy");
+        assert!(!delivery.automatic_paste);
+        assert!(delivery.allows(false));
+        assert!(!delivery.allows(true));
+
+        let native = DeliveryCapabilities {
+            automatic_paste: true,
+            sensitive_copy: true,
+        };
+        assert_eq!(native.action_label(), "Paste");
+        assert!(native.allows(true));
     }
 }

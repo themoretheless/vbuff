@@ -6,6 +6,8 @@
 
 use vbuff_types::Clip;
 
+use crate::recall::{RecallSearchContext, parse_natural_query, search_recall};
+
 /// A scored search hit.
 #[derive(Clone, Debug)]
 pub struct SearchResult<'a> {
@@ -21,71 +23,25 @@ pub struct SearchResult<'a> {
 /// A non-empty query keeps only clips whose searchable text contains the query
 /// (case-insensitively) and ranks by match quality.
 pub fn search<'a>(clips: &'a [Clip], query: &str) -> Vec<SearchResult<'a>> {
-    let q = query.trim().to_lowercase();
-
-    let mut results: Vec<SearchResult<'a>> = if q.is_empty() {
-        clips
-            .iter()
-            .map(|clip| SearchResult { clip, score: 0 })
-            .collect()
-    } else {
-        clips
-            .iter()
-            .filter_map(|clip| score_clip(clip, &q).map(|score| SearchResult { clip, score }))
-            .collect()
+    let now = chrono::Utc::now();
+    let Ok(parsed) = parse_natural_query(query, now) else {
+        // Never reinterpret malformed structured syntax as a raw payload scan.
+        return Vec::new();
     };
-
-    // Sort: pinned first, then higher score. The sort is *stable*, so items
-    // with equal rank keep their input order. Callers are expected to pass
-    // `clips` already ordered by recency (newest first), as the store does;
-    // this lets dedup-bumped clips float to the top without core needing
-    // wall-clock knowledge.
-    results.sort_by(|a, b| {
-        b.clip
-            .pinned
-            .cmp(&a.clip.pinned)
-            .then_with(|| b.score.cmp(&a.score))
-    });
-
-    results
-}
-
-/// Score a single clip against a lowercased query, or `None` if no match.
-fn score_clip(clip: &Clip, q: &str) -> Option<i64> {
-    let haystack = searchable_text(clip).to_lowercase();
-    let pos = haystack.find(q)?;
-
-    let mut score: i64 = 100;
-    // Earlier matches rank higher.
-    score -= pos as i64;
-    // Prefix / whole-start match bonus.
-    if pos == 0 {
-        score += 50;
-    }
-    // Word-boundary match bonus.
-    if pos > 0 {
-        let prev = haystack.as_bytes()[pos - 1];
-        if prev == b' ' || prev == b'\n' || prev == b'\t' {
-            score += 20;
-        }
-    }
-    // Shorter haystacks (more focused content) rank slightly higher.
-    score -= (haystack.len() / 64) as i64;
-
-    Some(score)
-}
-
-/// The text projection used for searching a clip.
-fn searchable_text(clip: &Clip) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = clip.primary_text() {
-        parts.push(t.to_string());
-    }
-    if let Some(app) = &clip.meta.source_app {
-        parts.push(app.clone());
-    }
-    parts.push(clip.meta.kind.label().to_string());
-    parts.join(" ")
+    search_recall(clips, &parsed, RecallSearchContext::default())
+        .into_iter()
+        .filter(|result| {
+            result
+                .clip
+                .meta
+                .expires_at
+                .is_none_or(|expires_at| expires_at > now)
+        })
+        .map(|result| SearchResult {
+            clip: result.clip,
+            score: result.score,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -153,5 +109,19 @@ mod tests {
         let clips = vec![text_clip("apple", false)];
         let res = search(&clips, "banana");
         assert!(res.is_empty());
+    }
+
+    #[test]
+    fn malformed_query_never_falls_back_to_sensitive_payload_search() {
+        let mut sensitive = text_clip("private needle", false);
+        sensitive.meta.sensitive = true;
+        assert!(search(&[sensitive], "\"needle").is_empty());
+    }
+
+    #[test]
+    fn expired_clips_are_not_search_results() {
+        let mut expired = text_clip("expired", false);
+        expired.meta.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(search(&[expired], "").is_empty());
     }
 }

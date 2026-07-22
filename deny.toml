@@ -13,8 +13,6 @@ unmaintained = "workspace"
 unsound = "all"
 ignore = [
   { id = "RUSTSEC-2024-0429", reason = "tray-icon's current Linux AppIndicator backend pins gtk-rs 0.18; vbuff never calls VariantStrIter; remove when tray-icon moves to gtk-rs >=0.20" },
-  { id = "RUSTSEC-2026-0194", reason = "wayland-scanner 0.31.10 is the latest release and parses only dependency-vendored protocol XML at build time, never runtime input" },
-  { id = "RUSTSEC-2026-0195", reason = "wayland-scanner 0.31.10 is the latest release and parses only dependency-vendored protocol XML at build time, never runtime input" },
 ]
 
 [bans]
@@ -28,6 +26,7 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/Smithay/wayland-rs"]
 
 [licenses]
 confidence-threshold = 0.90

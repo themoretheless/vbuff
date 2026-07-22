@@ -3,11 +3,11 @@
 
 pub mod adapter;
 pub mod bundle;
-pub mod component;
 pub mod manifest;
 pub mod migration;
 pub mod offline;
 pub mod pipeline;
+pub mod protocol;
 pub mod recipes;
 pub mod recognizer;
 pub mod snippet_pack;

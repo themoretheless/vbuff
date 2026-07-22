@@ -45,19 +45,24 @@ impl ClipboardBackend for ArboardClipboard {
                     text.into_bytes(),
                 ));
             }
-            _ => {}
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => {}
+            Err(error) => return Err(PlatformError::Clipboard(error.to_string())),
         }
 
         // Image flavor (raw RGBA). Only attempt if no text was present, to
         // avoid spurious image reads on text-only clipboards on some platforms.
-        if flavors.is_empty()
-            && let Ok(img) = self.clipboard.get_image()
-        {
-            let mime = format!(
-                "{RGBA_MIME_PREFIX};width={};height={}",
-                img.width, img.height
-            );
-            flavors.push(Flavor::inline(mime, img.bytes.into_owned()));
+        if flavors.is_empty() {
+            match self.clipboard.get_image() {
+                Ok(img) => {
+                    let mime = format!(
+                        "{RGBA_MIME_PREFIX};width={};height={}",
+                        img.width, img.height
+                    );
+                    flavors.push(Flavor::inline(mime, img.bytes.into_owned()));
+                }
+                Err(arboard::Error::ContentNotAvailable) => {}
+                Err(error) => return Err(PlatformError::Clipboard(error.to_string())),
+            }
         }
 
         Ok(CapturedClipboard {

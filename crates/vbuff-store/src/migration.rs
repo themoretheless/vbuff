@@ -46,7 +46,10 @@ impl MigrationGuard {
                 "database version {version} is newer than supported {target_version}"
             )));
         }
-        if version == target_version || !table_exists(&source, "clips")? {
+        if version == target_version {
+            return Ok(None);
+        }
+        if !table_exists(&source, "clips")? {
             return Ok(None);
         }
 
@@ -127,6 +130,13 @@ impl MigrationGuard {
         remove_if_exists(&sidecar(&self.live_path, "-wal"))?;
         remove_if_exists(&sidecar(&self.live_path, "-shm"))?;
         atomic_copy(&self.backup_path, &self.live_path)
+    }
+
+    /// Remove plaintext rollback artifacts once the live migration has been
+    /// verified. The backup exists only for the transactional migration window.
+    pub(crate) fn commit(&self) -> Result<()> {
+        remove_database_files(&self.backup_path)?;
+        remove_if_exists(&self.manifest_path)
     }
 
     fn verify(&self, connection: &Connection) -> Result<()> {
@@ -244,6 +254,42 @@ fn remove_database_files(path: &Path) -> Result<()> {
     remove_if_exists(path)?;
     remove_if_exists(&sidecar(path, "-wal"))?;
     remove_if_exists(&sidecar(path, "-shm"))
+}
+
+pub(crate) fn cleanup_stale_after_verified_open(
+    path: &Path,
+    target_version: i64,
+    connection: &Connection,
+) -> Result<()> {
+    let has_stale_artifact = (0..target_version).any(|version| {
+        database_files_exist(&path.with_extension(format!("migration-v{version}.bak")))
+    }) || database_files_exist(
+        &path.with_extension("migration-dry-run.db"),
+    ) || path.with_extension("migration.json").exists();
+    if !has_stale_artifact {
+        return Ok(());
+    }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != target_version {
+        return Err(StoreError::Migration(format!(
+            "refusing stale migration cleanup at schema {version}; expected {target_version}"
+        )));
+    }
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(StoreError::Migration(format!(
+            "refusing stale migration cleanup after SQLite quick_check: {quick_check}"
+        )));
+    }
+    for version in 0..target_version {
+        remove_database_files(&path.with_extension(format!("migration-v{version}.bak")))?;
+    }
+    remove_database_files(&path.with_extension("migration-dry-run.db"))?;
+    remove_if_exists(&path.with_extension("migration.json"))
+}
+
+fn database_files_exist(path: &Path) -> bool {
+    path.exists() || sidecar(path, "-wal").exists() || sidecar(path, "-shm").exists()
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {

@@ -113,6 +113,10 @@ fn top_docs_link_every_complete_implementation_batch() {
             "docs/implementation-batch-251-300.md",
             (251..=300).collect::<Vec<_>>(),
         ),
+        (
+            "docs/implementation-batch-301-350.md",
+            (301..=350).collect::<Vec<_>>(),
+        ),
     ] {
         for file in TOP_DOCS {
             assert!(
@@ -231,11 +235,13 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("docs/decision-gates-151-200.md"));
     assert!(readme.contains("docs/decision-gates-201-250.md"));
     assert!(readme.contains("docs/decision-gates-251-300.md"));
+    assert!(readme.contains("docs/decision-gates-301-350.md"));
     assert!(readme.contains("docs/limitations.md"));
     assert!(readme.contains("docs/maintainer-handoff.md"));
     assert!(readme.contains("docs/scope-review.md"));
     assert!(readme.contains("docs/data-contract-v1.md"));
     assert!(readme.contains("docs/data-contract-v2.md"));
+    assert!(readme.contains("docs/data-contract-v3.md"));
     assert!(readme.contains("docs/ideas-601-610.md"));
     assert!(readme.contains("docs/ideas-611-620.md"));
 
@@ -247,10 +253,13 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("`crates/vbuff-types/src/status.rs`"));
     assert!(architecture.contains("| `src/single_instance/` |"));
     assert!(architecture.contains("`CaptureHealth::Stalled`"));
-    assert!(architecture.contains("schema v6"));
+    assert!(architecture.contains("schema v7"));
     assert!(architecture.contains("History/Compose/Trust/Settings"));
     assert!(architecture.contains("workflow/everyday.rs"));
     assert!(architecture.contains("device_experience.rs"));
+    assert!(architecture.contains("data_lifecycle.rs"));
+    assert!(architecture.contains("`trust/`"));
+    assert!(architecture.contains("`recall/`"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
@@ -260,6 +269,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(recommendation.contains("batch 151-200"));
     assert!(recommendation.contains("batch 201-250"));
     assert!(recommendation.contains("batch 251-300"));
+    assert!(recommendation.contains("batch 301-350"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
@@ -272,6 +282,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("docs/ideas-601-610.md"));
     assert!(plan.contains("docs/ideas-611-620.md"));
     assert!(plan.contains("docs/decision-gates-251-300.md"));
+    assert!(plan.contains("docs/decision-gates-301-350.md"));
+    assert!(plan.contains("docs/data-contract-v3.md"));
 }
 
 #[test]

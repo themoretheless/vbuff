@@ -64,11 +64,67 @@ impl CasStore {
         }
     }
 
+    pub(crate) fn verify(
+        &self,
+        kind: ContentKind,
+        blob_ref: &str,
+        expected_size: u64,
+    ) -> Result<()> {
+        let path = self.path_for(kind, blob_ref)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(StoreError::Io)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != expected_size
+            || file_hash(&path)?.as_slice() != decode_blob_ref(blob_ref)?.as_slice()
+        {
+            return Err(StoreError::Corrupt(format!(
+                "CAS blob {blob_ref} failed integrity verification"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quarantine(&self, kind: ContentKind, blob_ref: &str) -> Result<()> {
+        let source = self.path_for(kind, blob_ref)?;
+        if !source.exists() {
+            return Ok(());
+        }
+        let quarantine = self.root.join("quarantine");
+        std::fs::create_dir_all(&quarantine).map_err(StoreError::Io)?;
+        harden_directory(&quarantine)?;
+        let destination = quarantine.join(format!(
+            "{}-{blob_ref}-{}.corrupt",
+            kind_slug(kind),
+            ClipId::new()
+        ));
+        std::fs::rename(source, destination).map_err(StoreError::Io)
+    }
+
     /// Remove complete but unreferenced blobs and abandoned temporary writes.
     /// The application enforces one store owner, so startup/idle GC cannot race
     /// another vbuff writer installing a blob.
     pub(crate) fn remove_orphans(&self, live: &HashSet<(ContentKind, String)>) -> Result<usize> {
-        let mut removed = 0;
+        let orphans = self.orphan_files(live)?;
+        for (path, _) in &orphans {
+            std::fs::remove_file(path).map_err(StoreError::Io)?;
+        }
+        Ok(orphans.len())
+    }
+
+    pub(crate) fn orphan_inventory(
+        &self,
+        live: &HashSet<(ContentKind, String)>,
+    ) -> Result<(usize, u64)> {
+        let orphans = self.orphan_files(live)?;
+        Ok((
+            orphans.len(),
+            orphans
+                .iter()
+                .fold(0_u64, |total, (_, bytes)| total.saturating_add(*bytes)),
+        ))
+    }
+
+    fn orphan_files(&self, live: &HashSet<(ContentKind, String)>) -> Result<Vec<(PathBuf, u64)>> {
+        let mut orphans = Vec::new();
         for (kind, slug) in ALL_KINDS {
             let kind_root = self.root.join(slug);
             if !kind_root.exists() {
@@ -94,14 +150,16 @@ impl CasStore {
                         if abandoned_temporary
                             || (valid_blob && !live.contains(&(kind, name.to_owned())))
                         {
-                            std::fs::remove_file(&path).map_err(StoreError::Io)?;
-                            removed += 1;
+                            let bytes = std::fs::symlink_metadata(&path)
+                                .map_err(StoreError::Io)?
+                                .len();
+                            orphans.push((path, bytes));
                         }
                     }
                 }
             }
         }
-        Ok(removed)
+        Ok(orphans)
     }
 
     fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<String> {
@@ -244,6 +302,18 @@ fn file_hash(path: &std::path::Path) -> Result<[u8; 32]> {
         hasher.update(&buffer[..read]);
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+fn decode_blob_ref(blob_ref: &str) -> Result<[u8; 32]> {
+    if !valid_blob_ref(blob_ref) {
+        return Err(StoreError::Corrupt("invalid CAS blob reference".into()));
+    }
+    let mut output = [0_u8; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&blob_ref[index * 2..index * 2 + 2], 16)
+            .map_err(|_| StoreError::Corrupt("invalid CAS blob reference".into()))?;
+    }
+    Ok(output)
 }
 
 fn read_dir(path: &std::path::Path) -> Result<Vec<PathBuf>> {

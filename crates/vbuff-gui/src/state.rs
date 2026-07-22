@@ -6,18 +6,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vbuff_core::onboarding::DefaultProfile;
+use vbuff_core::trust::PrivacyScore;
 use vbuff_types::{
     CapabilityView, CaptureBudgetAlert, CaptureHealth, CapturePauseReason, CaptureSessionStats,
     Clip, ClipId, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyLedgerSummary,
     SecurityPostureSummary, SloStatusSummary,
 };
 
+use crate::experience::UiPreferences;
+
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
 /// background capture thread can push new clips while the GUI reads them.
 #[derive(Default)]
 pub struct AppState {
     /// The current clip list, already ordered (pinned first, then recency).
-    pub clips: Vec<Clip>,
+    pub clips: Arc<[Clip]>,
     /// True if clipboard capture is currently paused.
     pub paused: bool,
     /// Why capture is paused; `None` while capture is running.
@@ -34,6 +37,8 @@ pub struct AppState {
     pub health_digest: ClipboardHealthDigest,
     /// Clips exempt from automatic lifecycle cleanup for this process session.
     pub session_protected: HashSet<ClipId>,
+    /// Payloads held only in this resident process and never persisted.
+    pub memory_only_clips: HashSet<ClipId>,
     /// Applied first-run profile, when one was chosen.
     pub default_profile: Option<DefaultProfile>,
     /// Capability-honest security state derived by the platform layer.
@@ -42,6 +47,8 @@ pub struct AppState {
     pub capabilities: Vec<CapabilityView>,
     /// Content-free, hash-chained capture decisions.
     pub privacy_ledger: PrivacyLedgerSummary,
+    /// Content-free score derived from the effective local privacy settings.
+    pub privacy_score: Option<PrivacyScore>,
     /// Release SLO status; unavailable measurements remain unknown.
     pub slo_status: SloStatusSummary,
     /// A recent privacy skip may be explicitly re-read from the live clipboard.
@@ -54,6 +61,8 @@ pub struct AppState {
     pub announcement_revision: u64,
     /// Resolved summon shortcut shown by the one-time coachmark.
     pub hotkey_label: Option<String>,
+    /// Whether the native resident process is registered to start at login.
+    pub launch_at_login: bool,
     /// True until the coachmark is explicitly dismissed.
     pub show_hotkey_coachmark: bool,
     /// Set to true by the wiring when the popup should be shown/focused.
@@ -67,14 +76,14 @@ impl AppState {
     /// Construct the initial state from the persisted history snapshot.
     pub fn with_clips(clips: Vec<Clip>) -> Self {
         Self {
-            clips,
+            clips: Arc::from(clips),
             ..Default::default()
         }
     }
 
     /// Replace the clip list and bump the revision.
     pub fn set_clips(&mut self, clips: Vec<Clip>) {
-        self.clips = clips;
+        self.clips = Arc::from(clips);
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -91,6 +100,7 @@ impl AppState {
         self.capture_health = health;
         if !matches!(health, CaptureHealth::Starting | CaptureHealth::Watching) {
             self.health_alert = Some(health);
+            self.announce(format!("Capture alert: {}", health.label()));
         }
         true
     }
@@ -100,6 +110,7 @@ impl AppState {
             return false;
         }
         self.size_budget_alert = Some(alert);
+        self.announce(alert.label());
         true
     }
 
@@ -133,10 +144,12 @@ impl AppState {
 
     /// Replace the current command notice with a redacted message.
     pub fn set_notice(&mut self, level: NoticeLevel, message: impl Into<String>) {
+        let message = message.into();
         self.notice = Some(CommandNotice {
             level,
-            message: message.into(),
+            message: message.clone(),
         });
+        self.announce(message);
     }
 
     pub fn clear_notice(&mut self) {
@@ -166,7 +179,7 @@ pub enum UiAction {
     /// Paste the given clip back into the previously focused app.
     Paste(ClipId),
     /// Paste an explicitly edited local composition draft.
-    PasteText(String),
+    PasteText { text: String, sensitive: bool },
     /// Pin or unpin a clip.
     SetPinned(ClipId, bool),
     /// Protect or unprotect a clip until this resident process exits.
@@ -187,6 +200,13 @@ pub enum UiAction {
     InstallStarterPack(StarterPack),
     /// Apply one bounded first-run default profile.
     ApplyDefaultProfile(DefaultProfile),
+    /// Enable or disable native launch-at-login registration.
+    SetLaunchAtLogin(bool),
+    /// Persist non-sensitive native popup preferences.
+    SetUiPreferences {
+        preferences: UiPreferences,
+        reduced_motion_changed: bool,
+    },
     /// Dismiss a de-duplicated health alert.
     DismissHealthAlert,
     /// Dismiss a de-duplicated size-budget alert.
@@ -203,9 +223,10 @@ impl fmt::Debug for UiAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Paste(id) => formatter.debug_tuple("Paste").field(id).finish(),
-            Self::PasteText(text) => formatter
+            Self::PasteText { text, sensitive } => formatter
                 .debug_struct("PasteText")
                 .field("text", &format_args!("[redacted; {} bytes]", text.len()))
+                .field("sensitive", sensitive)
                 .finish(),
             Self::SetPinned(id, pinned) => formatter
                 .debug_tuple("SetPinned")
@@ -238,6 +259,18 @@ impl fmt::Debug for UiAction {
             Self::ApplyDefaultProfile(profile) => formatter
                 .debug_tuple("ApplyDefaultProfile")
                 .field(profile)
+                .finish(),
+            Self::SetLaunchAtLogin(enabled) => formatter
+                .debug_tuple("SetLaunchAtLogin")
+                .field(enabled)
+                .finish(),
+            Self::SetUiPreferences {
+                preferences,
+                reduced_motion_changed,
+            } => formatter
+                .debug_struct("SetUiPreferences")
+                .field("preferences", preferences)
+                .field("reduced_motion_changed", reduced_motion_changed)
                 .finish(),
             Self::DismissHealthAlert => formatter.write_str("DismissHealthAlert"),
             Self::DismissSizeBudgetAlert => formatter.write_str("DismissSizeBudgetAlert"),

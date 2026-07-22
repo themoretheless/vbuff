@@ -6,14 +6,17 @@
 //! This keeps the view unit-friendly and lets the wiring own all side effects.
 
 mod app;
-mod demo;
 mod design;
 pub mod experience;
+mod media;
+mod navigation;
+mod projection;
 mod state;
+mod trust_view;
 mod view;
 
 pub use app::PopupApp;
-pub use demo::demo_state;
+pub use experience::{DeliveryCapabilities, DensityMode, HandedMode, UiPreferences};
 pub use state::{AppState, SharedState, StarterPack, UiAction};
 
 /// Preferred popup size used by the root composition layer.

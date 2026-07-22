@@ -69,7 +69,10 @@ fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
     }
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.doctor().unwrap().schema_version, 6);
+    assert_eq!(
+        store.doctor().unwrap().schema_version,
+        vbuff_store::SCHEMA_VERSION
+    );
     assert_eq!(
         store.list(1).unwrap()[0].primary_text(),
         clip.primary_text()
@@ -227,6 +230,79 @@ fn large_bodies_use_sharded_refcounted_cas_and_hydrate_on_read() {
     store.delete(clip.id).unwrap();
     assert_eq!(store.gc_blobs().unwrap(), 1);
     assert!(regular_files(&dir.path().join("blobs")).is_empty());
+}
+
+#[test]
+fn gc_dry_run_and_blob_scrubber_report_before_mutating() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+
+    let orphan_hash = blake3::hash(b"orphan preview").to_hex().to_string();
+    let orphan = dir
+        .path()
+        .join("blobs")
+        .join("text")
+        .join(&orphan_hash[0..2])
+        .join(&orphan_hash[2..4])
+        .join(&orphan_hash);
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"orphan preview").unwrap();
+    let preview = store.gc_dry_run().unwrap();
+    assert_eq!(preview.blob_count, 1);
+    assert_eq!(preview.reclaimable_bytes, 14);
+    assert!(orphan.exists());
+    assert_eq!(store.gc_blobs().unwrap(), 1);
+
+    let live = large_clip(ContentKind::Image, "image/png", vec![83_u8; 300 * 300 * 4]);
+    store.insert(&live).unwrap();
+    let live_path = regular_files(&dir.path().join("blobs"))
+        .into_iter()
+        .find(|path| !path.to_string_lossy().contains("quarantine"))
+        .unwrap();
+    std::fs::write(&live_path, b"damaged").unwrap();
+    let report = store.scrub_blobs(16).unwrap();
+    assert_eq!(report.checked, 1);
+    assert_eq!(report.quarantined, 1);
+    assert!(!live_path.exists());
+}
+
+#[test]
+fn blob_scrubber_cursor_advances_past_a_healthy_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    store
+        .insert(&large_clip(
+            ContentKind::Image,
+            "image/png",
+            vec![11_u8; 300 * 300 * 4],
+        ))
+        .unwrap();
+    store
+        .insert(&large_clip(
+            ContentKind::Image,
+            "image/png",
+            vec![12_u8; 300 * 300 * 4],
+        ))
+        .unwrap();
+
+    let mut files = regular_files(&dir.path().join("blobs"));
+    files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    assert_eq!(files.len(), 2);
+    std::fs::write(&files[1], b"damaged second blob").unwrap();
+
+    let first = store.scrub_blobs(1).unwrap();
+    assert_eq!(first.checked, 1);
+    assert_eq!(first.healthy, 1);
+    assert_eq!(first.remaining, 1);
+    assert!(files[0].exists());
+
+    let second = store.scrub_blobs(1).unwrap();
+    assert_eq!(second.checked, 1);
+    assert_eq!(second.quarantined, 1);
+    assert_eq!(second.remaining, 0);
+    assert!(!files[1].exists());
 }
 
 #[test]
@@ -418,7 +494,7 @@ fn regular_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn on_disk_migration_preflights_and_writes_verified_manifest() {
+fn on_disk_migration_verifies_then_removes_plaintext_rollback_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("history.db");
     let clip = make_clip("v1 row survives");
@@ -475,27 +551,52 @@ fn on_disk_migration_preflights_and_writes_verified_manifest() {
 
     let backup = db.with_extension("migration-v1.bak");
     let manifest = db.with_extension("migration.json");
-    assert!(backup.exists());
-    assert!(manifest.exists());
+    assert!(!backup.exists());
+    assert!(!manifest.exists());
     assert!(!db.with_extension("migration-dry-run.db").exists());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+}
 
-        assert_eq!(
-            backup.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            manifest.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+#[test]
+fn current_schema_open_removes_interrupted_plaintext_migration_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    store.insert(&make_clip("current schema")).unwrap();
+    drop(store);
+
+    let backup = db.with_extension("migration-v6.bak");
+    let backup_wal = std::path::PathBuf::from(format!("{}-wal", backup.to_string_lossy()));
+    let manifest = db.with_extension("migration.json");
+    let dry_run = db.with_extension("migration-dry-run.db");
+    for artifact in [&backup, &backup_wal, &manifest, &dry_run] {
+        std::fs::write(artifact, b"stale plaintext migration artifact").unwrap();
     }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest["pre_version"], 1);
-    assert_eq!(manifest["target_version"], vbuff_store::SCHEMA_VERSION);
-    assert_eq!(manifest["pre_rows"], 1);
-    assert_eq!(manifest["post_rows"], 1);
-    assert_eq!(manifest["backup_blake3"].as_str().unwrap().len(), 64);
+
+    let reopened = Store::open(&db).unwrap();
+    assert_eq!(reopened.count().unwrap(), 1);
+    for artifact in [&backup, &backup_wal, &manifest, &dry_run] {
+        assert!(!artifact.exists(), "stale artifact survived: {artifact:?}");
+    }
+}
+
+#[test]
+fn failed_current_schema_open_preserves_interrupted_migration_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    store.insert(&make_clip("before interrupted open")).unwrap();
+    drop(store);
+
+    let backup = db.with_extension("migration-v6.bak");
+    std::fs::copy(&db, &backup).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_len(100)
+        .unwrap();
+
+    assert!(Store::open(&db).is_err());
+    assert!(backup.exists());
+    assert!(backup.metadata().unwrap().len() > 100);
 }

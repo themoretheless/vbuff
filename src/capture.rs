@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use vbuff_core::capture::{
     AdaptivePollScheduler, CaptureAction, CaptureDecision, CaptureInput, CaptureLossLedger,
     CaptureOutcome, CapturePolicy, CaptureRule, DropClass, DropReason, GenerationObservation,
-    GenerationTracker, PollObservation, SelectionSource, SelfTestObservation, SelfTestState,
-    SelfWriteLedger, SkippedCapture, SkippedCaptureRing, SourcePredicate, SubsystemBudget,
-    annotate_integrity, prune_redundant_flavors, verify_integrity,
+    GenerationTracker, PollObservation, SelectionSource, SelfWriteLedger, SkippedCapture,
+    SkippedCaptureRing, SourcePredicate, SubsystemBudget, annotate_integrity,
+    prune_redundant_flavors, verify_integrity,
 };
 use vbuff_core::observability::RedactedClipFields;
 use vbuff_core::reliability::{
@@ -18,9 +18,7 @@ use vbuff_core::reliability::{
     RecoveryAction, SupervisorObservation, shed_to_text_preview,
 };
 use vbuff_core::{content_hash_from_flavors, detect_kind};
-use vbuff_platform::{
-    ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
-};
+use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardSelection};
 use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta};
 
 use crate::config::{Config, SourceRuleAction};
@@ -186,12 +184,10 @@ fn run_worker(
         }
     };
 
-    if capture_self_test(&mut clipboard, &self_writes) {
-        diagnostics.capture_health(CaptureHealth::Watching);
-    } else {
-        diagnostics.capture_health(CaptureHealth::SelfTestFailed);
-        tracing::warn!("clipboard capture self-test failed; continuing in degraded mode");
-    }
+    // The generic arboard adapter cannot prove a lossless snapshot/restore of
+    // every native flavor or exclude a probe from OS clipboard history. An
+    // active startup probe would therefore mutate user data to test itself.
+    diagnostics.capture_health(CaptureHealth::Watching);
     let policy = capture_policy(&config);
     let initial_interval = Duration::from_millis(config.poll_interval_ms.max(50));
     let mut scheduler = AdaptivePollScheduler::new(
@@ -396,7 +392,9 @@ fn run_worker(
                 sensitive: true,
                 sync_eligible: false,
                 ai_allowed: false,
-                expires_after: None,
+                memory_only: true,
+                expires_after: Some(Duration::from_secs(60)),
+                sensitivity_reason: Some(vbuff_types::SensitivityReason::CaptureRule),
             }
         } else {
             policy.decide(policy_input)
@@ -407,7 +405,9 @@ fn run_worker(
             sensitive,
             sync_eligible,
             ai_allowed,
+            memory_only,
             expires_after,
+            sensitivity_reason,
         } = decision
         else {
             let CaptureDecision::Skip(reason) = decision else {
@@ -524,6 +524,7 @@ fn run_worker(
             sync_eligible,
             ai_allowed,
             expires_after,
+            sensitivity_reason,
         );
         let fields = RedactedClipFields::from(&clip);
         let span = tracing::info_span!(
@@ -537,7 +538,11 @@ fn run_worker(
         let _entered = span.enter();
         diagnostics.write_queue_depth(1);
         let insert_started = Instant::now();
-        let insert_result = history.insert(&clip, config.max_history);
+        let insert_result = if memory_only {
+            history.insert_volatile(clip.clone())
+        } else {
+            history.insert(&clip, config.max_history)
+        };
         diagnostics.latency("capture_insert", insert_started.elapsed());
         diagnostics.write_queue_depth(0);
         match insert_result {
@@ -644,81 +649,6 @@ fn observe_scheduler(
     diagnostics.poll_interval(interval);
 }
 
-fn capture_self_test(
-    clipboard: &mut impl ClipboardBackend,
-    self_writes: &Arc<Mutex<SelfWriteLedger>>,
-) -> bool {
-    let Ok(original) = clipboard.read() else {
-        return false;
-    };
-    let nonce = ClipId::new().to_string_repr();
-    let probe = vec![vbuff_types::Flavor::inline(
-        "text/plain;charset=utf-8",
-        format!("vbuff-self-test-{nonce}").into_bytes(),
-    )];
-    let probe_hash = content_hash_from_flavors(&probe);
-    let lineage = vbuff_types::CaptureLineage {
-        origin_device: None,
-        write_nonce: Some(nonce.clone()),
-    };
-    let mut state = SelfTestState::start(probe_hash);
-
-    let probe_ok = clipboard
-        .write_tagged_with_retention(
-            &probe,
-            &lineage,
-            ClipboardRetention::ExcludeFromSystemHistory,
-        )
-        .is_ok()
-        && clipboard.read().is_ok_and(|observed| {
-            let observed_hash = content_hash_from_flavors(&observed.flavors);
-            let suppressed = self_writes
-                .lock()
-                .map(|mut ledger| {
-                    ledger.register(probe_hash, nonce, Instant::now());
-                    ledger.matches(observed_hash, &observed.lineage, Instant::now())
-                })
-                .unwrap_or(false);
-            observed_hash == probe_hash && suppressed
-        });
-    state = state.observe(if probe_ok {
-        SelfTestObservation::EchoConfirmed
-    } else {
-        SelfTestObservation::UnexpectedEcho
-    });
-
-    let restored = if original.is_empty() {
-        clipboard.clear().is_ok()
-    } else {
-        let restore_nonce = ClipId::new().to_string_repr();
-        let restore_lineage = vbuff_types::CaptureLineage {
-            origin_device: None,
-            write_nonce: Some(restore_nonce.clone()),
-        };
-        let restored = clipboard
-            .write_tagged_with_retention(
-                &original.flavors,
-                &restore_lineage,
-                ClipboardRetention::ExcludeFromSystemHistory,
-            )
-            .is_ok();
-        if restored {
-            let restore_hash = content_hash_from_flavors(&original.flavors);
-            if let Ok(mut ledger) = self_writes.lock() {
-                ledger.register(restore_hash, restore_nonce, Instant::now());
-            }
-        }
-        restored
-    };
-    state = state.observe(if restored {
-        SelfTestObservation::RestoreConfirmed
-    } else {
-        SelfTestObservation::TimedOut
-    });
-
-    state == SelfTestState::Passed
-}
-
 fn capture_policy(config: &Config) -> CapturePolicy {
     let rules = config
         .source_rules
@@ -729,10 +659,10 @@ fn capture_policy(config: &Config) -> CapturePolicy {
                 rule.title_regex.as_deref(),
                 rule.url_host_suffix.clone(),
             )
-            .map_err(|error| {
+            .map_err(|_| {
                 tracing::warn!(
                     pattern_bytes = rule.title_regex.as_ref().map_or(0, String::len),
-                    "invalid capture-rule regex: {error}"
+                    "invalid capture-rule regex; rule disabled"
                 );
             })
             .ok()?;
@@ -850,6 +780,7 @@ fn build_clip(
     sync_eligible: bool,
     ai_allowed: bool,
     expires_after: Option<Duration>,
+    sensitivity_reason: Option<vbuff_types::SensitivityReason>,
 ) -> Clip {
     let kind = detect_kind(&captured.flavors);
     let byte_size = captured
@@ -864,6 +795,7 @@ fn build_clip(
     meta.generation = captured.generation;
     meta.lineage = captured.lineage;
     meta.sensitive = sensitive;
+    meta.sensitivity_reason = sensitivity_reason;
     meta.sync_eligible = sync_eligible;
     meta.ai_allowed = ai_allowed;
     meta.expires_at = expires_after
@@ -883,35 +815,7 @@ fn build_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vbuff_platform::{PlatformError, Result as PlatformResult};
     use vbuff_types::Flavor;
-
-    #[derive(Clone)]
-    struct SelfTestClipboard {
-        current: CapturedClipboard,
-    }
-
-    impl ClipboardBackend for SelfTestClipboard {
-        fn read(&mut self) -> PlatformResult<CapturedClipboard> {
-            Ok(self.current.clone())
-        }
-
-        fn write(&mut self, flavors: &[Flavor]) -> PlatformResult<()> {
-            if flavors.is_empty() {
-                return Err(PlatformError::Empty);
-            }
-            self.current = CapturedClipboard {
-                flavors: flavors.to_vec(),
-                ..CapturedClipboard::default()
-            };
-            Ok(())
-        }
-
-        fn clear(&mut self) -> PlatformResult<()> {
-            self.current = CapturedClipboard::default();
-            Ok(())
-        }
-    }
 
     fn captured(text: &str, source_app: Option<&str>) -> CapturedClipboard {
         CapturedClipboard {
@@ -986,12 +890,17 @@ mod tests {
             false,
             false,
             Some(Duration::from_secs(90)),
+            Some(vbuff_types::SensitivityReason::OneTimePassword),
         );
 
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));
         assert_eq!(clip.meta.provenance.app_id.as_deref(), Some("editor.app"));
         assert!(clip.meta.sensitive);
+        assert_eq!(
+            clip.meta.sensitivity_reason,
+            Some(vbuff_types::SensitivityReason::OneTimePassword)
+        );
         assert!(!clip.meta.sync_eligible);
         assert!(clip.meta.expires_at.is_some());
         assert_eq!(clip.content_hash, hash);
@@ -1055,25 +964,6 @@ mod tests {
             &mut last_shed,
             hash,
             now + Duration::from_secs(5)
-        ));
-    }
-
-    #[test]
-    fn self_test_restores_and_suppresses_the_original_clipboard() {
-        let original = captured("do not recapture me", Some("secret.app"));
-        let original_hash = content_hash_from_flavors(&original.flavors);
-        let mut clipboard = SelfTestClipboard { current: original };
-        let ledger = Arc::new(Mutex::new(SelfWriteLedger::default()));
-
-        assert!(capture_self_test(&mut clipboard, &ledger));
-        assert_eq!(
-            content_hash_from_flavors(&clipboard.current.flavors),
-            original_hash
-        );
-        assert!(ledger.lock().unwrap().matches(
-            original_hash,
-            &vbuff_types::CaptureLineage::default(),
-            Instant::now(),
         ));
     }
 }
