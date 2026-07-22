@@ -1134,7 +1134,7 @@ impl Store {
                 clip.id.to_string_repr(),
                 clip.content_hash.as_slice(),
                 flavors_json,
-                row::kind_to_int(clip.meta.kind),
+                kind_to_int(clip.meta.kind),
                 created,
                 now,
                 clip.meta.byte_size as i64,

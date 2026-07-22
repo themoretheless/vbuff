@@ -47,10 +47,7 @@ impl ClipboardBackend for ArboardClipboard {
         if flavors.is_empty() {
             match self.clipboard.get_image() {
                 Ok(img) => {
-                    let mime = format!(
-                        "{RGBA_MIME_PREFIX};width={};height={}",
-                        img.width, img.height
-                    );
+                    let mime = rgba_mime(img.width, img.height);
                     flavors.push(Flavor::inline(mime, img.bytes.into_owned()));
                 }
                 Err(arboard::Error::ContentNotAvailable) => {}
@@ -118,20 +115,6 @@ fn rgba_dimensions_match(width: usize, height: usize, byte_len: usize) -> bool {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(4))
             == Some(byte_len)
-}
-
-/// Parse `width=W;height=H` out of an RGBA MIME string.
-fn parse_rgba_dims(mime: &str) -> Option<(usize, usize)> {
-    let mut width = None;
-    let mut height = None;
-    for part in mime.split(';') {
-        if let Some(v) = part.trim().strip_prefix("width=") {
-            width = v.parse().ok();
-        } else if let Some(v) = part.trim().strip_prefix("height=") {
-            height = v.parse().ok();
-        }
-    }
-    Some((width?, height?))
 }
 
 #[cfg(test)]

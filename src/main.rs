@@ -39,7 +39,6 @@ use vbuff_types::{
     SecurityPostureSummary,
 };
 
-use capture::spawn_capture_thread;
 use config::Config;
 use diagnostics::Diagnostics;
 use history::History;

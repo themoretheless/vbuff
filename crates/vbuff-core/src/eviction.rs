@@ -69,17 +69,14 @@ mod tests {
     /// the real recency field the policy now sorts by.
     fn clip(ts: u64, pinned: bool) -> Clip {
         let when = DateTime::from_timestamp_millis(ts as i64).unwrap();
+        let mut meta = ClipMeta::now(ContentKind::Text, 1, None);
+        meta.created_at = when;
+        meta.updated_at = when;
         Clip {
             id: ClipId(ulid::Ulid::from_parts(ts, 0)),
             flavors: vec![Flavor::inline("text/plain", b"x".to_vec())],
             content_hash: [0u8; 32],
-            meta: ClipMeta {
-                created_at: when,
-                updated_at: when,
-                byte_size: 1,
-                source_app: None,
-                kind: ContentKind::Text,
-            },
+            meta,
             pinned,
             favorite: false,
         }

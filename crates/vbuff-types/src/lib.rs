@@ -11,6 +11,7 @@
 //! over its canonical flavor bytes (see `vbuff-core`).
 
 mod ipc;
+mod rgba;
 mod status;
 
 use std::fmt;
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 pub use ipc::{ClientIntent, ServerResponse};
+pub use rgba::{RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
 pub use status::{
     CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, CapturePauseReason,
     CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyDecisionLevel,
@@ -400,6 +402,7 @@ pub struct ClipMeta {
 impl ClipMeta {
     /// Build metadata stamped at the current time for the given kind/size.
     pub fn now(kind: ContentKind, byte_size: u64, source_app: Option<String>) -> Self {
+        let now = Utc::now();
         let provenance = CaptureProvenance {
             app_id: source_app.clone(),
             ..CaptureProvenance::default()
