@@ -1,6 +1,6 @@
 # vbuff
 
-**Product target: one clipboard, every machine, never lost, never leaked.**
+**Product direction: right clip, tested format, explicit evidence.**
 
 A native desktop clipboard manager written in Rust. The current executable is an `eframe`/`egui` application only; the web demo, browser UI, and WASM target have been removed. It polls the generic `arboard` backend and can read either text or raw-RGBA image content per observation into a searchable local SQLite history. That SQLite database is not encrypted. Automatic paste is disabled until a native adapter can confirm the destination immediately before injection. Selecting an eligible non-sensitive clip therefore copies it to the OS clipboard for manual paste; sensitive copy is blocked when the backend cannot exclude the write from OS or third-party clipboard history.
 
@@ -8,9 +8,9 @@ A native desktop clipboard manager written in Rust. The current executable is an
 
 ## What is vbuff, and why it exists
 
-Clipboard managers are a mature but deeply fragmented category, and no single product covers the things that matter at once. The best tool on each platform is usually *only* on that platform: **Ditto** is the de facto free manager on Windows but is Windows-only and local-only; **Paste** is beautifully polished and syncs across Apple devices but is macOS/iOS-only and subscription-only; **CopyQ** genuinely spans macOS, Windows and Linux but wears a dated, scripting-heavy UI and has no real sync; **CrossPaste** reaches every platform and syncs privately but only over the LAN and without the polish. A person who works across macOS, Windows and Linux cannot carry one mental model, one keybinding scheme, or one private history across all three.
+Clipboard history itself is now an operating-system baseline: Windows provides Win+V history and cloud sync, and macOS Tahoe 26 exposes searchable history in Spotlight. Dedicated products have also moved well beyond simple recall. **Paste** now advertises OCR/Power Search, Teams, shared pinboards, Apple Intelligence, local MCP, and both recurring and lifetime purchase choices. **CrossPaste** advertises cross-OS LAN E2EE, OCR, MCP, and a browser extension. **PowerToys**, **CopyQ**, **Raycast**, **Maccy**, **PastePal**, and **PasteBar** already cover most individual transform, scripting, queue, collection, and privacy checkboxes.
 
-That is the four-corner gap vbuff is built to close: **be truly cross-platform (macOS + Windows + Linux), genuinely polished, privately synced, and approachable, all at the same time.** Every competitor wins at most two of those corners; vbuff aims to occupy all four. The non-negotiable target is privacy: local-only by default, encrypted at rest, OS "do not store" hints evaluated before persistence, and every rejection routed through one fail-closed gate. The current fallback backend cannot yet observe all native privacy hints, and the current SQLite file is not encrypted; both limitations are tracked explicitly rather than hidden behind the target language.
+vbuff therefore does not try to win by accumulating the longest feature list. Its initial target is technical work across desktop operating systems: recall the right item by source/time/session context, preserve and test representations across source and destination apps, and attach explicit evidence to vbuff-controlled capture, storage, and disclosure boundaries. Cross-platform reach, encryption, and polish remain required, but they are foundations rather than the headline. The current fallback backend cannot yet observe all native privacy hints, the current SQLite file is not encrypted, and generic applications cannot acknowledge successful insertion; those limitations are tracked explicitly rather than hidden behind stronger product language. The dated evidence and implementation order are in [the 2026 competitive strategy refresh](docs/competitive-strategy-2026.md).
 
 ---
 
@@ -21,11 +21,11 @@ vbuff is designed as one codebase with native, per-OS backends behind common Rus
 | Platform | Clipboard capture | Global hotkey | Paste-back | Notes |
 |---|---|---|---|---|
 | **macOS** | `NSPasteboard` `changeCount` polling (~150-250 ms, adaptive idle backoff) | Carbon `RegisterEventHotKey` | Focus restore + synthetic Cmd+V | Paste-back needs **Accessibility** permission (granted in System Settings). Honors `org.nspasteboard.ConcealedType` / `TransientType`. |
-| **Windows** | `AddClipboardFormatListener` / `WM_CLIPBOARDUPDATE` (event-driven) | Win32 `RegisterHotKey` | `SetForegroundWindow` + `SendInput` Ctrl+V | Honors `ExcludeClipboardContentFromMonitorProcessing` and `CanIncludeInClipboardHistory`. |
+| **Windows** | `AddClipboardFormatListener` / `WM_CLIPBOARDUPDATE` (event-driven) | Win32 `RegisterHotKey` | `SetForegroundWindow` + `SendInput` Ctrl+V | Distinguishes monitor exclusion, local-history exclusion, and cloud-upload exclusion; source starts with `GetClipboardOwner`, with foreground attribution marked as a fallback. |
 | **Linux / X11** | `CLIPBOARD` selection ownership via XFIXES selection events | `XGrabKey` | `XTEST` Ctrl+V | vbuff takes selection ownership so clips survive the source app closing. |
-| **Linux / Wayland** | `wlr-data-control` (wlroots: Sway, Hyprland, river; also KDE Plasma) | `GlobalShortcuts` portal (`xdg-desktop-portal`) | virtual-keyboard / `wtype` / `ydotool`, else set-and-let-user-paste | See the GNOME caveat below. |
+| **Linux / Wayland** | `ext-data-control-v1` where advertised; deprecated `wlr-data-control` only as a legacy fallback | `GlobalShortcuts` portal (`xdg-desktop-portal`) | virtual-keyboard / `wtype` / `ydotool`, else set-and-let-user-paste | Capability-probed per compositor; see the GNOME caveat below. |
 
-> **Target GNOME on Wayland behavior.** GNOME's Mutter compositor does not implement `wlr-data-control` and offers no sanctioned background clipboard-monitor API. A future native Wayland adapter must either prove a supported portal/protocol path or degrade visibly to capture-on-summon/manual capture. The current generic `arboard` poller does not establish this compositor-specific behavior.
+> **Target GNOME on Wayland behavior.** GNOME's Mutter compositor does not currently expose the data-control path vbuff needs for a sanctioned background clipboard monitor. A future native Wayland adapter must prove `ext-data-control-v1`, use an explicitly supported integration, or degrade visibly to capture-on-summon/manual capture. The current generic `arboard` poller does not establish this compositor-specific behavior.
 
 Source-app attribution and per-app exclusion require a trustworthy foreground identity. The current backend does not provide one on any platform, so source-dependent protection is unavailable. Content-derived rules can still run on payloads that reach policy evaluation, but they do not substitute for native concealed/source proof.
 
@@ -79,7 +79,7 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 - **Honors OS concealed/secure markers** and password-field hints, skips designated apps, supports regex/keyword exclusion rules and built-in secret detection.
 - **Local by default, zero telemetry, no network calls** out of the box.
 - Auto-clear-on-timer, wipe-on-demand, and shorter retention for sensitive clips.
-- Cross-device, end-to-end encrypted sync is planned and opt-in (v1 foundation, v2 breadth), never the default path and never a backend that can read your data.
+- Cross-device code is foundation-only and frozen. If the Windows beta passes demand gates, one explicit authenticated handoff may be tested before any ambient history replication; sync is not promised release scope.
 
 ---
 
@@ -216,7 +216,7 @@ vbuff is a standard Cargo workspace. You need a recent stable **Rust toolchain**
 **Linux (X11 and Wayland)**
 - A C toolchain and `pkg-config`.
 - X11 development headers (for X11 sessions): on Debian/Ubuntu, `libx11-dev`, `libxcb1-dev`, `libxfixes-dev`.
-- Wayland and clipboard tooling (for Wayland sessions): `libwayland-dev`; `wl-clipboard` is recommended as a fallback path on compositors without `wlr-data-control`.
+- Wayland and clipboard tooling (for Wayland sessions): `libwayland-dev`; the target adapter probes `ext-data-control-v1`, can use legacy `wlr-data-control` where still advertised, and otherwise enters a visible degraded mode. `wl-clipboard` is a bring-up helper, not proof of background-capture support.
 - GUI/runtime libraries for eframe: development packages for `libxkbcommon`, plus your GPU/GL stack. On Debian/Ubuntu: `libxkbcommon-dev`, `libgl1-mesa-dev`.
 - The Linux build deliberately links both the X11 and Wayland client libraries so one binary runs under either session.
 
@@ -249,7 +249,7 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
 3. **Type to filter** the history; matches highlight as you go.
 4. **Navigate** with **Up / Down** (Home / End jump to the ends of the list).
 5. **Press Enter** to copy an eligible non-sensitive selected clip to the OS clipboard, then paste it manually in the destination app.
-6. **Number keys (1-9)** quick-pick using the same copy-only rule.
+6. **Cmd/Ctrl + number (1-9)** quick-picks using the same copy-only rule.
 7. **Pin** an item to keep it at the top and exempt it from eviction; **delete** removes it from history.
 8. Add text clips to **Compose** to edit/reorder a temporary paste stack, name form slots, or merge items as bullets, citations, CSV, or a Markdown table.
 9. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, toggle start-at-login, or quit.
@@ -267,7 +267,7 @@ vbuff verify --file ./vbuff --sha256 <64-hex-character-release-hash>
 
 For an explicit second-machine setup transfer, `vbuff config handoff export setup.toml` writes the full configuration, including private matchers, with a checksum and owner-only permissions; transfer it through a trusted channel and run `vbuff config handoff apply setup.toml`. Unlike the redacted export, a handoff file is sensitive. Run `vbuff ask --json --limit 10 "meeting link"` for bounded local retrieval over clips whose capture policy explicitly permits AI processing; the current engine is local feature hashing, not a generative model.
 
-The hotkey is rebindable in settings, with conflict detection at bind time. The popup opens near the cursor and is clamped to the work area. Recall and copy-only selection are keyboard-driven; final paste remains a manual OS/application action.
+The default hotkey is registered at startup. Live rebinding/conflict repair in Settings and cursor-relative popup placement remain target work; today a bind failure degrades visibly and the window manager controls placement. Recall and copy-only selection are keyboard-driven; final paste remains a manual OS/application action.
 
 > **Automatic paste is not currently enabled.** macOS Accessibility permission is necessary for future Cmd+V synthesis but is not sufficient: vbuff must also confirm the original destination immediately before injection. Until that native adapter and its evidence exist, every platform remains copy-only. Sensitive copy additionally remains blocked whenever OS-history exclusion cannot be proven.
 
@@ -291,16 +291,17 @@ Set `launch_at_login = true` in the config, or use the tray/menu-bar action, to 
 
 ## Roadmap
 
-Phased to ship a usable, private, single-machine clipboard manager first, then depth, then networked and team features. Each phase has explicit exit criteria; see [plan.md](plan.md) for the full milestone breakdown.
+The active roadmap favors evidence over breadth. It first fixes full-history recall, then proves one Windows 11 native vertical, then decides whether measured beta demand justifies expansion. See [plan.md](plan.md) for the gates and [the competitive strategy refresh](docs/competitive-strategy-2026.md) for the 20-review arbitration.
 
 | Phase | Theme | Highlights |
 |---|---|---|
 | **Phase 0 - Foundations** | Scaffolding | Cargo workspace and crate skeleton, the four backend traits with mock backends, schema v1 + migrations, encrypted-store open path, content-hash golden vectors, core engine fully testable headless. |
-| **MVP** | Single machine, the core loop everywhere | copy -> store -> hotkey -> popup -> paste-back, encrypted at rest, on macOS, Windows, X11 and Wayland (wlr-data-control). Capture all flavors, dedup, pin/favorite, substring search-as-you-type, plain/rich paste-back, tray, themes, accessibility tree, MVP snippets, MVP transforms, MVP privacy controls. |
-| **v1** | A power user's daily driver | Files/custom MIME/source-app tagging, total-size + time retention, out-of-row blob CAS, FTS5 indexed search, fuzzy/regex search, tags/collections/pinboards, richer snippets and transforms, master password + idle auto-lock, i18n/RTL/a11y depth, scripting and integrations, and the first networked work: LAN P2P sync with encrypted transport and verified pairing. |
-| **v2** | Across all my devices and my team | Flexible sync transports (relay / user cloud drive), conflict resolution, send-to-device, shareable links and QR handoff, shared team snippet libraries with roles and revocation, in-app updater, distribution polish. |
+| **Slice 0** | Full-history recall | Replace the 1,000-row in-memory ceiling with paged summary queries off the egui frame; retrieve any stored row at 100,000-item scale and hydrate only the selected payload. |
+| **Windows alpha** | Native evidence | Preserve ordered items/flavors/native IDs; add event-driven capture, SQLCipher + OS key lifecycle, distinct history/privacy markers, target reconfirmation, and a narrow app/format matrix. |
+| **Windows beta** | Compounding proof | Publish the app-pair Fidelity Lab, complete clean-install/accessibility/soak evidence, test contextual ranking, and pass the 20-user demand gate. |
+| **Gated expansion** | Only after demand | A second real native adapter precedes any parity claim. Directed handoff precedes ambient sync. MCP, plugins, OCR, generic AI, mobile, and teams remain frozen until separately justified. |
 
-Sync features were tagged early in the raw feature list but depend on a stable single-machine core, so they are sequenced as the first networked work within v1 rather than in the MVP.
+The backlog remains research input, not promised scope. Contract-only sync, plugin, IPC, and update crates are not user features until a live path and their release evidence exist.
 
 ---
 

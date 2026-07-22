@@ -1,0 +1,81 @@
+[
+  {
+    "label": "vbuff: run native (debug)",
+    "command": "cargo",
+    "args": ["run", "-p", "vbuff", "--locked"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_LOG": "vbuff=debug"
+    },
+    "allow_concurrent_runs": false,
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "vbuff: run native (release)",
+    "command": "cargo",
+    "args": ["run", "-p", "vbuff", "--release", "--locked"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUST_LOG": "vbuff=info"
+    },
+    "allow_concurrent_runs": false,
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "vbuff: check workspace",
+    "command": "cargo",
+    "args": [
+      "check",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--locked"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "save": "all"
+  },
+  {
+    "label": "vbuff: test workspace",
+    "command": "cargo",
+    "args": ["test", "--workspace", "--all-features", "--locked"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "save": "all"
+  },
+  {
+    "label": "vbuff: clippy workspace",
+    "command": "cargo",
+    "args": [
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "save": "all"
+  },
+  {
+    "label": "vbuff: format check",
+    "command": "cargo",
+    "args": ["fmt", "--all", "--", "--check"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "save": "all"
+  },
+  {
+    "label": "vbuff: test crate $ZED_CUSTOM_RUST_PACKAGE",
+    "command": "cargo",
+    "args": ["test", "-p", "$ZED_CUSTOM_RUST_PACKAGE", "--locked"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "save": "all"
+  }
+]

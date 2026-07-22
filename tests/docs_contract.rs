@@ -277,13 +277,42 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("Serializable status contracts live in `vbuff-types`"));
     assert!(plan.contains("Bootstrap already landed in the root app"));
     assert!(plan.contains("native hook re-subscribe/auto-restart"));
-    assert!(plan.contains("M6 -> M7 data-contract gate"));
+    assert!(plan.contains("M6 -> post-beta contract gate"));
     assert!(plan.contains("Unknown` is a release blocker"));
     assert!(plan.contains("docs/ideas-601-610.md"));
     assert!(plan.contains("docs/ideas-611-620.md"));
     assert!(plan.contains("docs/decision-gates-251-300.md"));
     assert!(plan.contains("docs/decision-gates-301-350.md"));
     assert!(plan.contains("docs/data-contract-v3.md"));
+}
+
+#[test]
+fn competitive_strategy_priorities_stay_synchronized() {
+    let readme = read("README.md");
+    assert!(readme.contains("| **Slice 0** | Full-history recall |"));
+    assert!(readme.contains("| **Windows alpha** | Native evidence |"));
+    assert!(readme.contains("| **Gated expansion** | Only after demand |"));
+
+    let architecture = read("architecture.md");
+    assert!(architecture.contains("### Phase 1 - Full-history recall"));
+    assert!(architecture.contains("### Phase 2 - Verifiable Windows 11 alpha"));
+    assert!(architecture.contains("### Phase 4 - Gated expansion"));
+
+    let recommendation = read("recommendation.md");
+    assert!(recommendation.contains("connect egui to paged full-history retrieval"));
+    assert!(recommendation.contains("prove one narrow Windows 11 native vertical"));
+    assert!(recommendation.contains("Generic OCR, LLM rewrite palettes"));
+
+    let plan = read("plan.md");
+    assert!(plan.contains("### M6 - Windows evidence beta"));
+    assert!(plan.contains("### M9 - Explicit LAN handoff"));
+    assert!(plan.contains("### M11 - Gated expansion"));
+
+    let strategy = read("docs/competitive-strategy-2026.md");
+    assert!(strategy.contains("## Final arbitration: what to implement"));
+    assert!(strategy.contains("**Full-history retrieval first.**"));
+    assert!(strategy.contains("**One verifiable Windows 11 alpha.**"));
+    assert!(strategy.contains("**Publish the app-pair Fidelity Lab"));
 }
 
 #[test]

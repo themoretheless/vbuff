@@ -1,0 +1,29 @@
+{
+  "languages": {
+    "Rust": {
+      "format_on_save": "on",
+      "formatter": "language_server",
+      "hard_tabs": false,
+      "tab_size": 4
+    },
+    "Markdown": {
+      "format_on_save": "off",
+      "soft_wrap": "preferred_line_length"
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "features": "all"
+        },
+        "check": {
+          "allTargets": true,
+          "command": "clippy",
+          "extraArgs": ["--locked"],
+          "features": "all"
+        }
+      }
+    }
+  }
+}

@@ -49,7 +49,7 @@ The target system remains durable searchable history with SQLCipher at-rest encr
         │  OS clipboard   │   │ Watcher thread│   (Win: WM_CLIPBOARDUPDATE event           │
         │  changes        │   │  Clipboard_   │    macOS: changeCount poll ~250ms          │
         ▼                 │   │  Backend      │    X11: XFIXES selection-notify            │
-   OS clipboard ──────────┼──►│  .subscribe   │    Wayland: wlr-data-control)              │
+   OS clipboard ──────────┼──►│  .subscribe   │    Wayland: ext-data-control; legacy wlr)  │
                           │   └──────┬────────┘                                            │
                           │          │ 1. debounce burst -> one capture                    │
                           │          │ 2. CAPTURE GATE (fail-closed):                      │
@@ -67,8 +67,8 @@ The target system remains durable searchable history with SQLCipher at-rest encr
                           │   │ vbuff-store   │  blob spill >256KiB to encrypted CAS;       │
                           │   │ SQLite+SQLCipher│ count/size/time eviction (pins exempt);   │
                           │   │  (1 writer)   │  thumbnails ─────► StoreEvent::Inserted ────┼──► vbuff-sync
-                          │   └──────┬────────┘                                            │    (opt-in LAN P2P,
-                          │          │ reads via WAL snapshot (r2d2 read pool)             │     Noise/TLS, mDNS)
+                          │   └──────┬────────┘                                            │    (future explicit handoff;
+                          │          │ reads via WAL snapshot (r2d2 read pool)             │     frozen before native beta)
                           │          │                                                     │
    [ USER presses ]       │   ┌──────▼────────┐                                            │
    [ global hotkey ]──────┼──►│ HotkeyBackend │ 1. PasteBackend.capture_focus() FIRST      │
@@ -197,7 +197,7 @@ vbuff/
 │   ├── vbuff-gui/             # eframe app: popup + settings viewports. Depends on core+store+platform.
 │   ├── vbuff-ipc/             # framed protocol (serde) over UDS/named-pipe; client + server.
 │   ├── vbuff-plugin/          # Native pipe protocol, manifests, transforms, adapters, signed bundles.
-│   ├── vbuff-sync/            # mDNS discovery, Noise/TLS transport, pairing, replication (LAN P2P).
+│   ├── vbuff-sync/            # Contract-only identity/crypto/policy; explicit handoff before replication.
 │   ├── vbuff-update/          # signed update manifests, build attestations, checksum verification.
 │   └── vbuff-cli/             # `vbuff` verbs; pure IPC client. shell completions, --json.
 └── src/main.rs                # the single binary: role dispatch (daemon vs forward vs cli verb).
@@ -279,7 +279,7 @@ Current extraction status:
 8. **Done:** the root process performs bind-or-forward before opening storage or registering a hotkey; an OS-released owner lock serializes recovery, a second launch forwards `ShowPopup`, `Ping` proves liveness, and a stale endpoint is removed and rebound once.
 9. **Done/foundation:** schema v7 owns FTS5 prose/code indexes, structured facets, SimHash/dHash plus normalized text groups, keyset search, Bloom-assisted exact dedup, transactional refcounted CAS, per-kind/collection retention, lifecycle annotations, backup-evidence metadata, import/blob quarantine, versioned export, legal hold, externally keyed grace-record primitives, expiry, content audits, and eligible local embeddings. The live database remains unencrypted. Migration safety copies are temporary and removed after a successful verification; neither they nor backup-evidence metadata constitute a durable backup service.
 10. **Done:** hotkey, tray, and second-instance events wake egui directly; a five-second supervisory repaint replaces the former 100 ms resident poll, while the visible popup uses a one-second refresh for expiry and capture state instead of repainting every frame.
-11. **Foundation:** `vbuff-sync` now has tested protocol/crypto and focused device-experience modules for trust/rehearsal/replay, revocation, conflict timelines, outbox, bandwidth/retention, travel/handoff, and approvals, while transport, persistence, pairing UI, and runtime integration remain M9 work.
+11. **Frozen foundation:** `vbuff-sync` has tested protocol/crypto and focused device-experience modules, but no transport, persistent authenticated identity lifecycle, pairing UI, or runtime integration. It remains inactive until the first native beta passes demand gates; if resumed, one explicit TTL-bound handoff precedes replication.
 12. **Done:** tiered capture supervision, byte-aware backpressure, RSS-aware maintenance, secret detection/clawback, doctor output, process hardening, strict posture, FTS health, and atomic store batches are active in the current root runtime.
 13. **Foundation:** `vbuff-ipc` and `vbuff-plugin` own bounded browser/editor/Vim/automation/MCP/launcher/terminal/webhook and import/export contracts, but no daemon listener, local HTTP server, signed client, plugin-process host, OS sandbox, or third-party execution is enabled. The executable plugin protocol remains contract-only and release-gated.
 14. **Done/foundation:** the popup owns golden-tested History/Stack/Privacy/Settings surfaces; feedback opens only a redacted draft; the local Stack is ephemeral; `vbuff-update` owns signed release contracts; config/ask/verify remain narrow root adapters.
@@ -294,16 +294,21 @@ The current startup transport is deliberately smaller than the target IPC servic
 ### Core data model
 
 ```rust
-/// One logical copy event. Holds EVERY simultaneous flavor.
+/// One logical copy event. Preserves item order and every simultaneous flavor.
 pub struct Clip {
     pub id: ClipId,                 // ULID: sortable by creation time, sync-friendly
-    pub flavors: Vec<Flavor>,       // text/plain, text/html, RTF, image/png, uri-list, custom MIME...
+    pub items: Vec<ClipboardItem>,  // item boundaries are part of the clipboard contract
     pub primary_kind: ContentKind,  // detected type for icon/filter (Text/Url/Color/Code/Image/File...)
-    pub content_hash: [u8; 32],     // BLAKE3 over canonicalized flavor set -> dedup key
+    pub content_hash: [u8; 32],     // BLAKE3 over canonicalized item/flavor topology -> dedup key
     pub meta: ClipMeta,
     pub pinned: bool,
     pub favorite: bool,
     pub permanent: bool,            // promoted out of the ephemeral/auto-prune pool
+}
+
+pub struct ClipboardItem {
+    pub ordinal: u32,
+    pub flavors: Vec<Flavor>,       // text/plain, text/html, RTF, image/png, uri-list, custom MIME...
 }
 
 pub struct Flavor {
@@ -322,7 +327,7 @@ pub struct ClipMeta {
 }
 ```
 
-`content_hash` is the dedup pivot, computed over the **canonical flavor set** (sorted MIME, raw bytes, byte-for-byte, no normalization). Re-copying identical content matches the hash -> the existing row's timestamp is bumped and it moves to top instead of inserting a duplicate.
+`content_hash` is the dedup pivot, computed over the **canonical clipboard topology**: ordered item boundaries plus each item's MIME-sorted raw flavors, byte-for-byte, with no text normalization. Re-copying identical topology matches the hash -> the existing row's timestamp is bumped and it moves to top instead of inserting a duplicate. The current Rust type remains a flat `Vec<Flavor>`; migration to this target model is part of the native fidelity gate and must happen before claiming multi-item losslessness.
 
 ### The four cross-platform backend traits
 
@@ -333,7 +338,7 @@ All platform variance is funneled through four traits in `vbuff-platform`. The d
 pub trait ClipboardBackend: Send {
     fn subscribe(&self, sink: Sender<ClipboardEvent>) -> Result<Subscription>;
     fn read_all(&self) -> Result<CapturedClipboard>;       // every flavor, byte-for-byte
-    fn write(&self, flavors: &[Flavor]) -> Result<()>;     // for paste-back
+    fn write(&self, items: &[ClipboardItem]) -> Result<()>; // for paste-back
     fn is_concealed(&self) -> bool;                        // skip capture if true
 }
 
@@ -380,9 +385,9 @@ Each trait has one concrete impl per platform, chosen at **compile time** via a 
 pub fn backends() -> Result<Backends> {
     match detect_session() {
         Session::Wayland => {
-            let caps = probe_wayland();           // wlr-data-control? virtual-keyboard? portal?
+            let caps = probe_wayland();           // ext/wlr data-control? virtual-keyboard? portal?
             Ok(Backends {
-                clipboard: wayland::clipboard(caps)?,   // wlr-data-control, else clipboard-only fallback
+                clipboard: wayland::clipboard(caps)?,   // ext-data-control, legacy wlr, or visible fallback
                 hotkey:    wayland::hotkey(caps)?,       // GlobalShortcuts xdg-desktop-portal
                 paste:     wayland::paste(caps)?,        // virtual-keyboard / wtype, else set-and-let-user-paste
                 tray:      linux::tray()?,               // StatusNotifierItem (shared X11/Wayland)
@@ -404,7 +409,7 @@ The dual-compile means the Linux build links both X11 and Wayland client libs. T
 
 | Trait | macOS | Windows | Linux/X11 | Linux/Wayland |
 |---|---|---|---|---|
-| Clipboard | `NSPasteboard` changeCount **polling** (~150-250 ms; no OS callback) | `AddClipboardFormatListener` -> `WM_CLIPBOARDUPDATE` (event-driven) | own/observe `CLIPBOARD` selection via XFIXES, request `TARGETS`; manager handoff | `wlr-data-control` (wl-clipboard); documented fallback if compositor lacks it |
+| Clipboard | `NSPasteboard` changeCount **polling** (~150-250 ms; no OS callback) | `AddClipboardFormatListener` -> `WM_CLIPBOARDUPDATE` (event-driven) | own/observe `CLIPBOARD` selection via XFIXES, request `TARGETS`; manager handoff | `ext-data-control-v1` when advertised; deprecated `wlr-data-control` fallback; visible degraded mode otherwise |
 | Hotkey | Carbon `RegisterEventHotKey` (or `CGEventTap`) | Win32 `RegisterHotKey` | `XGrabKey` | `GlobalShortcuts` portal (compositors block raw grabs) |
 | Paste | restore focus + `CGEvent` Cmd+V; needs Accessibility (`AXIsProcessTrusted`) | `SetForegroundWindow` + `SendInput` Ctrl+V | `XTEST` Ctrl+V | `virtual-keyboard`/`wtype`/`ydotool`, else set-and-let-user-paste |
 | Tray | `NSStatusItem` (menu bar) | `Shell_NotifyIcon` | `StatusNotifierItem`/AppIndicator (XEmbed fallback) | same SNI |
@@ -427,7 +432,7 @@ This subsystem observes the OS clipboard, reads every flavor of a copy, attribut
 
 ### Design goals and constraints
 
-- **Event-driven where the OS allows it, polling only where it does not.** Windows and Wayland (wlr-data-control) give real change notifications; macOS gives none (poll `changeCount`); X11 is a hybrid (XFIXES selection-notify events, complicated by ownership semantics).
+- **Event-driven where the OS allows it, polling only where it does not.** Windows and supported Wayland data-control implementations give real change notifications; macOS gives none (poll `changeCount`); X11 is a hybrid (XFIXES selection-notify events, complicated by ownership semantics). Polling can detect a `changeCount` jump but cannot reconstruct overwritten intermediate payloads, so the product reports gaps instead of promising universal zero loss.
 - **Capture all flavors atomically.** A single copy offering HTML + RTF + plain text + image is read in one pass and stored under one item. This rules out `arboard` as the primary backend.
 - **Byte-for-byte fidelity.** No newline normalization, no re-encoding, no whitespace trimming at the capture layer.
 - **Honor sensitivity hints before storage.** Concealed markers, secure-input flags, and excluded apps are checked *before* the payload is persisted or fully read into long-lived memory.
@@ -461,12 +466,13 @@ pub struct Sensitivity {
     pub concealed: bool,        // org.nspasteboard.ConcealedType, Wayland sensitive
     pub exclude_history: bool,  // Win ExcludeClipboardContentFromMonitorProcessing
     pub transient: bool,        // Win CanIncludeInClipboardHistory == false-ish
+    pub exclude_cloud_sync: bool, // Win CanUploadToCloudClipboard == false
 }
 
 pub struct CaptureEvent {
     pub seq: u64,               // monotonic per-backend change counter
     pub captured_at: SystemTime,
-    pub flavors: Vec<Flavor>,
+    pub items: Vec<ClipboardItem>, // ordered item boundaries plus every offered flavor
     pub sensitivity: Sensitivity,
     pub source: SourceApp,      // bundle id / exe / WM_CLASS / app-id, name, title, icon
 }
@@ -520,9 +526,9 @@ Fully event-driven. Create a **message-only window** (`HWND_MESSAGE`) on the cap
 
 Specifics:
 - **Format enumeration:** loop `EnumClipboardFormats(0)` + `GetClipboardData` + `GlobalLock`. Map `CF_UNICODETEXT` -> `PlainUtf8` (keep original bytes too for fidelity), `CF_HDROP` -> `FileList`, `CF_DIB`/`CF_DIBV5` -> `Image`. Registered formats by name: `"HTML Format"` (CF_HTML, parse header for fragment offsets), `"Rich Text Format"`, `"PNG"`.
-- **Sensitivity:** honor `ExcludeClipboardContentFromMonitorProcessing` (presence -> skip) and `CanIncludeInClipboardHistory` (0-valued DWORD -> skip). Treat `Clipboard Viewer Ignore` similarly.
+- **Sensitivity:** parse `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard` separately. The first blocks monitor processing, the second excludes local history, and the third excludes cloud upload without necessarily forbidding local capture. Treat `Clipboard Viewer Ignore` as a monitor exclusion. The policy layer, not the format reader, decides whether a marker means skip, local-only, or no-sync.
 - **Self-write loop avoidance:** stamp our own writes with a sentinel registered format (`"vbuffOwnWrite"`) and skip events that carry it. `GetClipboardSequenceNumber()` alone can't distinguish source.
-- **Source app:** `GetForegroundWindow` -> `GetWindowThreadProcessId` -> `QueryFullProcessImageName`; `GetWindowTextW` for title, captured inside the `WM_CLIPBOARDUPDATE` handler before opening the clipboard.
+- **Source app:** start with `GetClipboardOwner`, then resolve its PID and executable. The owner can be `NULL`; only then use `GetForegroundWindow` as a lower-confidence heuristic. Store attribution confidence and never present the fallback as certain provenance.
 
 #### Linux - X11 vs Wayland, detected at runtime
 
@@ -534,9 +540,9 @@ Detect session from `XDG_SESSION_TYPE` (fallback to `WAYLAND_DISPLAY` presence).
 - **Source app:** `_NET_ACTIVE_WINDOW` -> `WM_CLASS` + `_NET_WM_NAME`; resolve icon from the `.desktop` file. Window-class ignore rules use `WM_CLASS`.
 - **Password-manager hints:** no universal flag; detect known target names (e.g. `x-kde-passwordManagerHint`) and treat as concealed.
 
-**Wayland - `wlr-data-control` (primary), portal/`wl-paste` fallback.** Wayland forbids background clipboard snooping for security; a normal client only gets clipboard data while focused. The escape hatch is **`wlr-data-control-unstable-v1`** (wlroots: Sway/Hyprland/river; also KDE Plasma): a privileged data-control manager gets a `selection` event with offered MIME types on every change and `receive`s each type via a pipe - event-driven, all flavors, no focus needed. Specifics:
-- **Capability probing** at startup: check whether `zwlr_data_control_manager_v1` is in the registry.
-- **GNOME fallback:** Mutter historically does **not** implement wlr-data-control and offers no sanctioned background-monitor API. Degrade to **capture-on-summon** (read the clipboard only when the popup opens, since it has focus) plus the manual capture hotkey, and communicate this clearly in UI rather than silently dropping copies. This is a genuine platform limitation.
+**Wayland - `ext-data-control-v1` first, deprecated `wlr-data-control` fallback, explicit unsupported mode.** Wayland forbids background clipboard snooping for ordinary clients. A compositor-advertised data-control manager receives selection events and offered MIME types without foreground focus. Prefer staging `ext-data-control-v1`; bind `wlr-data-control-unstable-v1` only when the newer protocol is absent and the legacy protocol is explicitly advertised. Specifics:
+- **Capability probing** at startup: inspect the registry for the exact data-control protocol and version, then expose that result through `Capabilities`; do not infer support from `WAYLAND_DISPLAY` or the presence of `wl-paste`.
+- **GNOME fallback:** if Mutter exposes neither supported path, degrade to **capture-on-summon** plus manual capture and communicate this clearly in UI rather than silently dropping copies. This is a genuine platform limitation, not a failed promise to hide.
 - **Source app:** Wayland intentionally hides cross-client window info; `app-id`/title are generally **not retrievable** without compositor-specific protocols. Source-app tagging is best-effort and often `None`.
 - **Sensitivity / primary:** honor the same password-manager-hint MIME list as X11; primary selection is exposed too, with the same noisy-debounce treatment.
 
@@ -813,10 +819,10 @@ The schema is identical across platforms; what varies is the bytes that arrive, 
 |---|---|---|---|---|
 | Default DB path | `~/Library/Application Support/vbuff/vbuff.db` | `%APPDATA%\vbuff\vbuff.db` | `$XDG_DATA_HOME/vbuff/vbuff.db` | same as X11 |
 | `flavor.os_format` | UTIs (`public.utf8-plain-text`, `public.html`, `public.png`, `public.file-url`) | `CF_UNICODETEXT`, `CF_HTML`, `CF_DIB`/`PNG`, `CF_HDROP` | X11 targets (`UTF8_STRING`, `text/html`, `image/png`, `text/uri-list`) | Wayland MIME |
-| Concealment -> `secret`/skip | `org.nspasteboard.ConcealedType`, Secure Event Input | `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` | password-manager hint atoms (best-effort) | sensitive flag where supported |
+| Concealment -> `secret`/skip | `org.nspasteboard.ConcealedType`, Secure Event Input | monitor exclusion and local-history exclusion; cloud-upload exclusion remains a distinct no-sync input | password-manager hint atoms (best-effort) | sensitive flag where supported |
 | File clips | file URLs / `NSFilenamesPboardType` | `CF_HDROP` paths | `text/uri-list` | `text/uri-list` |
 | Key store | Keychain | Credential Manager / DPAPI | Secret Service (GNOME Keyring) | Secret Service / KWallet; encrypted-file fallback |
-| Persistence quirk | survives app exit | survives app exit | **selection owner-held**: must take ownership to persist | wlr-data-control needed; else lost on source exit |
+| Persistence quirk | survives app exit | survives app exit | **selection owner-held**: must take ownership to persist | data-control support needed; otherwise only foreground/manual capture is claimed |
 
 Path resolution uses `directories::ProjectDirs`; users can override the location (validated writable, on a filesystem with `rename(2)` atomicity; warn on network/FUSE mounts).
 
@@ -893,7 +899,7 @@ The highest-leverage privacy win: well-behaved password managers already tell us
 | OS | Marker | How we read it |
 |---|---|---|
 | macOS | `org.nspasteboard.ConcealedType`, `...TransientType`, `...AutoGeneratedType` | Enumerate `NSPasteboard.types`; presence -> skip/transient |
-| Windows | `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` | Enumerate formats after `WM_CLIPBOARDUPDATE`; Exclude present or CanInclude=0 -> skip |
+| Windows | `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, `CanUploadToCloudClipboard` | Enumerate after `WM_CLIPBOARDUPDATE`; preserve three distinct decisions: monitor exclusion, local-history exclusion, and cloud-upload exclusion |
 | Linux X11/Wayland | `x-kde-passwordManagerHint` / password-manager hint targets | Present in TARGETS / wlr offers -> skip |
 
 These are conventions, not enforced contracts. Defense in depth: hints are gate #1; secure-field detection, app exclusion, and content/secret rules catch what hints miss. Documented as best-effort.
@@ -902,7 +908,7 @@ These are conventions, not enforced contracts. Defense in depth: hints are gate 
 
 | Capability | macOS | Windows | Linux X11 | Linux Wayland |
 |---|---|---|---|---|
-| Foreground app identity | `NSWorkspace.frontmostApplication` | `GetForegroundWindow`->exe | `_NET_ACTIVE_WINDOW`->`WM_CLASS` | **Not available** to clients |
+| Foreground/source app identity | `NSWorkspace.frontmostApplication` | `GetClipboardOwner`->exe; foreground fallback with lower confidence | `_NET_ACTIVE_WINDOW`->`WM_CLASS` | **Not available** to ordinary clients |
 | Secure input active | `IsSecureEventInputEnabled()` (global) | rely on concealed hint | rely on hints | rely on hints |
 | Private-browsing window | bundle id + title heuristics | title/class heuristics | `WM_CLASS` + title | app-id only, limited |
 
@@ -962,7 +968,7 @@ The principle throughout: **a missing permission degrades a feature, it never bl
 | `objc2`, `objc2-app-kit`, `objc2-foundation` | macOS clipboard/workspace/run-app bindings | Modern, maintained successor to `cocoa`/`objc`; typed `NSPasteboard`/`NSWorkspace`. Avoid unmaintained `cocoa`. |
 | `windows` (windows-rs) | Win32 clipboard listener, `SendInput`, foreground window, DPAPI | First-party bindings covering `AddClipboardFormatListener`, `GetClipboardData`, etc. |
 | `x11rb` (with `xfixes`) | X11 selections + XFIXES selection events | Pure-Rust XCB bindings; safer than `x11-dl`. Needed for INCR transfer and selection ownership. |
-| `wayland-client` + `wayland-protocols-wlr` | Hand-rolled `wlr-data-control` client | Lower-latency, dependency-light. `wl-clipboard` subprocess (`wl-paste --watch`) is the faster-to-ship fallback. |
+| `wayland-client` + generated protocol bindings | `ext-data-control-v1` client with legacy `wlr-data-control` compatibility | Registry-probed, event-driven capture where supported. `wl-clipboard` is useful for bring-up/manual operations but is not evidence that background monitoring works. |
 | `global-hotkey` | Hotkey registration (macOS/Windows/X11) | From the Tauri ecosystem; does **not** cover Wayland. |
 | `ashpd` | Wayland GlobalShortcuts via xdg-desktop-portal | Required because Wayland forbids raw grabs; two code paths on Linux is unavoidable. |
 | `tray-icon` | Tray / menu-bar (NSStatusItem / Shell_NotifyIcon / SNI) | Most-maintained option; SNI path needs a StatusNotifier host, hence the XEmbed fallback caveat. |
@@ -996,7 +1002,7 @@ Crate-maturity claims (`tray-icon` SNI behavior, `global-hotkey` Wayland gap, ex
 | Multi-format writer fires N change events | debounce window after first event | collapse to one capture |
 | X11 INCR large-transfer truncation | INCR chunk reader | accumulate chunks; cap at per-item limit and mark truncated |
 | Owner app exits before we read (X11/Wayland) | selection notify | read immediately on notify; for survival, take selection ownership (X11 persistence role) |
-| GNOME-Wayland, no `wlr-data-control` | capability probe at startup | degrade to capture-on-summon + manual hotkey; surface a one-time explainer |
+| Wayland compositor advertises no supported data-control protocol | capability probe at startup | degrade to capture-on-summon + manual hotkey; surface a persistent capability state and one-time explainer |
 | Self-write feedback loop | sentinel format + own-ownership tracking + short-TTL flag | coalesce window swallows the echo; gate #0 ignores it |
 | macOS Accessibility not granted | `AXIsProcessTrusted()` false | popup works copy-only; banner guides user; paste-back disabled until granted |
 | macOS Secure Input active | `IsSecureEventInputEnabled()` | pause capture + keystroke synthesis, inform user |
@@ -1021,7 +1027,7 @@ Crate-maturity claims (`tray-icon` SNI behavior, `global-hotkey` Wayland gap, ex
 - **`vbuff-core` is the test crown jewel.** Because it depends only on traits, dedup/eviction/retention/redaction/search-ranking are unit- and property-tested (`proptest`) against an in-memory `FakeStore`/`FakeClipboard`. Invariants: pinned items never evicted under any cap; byte-for-byte content survives store->load round-trip (invalid UTF-8, NUL bytes, CRLF, trailing newlines, RTL, emoji, 4-byte codepoints); identical content never produces two rows.
 - **Capture gate** is table-driven: one case per `SkipReason`, plus `Capture+Sensitive`/`Capture+Normal`. A `proptest` invariant asserts that paused/incognito/concealed/secure-input/source-unknown-and-required *always* yields `Skip` (a `Capture` here is a release blocker).
 - **Secret detectors:** corpus tests (Luhn-valid/invalid cards, JWTs, PEM keys, AWS keys -> Sensitive; UUIDs/hashes/prose -> Normal), tracked precision/recall, fail CI on regression.
-- **Crypto:** `seal_blob`/`open_blob` round-trip; one-byte tamper of ciphertext/nonce/tag -> AEAD error; wrong key -> failure not garbage. Master-password wrap/unwrap; wrong password fails; password change preserves DB readability. The **canary-grep at-rest test** writes `CANARY_SECRET`, closes the DB, then greps the raw `.db`/`-wal`/blob files for zero hits - the only test that catches "encryption silently didn't engage." Run on all three platforms.
+- **Crypto:** `seal_blob`/`open_blob` round-trip; one-byte tamper of ciphertext/nonce/tag -> AEAD error; wrong key -> failure not garbage. Master-password wrap/unwrap; wrong password fails; password change preserves DB readability. The **canary-grep at-rest test** writes `CANARY_SECRET`, closes the DB, then scans raw DB/WAL/SHM/CAS/temp/log artifacts for zero hits. Run it on the active Windows release lane and repeat it independently for every later promoted native adapter.
 - **Backend trait conformance suite:** a shared `#[test]` battery parameterized over any `ClipboardBackend`/`PasteBackend` impl, plus a `MockBackend` emitting scripted `CaptureEvent`s to drive daemon policy with zero OS deps. Run per-OS in a CI matrix (macOS, Windows, Ubuntu-X11 via `Xvfb`, Ubuntu-Wayland via headless `sway`).
 - **Format mapping:** table-driven round-trip of UTI/CF_*/MIME <-> `FormatKey`, the CF_HTML header parser, and unknown->`Custom` preservation.
 - **Store:** migrations forward-apply on checked-in fixture DBs from each prior schema version; WAL crash-recovery by SIGKILL mid-transaction then assert last committed clip present + `integrity_check`; disk-full via a small loopback/quota FS; FTS5 latency benchmarked at 50k rows (target < 8 ms for the SQL+map step). FTS correctness: diacritic folding, case-insensitivity, prefix matching, CJK tokenization, `highlight()` offset alignment.
@@ -1043,50 +1049,46 @@ Phased to deliver a usable, private, single-machine clipboard manager first, the
 - `vbuff-core` engine with dedup/eviction/capture-gate against fakes; the full `proptest` byte-fidelity + fail-closed suites.
 - **Exit:** core logic is fully testable headless on any host; `vbuff` runs as a no-op daemon with single-instance guard.
 
-### Phase 1 - MVP (single machine, the core loop works on all platforms)
+### Phase 1 - Full-history recall (first implementation slice)
 
-Milestone: **"copy -> store -> hotkey -> popup -> paste-back" works end-to-end, encrypted, on macOS, Windows, X11, and Wayland-with-wlr-data-control.**
+Milestone: **every stored clip is reachable without loading the history into the egui frame.**
 
-- **Capture:** event-driven Windows + Wayland(wlr), polling macOS, XFIXES X11; capture all flavors (plain/RTF/HTML/image), byte-for-byte; debounce; dedup-by-hash + move-to-top; concealed-flag honoring; app blacklist; pause/resume; incognito; autostart-on-login; capture daemon on a dedicated thread.
-- **Store:** SQLite + SQLCipher at rest, key in OS keychain; FIFO count cap (configurable) with pin/permanent exemption; most-recent-first; per-item timestamp; cross-platform default paths; restore session on launch; clear-all (pin-protected) + delete-item; transactional-per-capture durability.
-- **Search:** substring search-as-you-type with live highlight, no-match feedback, type-chip filter, pinned/favorites filter, recency default, keyboard navigation. (FTS schema present, substring is the shipped tier.)
-- **Paste:** paste-back into prior focus (macOS CGEvent, Windows SendInput, X11 XTEST); Enter / double-click / number-key / copy-only; plain vs keep-formatting; fully keyboard-driven.
-- **UI:** egui popup near cursor, clamped to work area; tray/menu-bar item; scrollable list; dark/light themes; type icons; image thumbnails; empty/no-results state; pinned/favorite badges; dismiss on focus-loss/Escape; full keyboard nav; screen-reader tree (accesskit); DPI scaling.
-- **Hotkeys:** global summon + rebind; arrow nav (Home/End); Enter to paste; type-to-filter; Escape to dismiss.
-- **Organization:** pin-to-top, star favorite, persistent-vs-ephemeral, promote-to-permanent, type filter, pin-protected-from-clear.
-- **Snippets (MVP set):** saved snippets, abbreviation expansion, insert-by-hotkey, search-in-popup, folders, built-in editor, date/time placeholders, promote-clip-to-snippet.
-- **Transformations (MVP set):** change case, trim whitespace, strip formatting, paste-as-plain one-shot, literal find&replace, quick-action palette.
-- **Security/privacy (MVP set):** encrypt-at-rest, skip password fields, honor concealed markers, per-app exclusion, incognito, auto-clear-on-timer, wipe-on-demand, local-by-default, zero telemetry.
-- **CLI/integration (MVP set):** `vbuff` CLI (list/get/copy/add/search/delete), stdin/stdout piping, daemon control socket.
-- **Settings (MVP set):** preferences window, launch-at-login, start-minimized, retention limits, hotkey editor with conflict detection, onboarding/permissions flow.
-- **Platform (MVP set):** all per-OS paste-back, hotkey registration, capture monitoring, tray UI, macOS Accessibility request, X11-vs-Wayland auto-detect.
-- **Exit:** the consolidated MVP feature set passes the per-OS CI matrix; canary-grep at-rest test green on all three platforms; cold-start hotkey live < a few hundred ms.
+- Add one `HistoryQuery { query, facets, cursor, limit } -> HistoryPage` boundary that returns row summaries, not hydrated payloads.
+- Query SQLite/FTS off the egui thread, cancel stale generations, keyset-page results, and merge the bounded process-only lane into the projection without persisting it.
+- Hydrate only the selected item for preview or delivery. Keep the current design tokens, stable row geometry, keyboard navigation, and typed health/evidence states.
+- Benchmark the actual popup path against 100,000 rows; include a regression case that retrieves an item older than the first 1,000.
+- **Exit:** p95 first results <= 50 ms, warm interactive p99 <= 16 ms, no full-table hydration, and ten idle repaint cycles cause zero projection rebuilds.
 
-### Phase 2 - v1 (depth, polish, robustness)
+### Phase 2 - Verifiable Windows 11 alpha
 
-Milestone: **"a power user's daily driver"** - rich types, deep search, organization, scripting, hardened privacy, and crash-safety guarantees.
+Milestone: **the copy -> store -> find -> deliver loop is encrypted and evidence-backed on one declared Windows 11 x86-64 session class.**
 
-- **Capture/types:** files/folders, custom MIME byte-for-byte, source-app tagging (where the OS allows), full capture metadata, secure-input skip, regex/keyword exclusion, whitespace skip/trim, per-item size limit, manual capture hotkey, content-type detection/labeling (URL/email/color/code/path), PRIMARY-selection capture + sync/separation toggle.
-- **Store/perf:** total-size cap, time + sensitive-fast-path retention, out-of-row blob CAS, thumbnails, list virtualization, FTS5 indexed search switched on, unlimited mode, move-re-copied-to-top, per-item/total/sensitive caps, configurable storage location, backup/restore, WAL crash recovery, schema migration on upgrade, JSON/CSV export, cold-start optimization, owner-contention handling, single-instance handoff hardening.
-- **Search:** fuzzy, regex, FTS relevance ranking, filter by app/date/tag/status/collection, active-filter chips, diacritic normalization, collection-scoped search.
-- **Paste:** plain/rich default + modifier override, keystroke fallback, terminal-safe combo, paste-stack, FIFO multi-paste, merge, paste-and-delete, drag-and-drop, tray-paste, restore-clipboard-after-paste.
-- **Organization:** tags, folders/collections, named tabs, pinboards, color-code, notes, custom display name, manual drag reorder, numbered quick-slots, multi-select bulk organize, sort controls, pinned-top region, pin-expiry override, move-between-collections, smart duplicate-merge.
-- **Snippets:** cursor placeholder, clipboard token, fill-in fields + pop-up forms, rich-text snippets, word-boundary/case propagation, emoji/special-char catalog, built-in library, file/cloud-folder sync, pause-expansion.
-- **Transformations:** programmer-case convert, regex find&replace, base64/URL encode-decode, JSON pretty-print, run-shell-command, custom command library, append/combine, sort/dedup lines, bind hotkeys to transformations.
-- **Security/privacy:** regex/keyword exclusion, secret auto-detect/tag, master password, quick PIN, idle auto-lock, OTP exclusion, sensitive-type retention cap, locked collections, confirm-before-clear, clear-on-exit, key-in-OS-keychain hardening, masked sensitive clips, private-browsing exclusion.
-- **UI/i18n/a11y:** follow-OS-theme, per-type row styling, full preview pane, density toggle, font/size choice, resizable + remembered window, multi-monitor placement, HiDPI crispness, onboarding tour, hotkey cheat-sheet, screen-reader roles + live announcements, focus traps, high-contrast, reduced-motion, RTL mirroring + BiDi (cosmic-text layer), localization + locale formatting + complex-script shaping.
-- **Integration/settings/platform:** `--json`/NUL output, external pickers, `vbuff://`, run-commands-on-match, custom-command library, event stream (`vbuff watch`), AppleScript / PowerShell / D-Bus, importers, config file + hot-reload, shell completions + man pages, per-OS notifications, OS credential stores, concealed-flag handling, per-OS UTI/CF mapping, native file-paste semantics, Secure-Input detection, per-OS autostart, Wayland capability detection + Wayland paste-back, clipboard-persistence daemon, window-class ignore rules, DPI awareness, sandbox/hardened-runtime packaging + native installers.
-- **Sync foundation (MVP-priority sync features land here as v1 work):** mDNS device discovery, LAN P2P replication, in-transit encryption (Noise/TLS), device-list management, pairing with verification code, auto-sync-on-copy. (These were tagged MVP in the feature list but depend on the entire single-machine stack being stable; they are sequenced first within the networked work.)
-- **Exit:** full v1 feature set; benchmarks hold sub-frame search at 100k items; LAN sync round-trips a clip between two paired devices with verified pairing and encrypted transport.
+- Replace the flattened clip representation with `ClipboardSnapshot -> ClipboardItem[] -> Flavor[]`, preserving order, native format IDs, realization state, generation evidence, and canonical source bytes.
+- Implement `WM_CLIPBOARDUPDATE`, sequence-gap accounting, owner evidence, bounded format enumeration, exact writes, and separate monitor/history/cloud policy markers. The generic `arboard` path remains an explicitly degraded fallback, never native proof.
+- Wire SQLCipher to Credential Manager/DPAPI key lifecycle and scan DB/WAL/SHM/CAS/temp/log artifacts for plaintext canaries.
+- Capture the target before opening the picker, reconfirm it immediately before `SendInput`, and expose independent `Staged`, `TargetConfirmed`, `InjectionSent`, and integration-only `ApplicationAcknowledged` states. Elevated, changed, or otherwise unproven targets are copy-only.
+- Keep the initial app/format matrix narrow: representative browser, IDE, terminal, and Office routes for text and CF_HTML. RDP, elevated targets, images, files, custom formats, and sensitive paste remain unsupported until their own rows pass.
+- **Exit:** 10,000 observed edges are stored exactly once or explicitly gap-accounted; each supported format passes 1,000 canonical round trips; zero wrong-target injections; zero durable canary hits; and 14 days of sole-manager dogfood produce no silent observed-state loss.
 
-### Phase 3 - v2 (networked breadth, collaboration, team)
+### Phase 3 - Fidelity and contextual-recall beta
 
-Milestone: **"works across all my devices and my team"** - flexible sync transports, conflict resolution, sharing, and collaboration.
+Milestone: **publish compatibility evidence that compounds, then prove contextual recall beats text-only search.**
 
-- **Sync:** auto-vs-manual toggle, push-single-item, send-to-specific-device, E2E encryption of payloads, optional cloud relay, user-cloud-drive transport, conflict resolution (Lamport + LWW), per-content-type selection, per-item/source sync exclusion, sync pinned/favorites.
-- **Collaboration/sharing:** shareable clip link, QR display, send-to-paired-device, export-selected-to-file, paste-into-chat-app, send-to-contact, shared team snippet library, role-based permissions, subscribe-by-URL, invite members, share history/audit log, link expiry + revoke, drop-into-folder-sync-target, email clips, import shared clip pack.
-- **Settings/distribution polish:** export/import config, reset-to-defaults, in-app updater, opt-in telemetry, theme/accent/density, popup layout config, language selection, sound/notification toggles, scheduled clearing, multi-platform installers with settings migration.
-- **Exit:** off-LAN sync via relay/cloud-drive with E2E encryption and deterministic conflict resolution; team shared library with roles, expiry, and revocation.
+- Turn `format-fidelity-v1` into a public, versioned app-pair corpus and generated support matrix. A supported row permits no silent downgrade; unsupported routes degrade visibly.
+- Add encrypted source/time/session metadata, deterministic facets, surrounding-copy navigation, and a labeled ranking benchmark. Contextual ranking ships only with at least a 20% accepted top-three lift across 200 labeled retrievals.
+- Add dry-run importers for Maccy, CopyQ, Ditto, and PasteBar through safe exports or snapshots, with a machine-readable loss manifest.
+- Complete Windows packaging/signing, bootstrap recovery, autostart verification, keyboard-only workflows, text scaling, and screen-reader evidence. AccessKit roles and image goldens are foundations, not assistive-technology proof.
+- **Exit:** the Windows beta passes its engineering gates and a demand gate: 20 target users, 12 activating without docs, 8 using vbuff four days per week after 30 days, and 5 willing to pay at least USD 25.
+
+### Phase 4 - Gated expansion
+
+No expansion item is implied by the beta roadmap. Promote work only after the Phase 3 demand gate:
+
+- A second real native adapter must pass the same conformance and app-pair evidence before any cross-platform parity claim. Choose the OS from observed demand, not abstraction convenience.
+- Extract daemon/IPC only when a second live client needs it; protocol contracts alone are not shipped integration.
+- If device transfer is demanded, prove one explicit authenticated, TTL-bound, non-sensitive text handoff with replay protection and a signed receipt before ambient replication, CRDT, relay, or cloud-drive work.
+- Keep MCP, plugin execution, remote automation, OCR, generic AI actions, ambient sync, mobile peers, and team collaboration frozen until a paid native beta supplies a narrower use case and an owner for its security boundary.
+- **Exit:** each promoted capability has its own measurable gate. There is deliberately no pre-committed "all platforms plus sync" completion claim.
 
 ---
 
@@ -1094,11 +1096,11 @@ Milestone: **"works across all my devices and my team"** - flexible sync transpo
 
 | Risk | Likelihood / Impact | Mitigation |
 |---|---|---|
-| **GNOME-Wayland has no sanctioned background clipboard monitor** (no wlr-data-control) | High / High - a large Linux user segment | Degrade to capture-on-summon + manual hotkey; capability-probe at startup; honest UI explainer and capability badges. Document as a platform limitation, not a bug. Track GNOME extension/portal progress. |
+| **A Wayland compositor advertises no supported background data-control protocol** (currently including important Mutter configurations) | High / High - a large Linux user segment | Probe `ext-data-control-v1` and legacy `wlr-data-control` exactly; degrade to capture-on-summon + manual hotkey; show an honest capability state. Track compositor and portal progress without claiming generic Wayland parity. |
 | **Wayland hides foreground-app identity** -> per-app exclusion and private-browser skip can't function | High / Medium | Fail-closed where required is configurable; show per-platform capability badges so users aren't lulled into false safety; content/regex/secret rules still work and are surfaced as the active protection. |
 | **egui's weak BiDi/complex-script shaping** blocks RTL/CJK/Indic users at launch | Medium / High for affected locales | Commit to a `cosmic-text` galley layer for clip *content* from v1; keep iced as the documented escape hatch if fidelity remains insufficient. |
 | **Crate-maturity assumptions wrong** (`tray-icon` SNI, `global-hotkey` Wayland gap, `keyring` v3, SQLCipher PRAGMA defaults, objc2/windows-rs signatures) | Medium / Medium | Verify every platform crate against pinned versions in a Phase-0 spike before locking the stack; the trait boundaries make swapping an impl cheap. |
-| **Encryption silently not engaged** (wrong PRAGMA, fallback to plain SQLite, blob written before sealing) | Low / Critical | Canary-grep at-rest test on all three platforms in CI; pin cipher params explicitly in a config record; treat a canary hit as a release blocker. |
+| **Encryption silently not engaged** (wrong PRAGMA, fallback to plain SQLite, blob written before sealing) | Low / Critical | Whole-artifact canary scan on Windows and each independently promoted native adapter; pin cipher params explicitly in a config record; treat any hit as a release blocker. |
 | **Sensitive content leaks** because a source app sets no concealed hint | Medium / High | Defense in depth: hints + secure-field detection + app exclusion + built-in secret detectors + regex rules + incognito; sensitive items get masked display, shorter retention, and sync exclusion. |
 | **Clipboard-owner contention / hangs** stall the watcher | Medium / Medium | Bounded retry with exponential backoff and timeouts; drop the generation rather than block; never hold the watcher loop. |
 | **Self-write feedback loop** re-captures our own paste (or a restored sensitive clip) | High if unhandled / Medium | Sentinel format + own-ownership tracking + short-TTL content-hash flag; debounce window swallows the echo; gate #0 ignores tagged writes. |
@@ -1118,9 +1120,9 @@ Note on sourcing: this prompt referenced a pitfalls JSON (with `pitfallsExec` / 
 
 | # | Competitor mistake (who) | vbuff design decision | Crate(s) | Safeguard / enforcing test |
 |---|---|---|---|---|
-| 1 | Fixed-interval polling misses fast copies and burns CPU/battery (Maccy, CopyClip, CopyQ, Win+V) | Subscribe to native change events: `AddClipboardFormatListener`/`WM_CLIPBOARDUPDATE` (Windows), `wlr-data-control`/`ext-data-control` selection events + X11 `XFIXES SelectionNotify` (Linux); poll only `changeCount` integer on macOS with adaptive idle backoff | `vbuff-platform` | Idle-CPU near 0% over a multi-day session; rapid-copy test fires N copies, asserts N entries (no misses) |
+| 1 | Fixed-interval polling can miss fast copies and burns CPU/battery | Subscribe to native change events: `AddClipboardFormatListener`/`WM_CLIPBOARDUPDATE` (Windows), `ext-data-control-v1` with legacy `wlr-data-control` fallback plus X11 `XFIXES SelectionNotify` (Linux); poll only `changeCount` on macOS with adaptive idle backoff | `vbuff-platform` | Idle CPU near 0% over a multi-day session; event-driven backends assert N generated edges -> N entries, while polling backends assert every observed state and every detectable counter gap is accounted for |
 | 2 | macOS apps re-read full pasteboard every tick, stalling the source app (Maccy) | On each tick read ONLY the integer `changeCount`; read actual content exactly once, only when `changeCount` incremented | `vbuff-platform` (macOS backend) | Source-app re-render not triggered on idle ticks; content read counted == change-edge count in test |
-| 3 | Missing copies during rapid successive copying (CopyClip, Maccy, Win+V, CopyQ) | Capture synchronously inside the event handler, enqueue, persist on a separate worker so the capture path never blocks and never debounces distinct edges | `vbuff-platform` → `vbuff-store` async write queue | Zero-loss capture metric: tight-loop N-copy test (text and images) yields exactly N distinct entries on every platform |
+| 3 | Missing copies during rapid successive copying | Capture synchronously inside event-driven handlers, enqueue, and persist on a separate worker; on polling APIs, compare sequence counters and record gaps that cannot be reconstructed | `vbuff-platform` -> `vbuff-store` async write queue | Capture-observability metric: exact N-edge recovery on event-driven backends; no silent gap, false recovery, or duplicate claim on polling backends |
 | 4 | Clip lost when source window closes on Wayland/X11 - the single most-reported Linux frustration (X11/Wayland core, GPaste, Klipper, Diodon, Clipman, CopyQ) | Eagerly materialize all offered MIME types into vbuff's own store the instant a selection event fires; on X11 take ownership / cache bytes immediately. vbuff IS the persistence helper (built-in wl-clip-persist behavior) | `vbuff-platform` (Linux backend) → `vbuff-store` | Test: copy, close source app on Wayland and X11, assert clip still pasteable |
 | 5 | Relying on a compositor protocol GNOME Mutter refuses to implement -> empty history on GNOME Wayland (cliphist, clipman, wl-clipboard) | Detect compositor capability at startup; fall back gracefully (portal / shell-extension bridge / XWayland-scoped) and surface what is and isn't captured. Never fake capability (non-goal) | `vbuff-platform`, surfaced by `vbuff-daemon` health | Startup capability probe; visible "capturing / paused / unsupported on this compositor" status |
 | 6 | Capture only runs while the UI window is open / dies on XWayland window close (CopyQ, cliphist, GPaste) | Capture runs in a supervised always-on daemon decoupled from any UI window; a dedicated hidden persistent selection/message window keeps X11 capture alive | `vbuff-daemon` (owns listener + heartbeat) | Test: close all UI windows, copy, assert capture continues; watchdog re-registers OS hooks |
@@ -1144,7 +1146,7 @@ Note on sourcing: this prompt referenced a pitfalls JSON (with `pitfallsExec` / 
 | 24 | No source-app attribution, so trust rules and leak audits are impossible (Diodon, GPaste, Klipper) | Record owner/foreground app at capture (bundle id on macOS, owner PID -> executable on Windows, data-source client on Wayland where exposed); mark "unknown" explicitly where the compositor cannot attribute rather than guessing | `vbuff-platform` + `vbuff-store` (indexed metadata) | Per-clip source stored and filterable; Wayland-unknown case asserted as explicit, not silently "safe" |
 | 25 | X11/Wayland/XWayland clipboard split not bridged, missing copies from the other world (Diodon, CopyQ) | Watch the Wayland selection (data-control) and the X11/XWayland selection (XFIXES) simultaneously, dedup across them by content fingerprint, and offer items into whichever world the paste target lives in | `vbuff-platform` (Linux backend) | Cross-world test: copy in a Wayland-native app, paste in an XWayland app and vice versa, with no duplicate entry |
 
-Cross-cutting guarantees that back the table: the behavioral test suite runs identically on macOS, Windows, and Linux (X11 and Wayland) to enforce cross-platform parity; `vbuff-core` holds all dedup/fingerprint/retention/concealment policy as pure, fully unit-testable logic with no I/O; and `vbuff-daemon` always exposes a visible capture-health state so that the single worst category failure - silent data loss - cannot happen unnoticed.
+Cross-cutting guarantees that back the table: pure behavior runs against the same fakes on every build host, while each promoted native adapter must supply independent real-host evidence. The active support claim is Windows only. `vbuff-core` holds dedup/fingerprint/retention/concealment policy as testable logic with no I/O, and the resident runtime exposes visible capture health so silent observed-state loss cannot hide behind shared-trait tests.
 
 ---
 
@@ -1280,7 +1282,7 @@ The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/idea
 
 ### Performance, reliability & observability
 
-45. **Capture-loss accounting ledger (the anti-silent-data-loss metric)** `[M]` - Maintain a persistent counter of every drop reason on the capture path - debounce-collapsed, owner-contention-timeout, INCR-truncation, over-size-cap, backpressure-shed, self-write-suppressed - so the daemon can distinguish intended skips from genuine misses and surface a per-session 'N copies captured, M intentionally skipped, 0 lost' number. _Value: Silent data loss is the single worst failure category named throughout the architecture and recommendation docs, yet nothing currently *counts* it; this turns 'trust me, capture works' into a verifiable, user-visible figure and gives the CI zero-loss test a concrete assertion target._
+45. **Capture-loss accounting ledger (the anti-silent-loss metric)** `[M]` - Maintain counters for every capture outcome: observed and stored, policy skip, owner contention, INCR truncation, oversize rejection, backpressure, self-write suppression, and detected native sequence gap. Surface only what can be known, such as 'N observed, M intentionally skipped, G sequence gaps'; never convert an unknowable overwritten payload into '0 lost'. _Value: this turns capture health into auditable evidence without claiming more observability than the OS provides._
 46. **changeCount poll-skew adaptive scheduler (macOS)** `[M]` - Instead of a fixed 150-250ms poll, drive the macOS poll interval off observed copy cadence and recent miss-risk: tighten toward ~120ms during active typing/copy bursts, widen toward 750ms-1s when the changeCount has been stable and the machine is idle or on battery, with a hard wake on app-activation notifications. _Value: The catalogued 'battery throttle' (574) is binary; a cadence-aware scheduler cuts idle wakeups (the Maccy ~45% idle CPU complaint cited in recommendation.md) far harder while actually lowering miss-rate during the bursts that matter, which a flat interval cannot do._
 47. **Per-subsystem CPU/wakeup budget with a tripwire** `[M]` - Assign explicit budgets (e.g. watcher <0.2% idle CPU, <X wakeups/min; store maintenance <Y ms/tick) and have a lightweight in-process sampler trip a logged warning + auto-backoff when a subsystem exceeds its budget over a rolling window. _Value: Idle CPU regressions are invisible until a user complains; an internal budget that self-reports converts 'near 0% as a multi-day metric' (an aspiration in the docs) into an enforced, alerting invariant that catches a leak or busy-spin the day it lands, not in a bug report._
 48. **Structured tracing with a redacting span layer** `[M]` - Adopt a tracing/log schema where every span carries clip_id, byte_size, kind, and source_app but is wired through a redaction filter that guarantees clip *content* and secret-flagged metadata can never enter a log line, even at trace level. _Value: A clipboard manager's logs are uniquely dangerous (they sit next to every password); generic logging guidance ignores this, so a privacy-by-construction logging layer is both a reliability tool and a hard requirement that prevents debug logging from becoming the leak the whole encryption design is meant to prevent._
@@ -1306,7 +1308,7 @@ The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/idea
 65. **Duress PIN / decoy vault for plausible deniability** `[L]` - Support a second 'duress' unlock secret that opens a decoy history (empty or seeded with innocuous clips) while leaving the real encrypted store inaccessible and indistinguishable on disk, optionally triggering a silent secure-wipe of the real DEK. _Value: For users under coercion (border crossing, theft-with-compulsion) the master-password model has no answer: you either unlock everything or refuse visibly. A decoy mode is a recognized high-assurance feature (VeraCrypt hidden volumes) and reinforces the 'private by default' positioning beyond what every rival offers._
 66. **Entropy-based + structural secret detection with a tunable confidence gate** `[M]` - Augment the fixed regex detectors (cards/JWT/PEM/AWS) with a Shannon-entropy + charset-class scorer for generic high-randomness tokens, plus length/format heuristics, gated by a user-adjustable sensitivity threshold and a recall/precision corpus already in the test plan. _Value: The cataloged detectors only catch four known shapes; a 40-char random API token for any other service sails through as Normal. Entropy scoring generalizes the 'looks secret' decision to unknown credential formats, which is exactly the class of leak (a writer in an app we can't identify) the threat model admits it misses._
 67. **Retroactive secret clawback: re-scan and reclassify already-stored clips** `[M]` - When the secret-detector ruleset is updated (new built-in pattern, new user regex, or a tightened entropy threshold), run a background pass over existing history to re-tag matches as Sensitive, apply masking + shorter retention, and secure-delete sync copies that already left the device. _Value: Detectors evolve, but a secret captured under yesterday's looser rules stays in plaintext-equivalent retention and may already be synced. Clawback makes a detector improvement actually protect historical data instead of only future captures, and is something no competitor does._
-68. **Cooperate with (and detect) OS-native clipboard history capturing our writes** `[M]` - On future paste-back and internal copy paths, set native OS 'do not retain' hints (such as `org.nspasteboard.ConcealedType` and `ExcludeClipboardContentFromMonitorProcessing` / `CanIncludeInClipboardHistory=false`) so Win+V, macOS Universal Clipboard, and other managers do not mirror sensitive output into their own histories; warn when a rival manager is detected running. _Value: The current generic backend can neither prove nor set this exclusion, so sensitive copy is blocked. A native writer with verified exclusion is required before that path can be enabled, independently of future SQLCipher protection inside vbuff._
+68. **Cooperate with OS-native clipboard history when staging sensitive writes** `[M]` - On future paste-back and internal copy paths, set the exact native history/monitor/cloud markers supported by the OS, including separate Windows local-history and cloud-upload policy, then verify the atomic write outcome before enabling sensitive delivery. _Value: the current generic backend can neither prove nor set these exclusions. A native writer with verified exclusion is required before that path can be enabled, independently of future SQLCipher protection inside vbuff._
 69. **Tamper-evident local security audit log (HMAC-chained)** `[M]` - Maintain an append-only, HMAC-chained log of security-relevant events (unlock/lock, failed unlock attempts, key access, secure-wipe, sync pairing, detector-ruleset changes), keyed by an HKDF subkey so any deletion or reordering breaks the chain and is detectable on next open. _Value: There is currently no way for a user to notice that someone unlocked the vault at 3am or that pairing happened without them. A verifiable local log gives forensic visibility after a suspected compromise and underpins the 'prove it' marketing stance the recommendation leans on, without phoning home._
 70. **Supply-chain CI gate: cargo-deny + cargo-vet + cargo-audit as a release blocker** `[S]` - Add a CI lane that runs cargo-audit (RustSec/OSV), cargo-deny (license + duplicate + advisory bans), and cargo-vet (reviewed-dependency attestations) on the pinned lockfile, failing the build on any unreviewed or vulnerable dependency before artifacts are produced. _Value: For a tool whose entire pitch is trust and longevity, a single compromised transitive crate (this app pulls in crypto, SQLCipher, three OS backends) silently undermines everything. None of the supply-chain tooling appears anywhere in the plan; this is the cheapest high-leverage gap to close and matches the open-source-trust positioning._
 71. **Reproducible builds + signed SBOM + Sigstore provenance for every release** `[L]` - Produce a deterministic build (pinned toolchain, locked deps, normalized timestamps), emit a CycloneDX SBOM, and sign artifacts with Sigstore/cosign keyless provenance so users and corporate security teams can independently verify a downloaded binary matches the public source. _Value: The recommendation calls out that Ditto got banned by a security team and that new entrants must signal they'll still exist and be trustworthy; reproducible + provenance-attested builds are exactly what unblocks enterprise adoption and proves no backdoor was injected post-source. The plan covers code-signing/notarization for OS gatekeepers but nothing for source-to-binary integrity._
@@ -1316,9 +1318,9 @@ The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/idea
 
 ### Platform backends (macOS/Windows/Linux/Wayland)
 
-75. **Migrate Wayland capture to ext-data-control-v1 with wlr fallback** `[M]` - Prefer the new staging protocol ext-data-control-v1 (now shipping in wlroots 0.18+, KDE Plasma 6.2+, Sway 1.10) for background clipboard monitoring, falling back to the deprecated wlr-data-control-unstable-v1 only when ext isn't advertised in the registry. _Value: The catalog's Wayland capture (feature 519) is pinned to wlr-data-control, which compositors are actively deprecating; binding to ext-data-control first future-proofs the single most fragile backend and widens compositor coverage without changing the daemon contract._
-76. **libei/InputCapture paste injection on Wayland before shelling to ydotool** `[L]` - Add a paste path that uses libei (emulated input) via the xdg-desktop-portal RemoteDesktop/InputCapture interface to synthesize Ctrl+V, ranked above the wtype/ydotool/virtual-keyboard chain in feature 511. _Value: libei is the compositor-sanctioned input-emulation route that GNOME and KDE are converging on; it works where ydotool (needs uinput/root) and virtual-keyboard (wlroots-only) fail, turning Wayland paste-back from best-effort into reliable on mainstream desktops._
-77. **Persist GlobalShortcuts and RemoteDesktop portal restore tokens** `[M]` - Store the restore_token returned by the xdg-desktop-portal GlobalShortcuts (hotkey) and RemoteDesktop (paste) sessions in the secret store, and replay it on launch so the user authorizes vbuff once instead of on every cold start. _Value: Without token persistence, portal-based hotkeys and paste re-prompt the user each launch on GNOME/KDE Wayland, the top friction complaint for portal apps; this makes feature 515's portal path actually usable day-to-day._
+75. **Negotiate Wayland capture as ext -> wlr -> degraded** `[M]` - Prefer staging `ext-data-control-v1` where the compositor advertises it (confirmed in current KWin 6.4+ and Sway 1.11/wlroots 0.19 paths), then fall back to deprecated `wlr-data-control-unstable-v1`. Mutter and some other compositors advertise neither. _Value: registry truth plus a published compositor/version matrix prevents a generic Wayland claim from masking incompatible sessions._
+76. **Use the RemoteDesktop/EIS path for portal-mediated Wayland paste** `[L]` - Model paste injection through the xdg-desktop-portal RemoteDesktop session and its EIS connection; do not treat InputCapture as a generic injection sender. Keep `wtype`/`ydotool` only as explicit opt-in fallbacks because compositor support and `/dev/uinput` privilege differ. _Value: the state machine must match the portal contract or degrade copy-only instead of producing prompts, privilege surprises, or wrong-target input._
+77. **Persist only portal state the specific interface defines** `[M]` - Rebind GlobalShortcuts through `ListShortcuts`; for RemoteDesktop, store the returned restore token securely and replace it whenever a restored session returns a new one. Do not invent a GlobalShortcuts restore token. _Value: interface-specific persistence avoids repeated prompts without relying on fields the portal never defined._
 78. **GNOME-Wayland companion shell extension to close the Mutter monitoring gap** `[L]` - Ship an optional GNOME Shell extension that watches the clipboard inside the compositor process and pipes change events to the vbuff daemon over the existing D-Bus interface, replacing the architecture's capture-on-summon degradation under Mutter. _Value: Mutter implements neither wlr- nor ext-data-control, so on stock GNOME vbuff silently misses copies (a documented limitation); the extension is the only sanctioned way to get true background capture there, and it reuses the D-Bus surface from feature 458._
 79. **AllowSetForegroundWindow handshake for reliable Windows focus restore** `[M]` - Before paste-back on Windows, call AllowSetForegroundWindow(ASFW_ANY) / attach to the target thread's input queue (AttachThreadInput) so SetForegroundWindow actually raises the previous app instead of flashing the taskbar. _Value: Windows' foreground-lock policy makes a naive SetForegroundWindow fail when vbuff isn't the active foreground process, which is exactly the paste-back situation (feature 509); this is the standard workaround and prevents the wrong-window / silent-no-op paste that mistake #17 calls out._
 80. **Hardware-backed key wrapping (Secure Enclave / TPM / TPM-bound DPAPI)** `[L]` - Wrap the SQLCipher DB key with a non-exportable hardware key: Secure Enclave via SecKeyCreateRandomKey on macOS, a TPM 2.0 persistent handle (tpm2-tss) on Linux, and CNG/NCRYPT machine-or-TPM key on Windows, instead of only storing the raw key in the keychain. _Value: Features 534-536 store the key in software secret stores, which a logged-in attacker or malware can read; hardware wrapping means a stolen disk or even a copied keychain is useless without the physical chip, directly strengthening the 'never leaked' positioning._
@@ -1353,11 +1355,11 @@ The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/idea
 103. **Golden-image GUI snapshot tests for the popup across themes and DPI** `[M]` - Upgrade the egui_kittest 'smoke test' to deterministic golden-PNG snapshots of the virtualized list, type icons, match-highlighting, and empty/capability-badge states, rendered with a pinned font and fixed seed at 1x/1.5x/2x scale and dark/light, diffed in CI with a perceptual tolerance. _Value: Polish is Bet 1 and egui 'draws its own widgets', so visual regressions (icon drift, highlight misalignment, clipped RTL galleys, broken DPI) are invisible to logic tests. Golden images make the headline polish claim regression-proof and catch cosmic-text galley breakage on CJK/RTL content._
 104. **Reproducible-build verification job that rebuilds and bit-compares the release** `[L]` - A CI job that builds each release artifact twice in independent clean containers (pinned Rust toolchain, --remap-path-prefix, SOURCE_DATE_EPOCH, locked Cargo.lock) and fails if the two binaries are not byte-identical, publishing the expected hashes alongside the release. _Value: Bet 3 is 'private by construction'; a clipboard manager handling secrets must let security teams independently verify the shipped binary matches the source. Reproducibility is also the prerequisite for any future binary-transparency or third-party rebuild attestation._
 105. **Signed, staged auto-update with key-rotation and downgrade-protection tests** `[L]` - Build the v1 updater on a signed manifest (minisign/TUF-style) with monotonic version pinning, a CI test matrix that asserts the client rejects tampered manifests, replayed/older versions, and wrong-key signatures, plus a percentage-based staged-rollout gate keyed off opt-in crash telemetry. _Value: An auto-updater is the single most dangerous attack surface in a privacy tool: a compromised update channel pushes malware to every machine. Testing rejection of tamper/rollback/wrong-key, and staging rollouts behind crash rates, turns 'check for updates' (feature #487) into something safe to ship._
-106. **Multi-compositor Wayland CI matrix beyond sway (GNOME Mutter, KDE KWin)** `[L]` - Extend the headless-sway job to also run the capability-probe and capture/paste conformance suite under headless Mutter and KWin (via nested compositors / VM images), asserting the documented degraded-mode behavior on GNOME rather than only the wlr-data-control happy path. _Value: The architecture's biggest stated risk is GNOME-Wayland having no sanctioned monitor; sway-only CI tests exactly the compositor that works and never the ones that don't. Catching 'capability badge wrong / silent loss on Mutter' in CI directly defends the cross-platform headline against the most-reported Linux failure class._
+106. **Multi-compositor Wayland CI matrix beyond sway (GNOME Mutter, KDE KWin)** `[L]` - Extend the headless-sway job to run the capability probe and capture/paste conformance suite under nested Mutter and KWin, asserting `ext-data-control-v1`, legacy `wlr-data-control`, or the documented degraded mode exactly as advertised. _Value: sway-only CI tests one favorable protocol path. Testing both supported and unsupported compositors catches false capability badges and silent loss before release._
 107. **Paste-injection fidelity harness with a sink app and modifier-leak assertions** `[M]` - A per-OS integration test that focuses a tiny headless 'sink' window, drives the real PasteBackend (CGEvent/SendInput/XTEST), and asserts the received text equals the source byte-for-byte with no stray modifiers, covering the Ditto 'literal v pasted' and held-modifier-leak bugs end-to-end. _Value: Paste-back correctness is currently only covered by a ClipboardOnly-fallback unit test; the actual keystroke-injection path (where competitors' worst bugs live: wrong char, leaked Ctrl, wrong target) has no automated check. A real sink closes the loop on 'a picker that does not paste back is not a clipboard manager'._
 108. **Packaging smoke tests: install the built artifact in a clean OS image and launch it** `[M]` - Post-build CI stage that takes the actual .dmg/.pkg, MSI/MSIX, and .deb/.rpm/Flatpak/AppImage, installs each into a pristine VM/container with no Rust toolchain, launches vbuff headless, and asserts the single-instance socket binds, the tray registers, and version reports correctly. _Value: Native installers (feature #550) routinely break on missing runtime libs, bad desktop files, unsigned binaries, or wrong entitlements - failures that never surface in `cargo build`. A clean-room install-and-launch gate per format prevents shipping an installer that no fresh machine can actually run._
 109. **macOS notarization + Gatekeeper assessment as a release gate** `[M]` - A CI step that codesigns with hardened runtime and the global-hotkey/Accessibility entitlements, submits to Apple notarization, staples, then runs `spctl --assess` and `codesign --verify --deep --strict` against the stapled .dmg, blocking release on any failure. _Value: Hardened-runtime notarized packaging (feature #549) is a yes/no gate users hit on first launch; an unstapled or mis-entitled build silently fails Gatekeeper and breaks the global hotkey. Asserting notarization + spctl in CI catches it before users do, not in a bug report._
 110. **Mutation testing on vbuff-core to score the crown-jewel test suite** `[M]` - Run cargo-mutants over vbuff-core (dedup, eviction, capture gate, classify, hash) in a scheduled CI job, treating surviving mutants in the fail-closed gate and pin-exemption logic as must-fix, with a tracked mutation-kill-rate threshold for the privacy-critical modules. _Value: proptest invariants can pass while still missing logic gaps; mutation testing measures whether the tests would actually catch a bug introduced into the gate or eviction. For modules where a single wrong branch means a captured secret or an evicted pin, kill-rate is a far more honest quality signal than line coverage._
 111. **Supply-chain gate: cargo-deny, cargo-vet, and SBOM + provenance on every release** `[M]` - CI enforcement of cargo-deny (license/advisory/duplicate bans) and cargo-vet (audited dependency trust) on every PR, plus generation of a CycloneDX SBOM and SLSA build-provenance attestation attached to each GitHub release artifact. _Value: vbuff depends on a wide native crate surface (objc2, windows-rs, SQLCipher, tray-icon, global-hotkey) flagged as a maturity risk; a malicious or vulnerable transitive dep undermines the entire privacy story. Vetting + SBOM + provenance gives security teams the audit trail they need to approve a tool that touches the clipboard._
 112. **Deterministic time/clock seam so capture, eviction, and Lamport tests are reproducible** `[S]` - Introduce a Clock trait (alongside the existing FakeStore/FakeClipboard fakes) injected into core so retention windows, self-destruct timers, and Lamport-clock sync ordering are driven by a controllable fake clock, eliminating wall-clock flakiness from time-dependent tests. _Value: Retention, per-clip expiry (#362), scheduled clearing, and last-writer-wins conflict resolution are all time-sensitive; testing them against real time is flaky and slow. A clock seam makes 'item expires after N minutes' and 'concurrent-edit LWW' assertions exact and instant, and is a prerequisite for trustworthy v2 sync conflict tests._
-113. **Zero-loss capture benchmark turned into a hard CI throughput assertion** `[M]` - Promote the 'rapid successive copies' concern into a gated test: a harness fires N distinct clipboard edges as fast as the OS allows from multiple threads/processes and asserts every distinct edge appears exactly once in the store, with a per-OS latency budget, failing CI on any dropped or debounced edge. _Value: Missing rapid copies is mistake #3 and zero-loss capture is named a CI metric, but a benchmark only warns - it must block. Making 'dropped a distinct copy' a red build directly enforces the anti-CopyQ/Maccy guarantee that distinguishes vbuff, across the same matrix where competitors silently regress._
+113. **Capture-observability benchmark as a hard CI assertion** `[M]` - Fire N distinct clipboard edges as fast as each OS contract permits. Event-driven backends must store every generated edge exactly once within a latency budget. Polling backends must store every observed state, flag every detectable sequence jump, and never invent recovery of an overwritten payload. _Value: this blocks silent loss and false success claims while respecting the information each native API can actually provide._
