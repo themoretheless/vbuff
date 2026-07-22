@@ -25,7 +25,12 @@ pub(crate) fn render(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 design::status_dot(ui, posture_color);
-                ui.label(RichText::new(posture.level.label()).strong());
+                let posture_label = match posture.level {
+                    SecurityPostureLevel::Protected => "Protection available",
+                    SecurityPostureLevel::Partial => "Protection incomplete",
+                    SecurityPostureLevel::Blocked => "Protection blocked",
+                };
+                ui.label(RichText::new(posture_label).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.small(format!(
                         "{} active · {} degraded · {} unavailable",
@@ -50,9 +55,9 @@ pub(crate) fn render(
 }
 
 fn render_privacy_score(ui: &mut egui::Ui, score: Option<&PrivacyScore>) {
-    ui.label(RichText::new("Local privacy score").strong());
+    design::section_heading(ui, "Privacy posture", Some("configuration estimate"));
     let Some(score) = score else {
-        ui.label(RichText::new("Privacy inputs unavailable").weak());
+        ui.label(RichText::new("Posture inputs unavailable").weak());
         return;
     };
 
@@ -91,6 +96,11 @@ fn render_privacy_score(ui: &mut egui::Ui, score: Option<&PrivacyScore>) {
                 ui.end_row();
             }
         });
+    ui.label(
+        RichText::new("This estimate is not a security guarantee.")
+            .small()
+            .weak(),
+    );
 }
 
 fn render_attention_items(ui: &mut egui::Ui, capabilities: &[CapabilityView]) {
@@ -123,24 +133,26 @@ fn render_attention_items(ui: &mut egui::Ui, capabilities: &[CapabilityView]) {
 
 fn render_privacy_ledger(ui: &mut egui::Ui, ledger: &PrivacyLedgerSummary) {
     ui.horizontal(|ui| {
-        design::section_heading(ui, "Privacy decisions", None);
-        let color = if ledger.chain_valid {
-            design::success(ui)
-        } else {
-            design::danger(ui)
-        };
-        ui.label(
-            RichText::new(if ledger.chain_valid {
-                "Chain verified"
+        design::section_heading(ui, "This session's capture log", None);
+        if !ledger.recent.is_empty() {
+            let color = if ledger.chain_valid {
+                design::success(ui)
             } else {
-                "Chain invalid"
-            })
-            .small()
-            .color(color),
-        );
+                design::danger(ui)
+            };
+            ui.label(
+                RichText::new(if ledger.chain_valid {
+                    "Log chain intact"
+                } else {
+                    "Log chain invalid"
+                })
+                .small()
+                .color(color),
+            );
+        }
     });
     if ledger.recent.is_empty() {
-        ui.label(RichText::new("No capture decisions in this session").weak());
+        ui.label(RichText::new("No session decisions recorded yet").weak());
         return;
     }
 
@@ -152,13 +164,23 @@ fn render_privacy_ledger(ui: &mut egui::Ui, ledger: &PrivacyLedgerSummary) {
         ui.horizontal(|ui| {
             design::status_dot(ui, color);
             ui.monospace(format!("#{:04}", event.sequence));
-            ui.label(RichText::new(event.decision.label()).color(color));
+            let decision_label = match event.decision {
+                PrivacyDecisionLevel::Captured => "Stored",
+                PrivacyDecisionLevel::Skipped => "Not stored by policy",
+                PrivacyDecisionLevel::Lost => "Lost unexpectedly",
+            };
+            ui.label(RichText::new(decision_label).color(color));
             ui.label(format!("{} ×{}", event.reason, event.count));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(time).small().weak());
             });
         });
     }
+    ui.label(
+        RichText::new("Session-only diagnostic log; it does not prove OS or storage protection.")
+            .small()
+            .weak(),
+    );
 }
 
 fn render_technical_diagnostics(
@@ -170,7 +192,7 @@ fn render_technical_diagnostics(
     egui::CollapsingHeader::new("Technical diagnostics")
         .default_open(false)
         .show(ui, |ui| {
-            design::section_heading(ui, "Release SLOs", None);
+            design::section_heading(ui, "This session's runtime signals", None);
             egui::Grid::new("trust_slo_grid")
                 .num_columns(3)
                 .striped(true)
@@ -183,7 +205,7 @@ fn render_technical_diagnostics(
                 });
 
             ui.add_space(12.0);
-            design::section_heading(ui, "Platform capabilities", None);
+            design::section_heading(ui, "Current platform evidence", None);
             if capabilities.is_empty() {
                 ui.label(RichText::new("No capability evidence published").weak());
             } else {
@@ -208,9 +230,7 @@ fn render_technical_diagnostics(
                         .monospace(),
                 );
                 ui.separator();
-                ui.label(RichText::new("Offline checksum verification").small());
-                ui.separator();
-                ui.label(RichText::new("Signed provenance workflow").small());
+                ui.label(RichText::new("Current build verification: not checked").small());
             });
         });
 }
@@ -234,8 +254,8 @@ fn capability_color(ui: &egui::Ui, level: CapabilityViewLevel) -> egui::Color32 
 
 fn privacy_color(ui: &egui::Ui, level: PrivacyDecisionLevel) -> egui::Color32 {
     match level {
-        PrivacyDecisionLevel::Captured => design::success(ui),
-        PrivacyDecisionLevel::Skipped => design::warning(ui),
+        PrivacyDecisionLevel::Captured => design::info(ui),
+        PrivacyDecisionLevel::Skipped => design::success(ui),
         PrivacyDecisionLevel::Lost => design::danger(ui),
     }
 }

@@ -3,8 +3,9 @@
 //! Renders a borderless, always-on-top popup: a search box at the top that
 //! filters as you type, and a virtualized results list below. Keyboard-driven:
 //! Up/Down to move the selection, Enter to deliver the selected clip through
-//! the active native backend, Esc to hide, and Cmd/Ctrl+1..9 to quick-pick the
-//! first nine rows.
+//! the active native backend, Cmd/Ctrl+1..9 to quick-pick the first nine rows,
+//! and Esc to close the popup. The runtime keeps the process resident only when
+//! it has a recoverable resident surface.
 //!
 //! The app does not perform side effects itself. It pushes [`UiAction`]s into a
 //! queue, which the wiring drains each frame via [`PopupApp::take_actions`].
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
+use egui::{Color32, Key, RichText, Stroke, TextureHandle, ViewportCommand};
 use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
 use vbuff_core::feedback::FeedbackEnvironment;
 use vbuff_core::onboarding::DefaultProfile;
@@ -25,9 +26,9 @@ use vbuff_core::workflow::{
     stale_pin_candidates,
 };
 use vbuff_types::{
-    CapabilityView, CaptureBudgetAlert, CaptureHealth, CapturePauseReason, Clip, ClipId,
-    ClipboardHealthDigest, CommandNotice, ContentKind, NoticeLevel, SecurityPostureLevel,
-    SecurityPostureSummary,
+    CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, CapturePauseReason,
+    Clip, ClipId, ClipboardHealthDigest, CommandNotice, ContentKind, NoticeLevel,
+    SecurityPostureLevel, SecurityPostureSummary,
 };
 
 use crate::design::{self, Icon};
@@ -40,6 +41,8 @@ use crate::navigation::PopupSurface;
 use crate::projection::{FilteredClip, clip_is_expired, filter_clips};
 use crate::state::{SharedState, StarterPack, UiAction};
 use crate::view::{relative_time, short_app_name};
+
+const QUERY_COMPLETION_ACCEPT_KEYS: [Key; 2] = [Key::Tab, Key::ArrowRight];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PreviewTransform {
@@ -136,7 +139,7 @@ pub struct PopupApp {
     /// to consume.
     request_focus_next_frame: bool,
     /// Set after global spacing and interaction tokens are installed.
-    design_applied: bool,
+    design_signature: Option<(bool, bool)>,
     /// True while the destructive clear-history confirmation is open.
     confirm_clear_history: bool,
     /// Clip awaiting explicit delete confirmation.
@@ -167,7 +170,6 @@ pub struct PopupApp {
     expanded_duplicates: HashSet<ClipId>,
     last_announcement_revision: u64,
     preview_clip_id: Option<ClipId>,
-    preview_fade_started: Instant,
 }
 
 impl PopupApp {
@@ -186,7 +188,7 @@ impl PopupApp {
             last_revision: u64::MAX,
             thumbnails: std::collections::HashMap::new(),
             request_focus_next_frame: false,
-            design_applied: false,
+            design_signature: None,
             confirm_clear_history: false,
             confirm_delete: None,
             confirm_profile: None,
@@ -212,7 +214,6 @@ impl PopupApp {
             expanded_duplicates: HashSet::new(),
             last_announcement_revision: 0,
             preview_clip_id: None,
-            preview_fade_started: now,
         }
     }
 
@@ -226,6 +227,7 @@ impl PopupApp {
         self.visible = true;
         self.query.clear();
         self.selected = 0;
+        self.preview_clip_id = None;
         self.query_completion_selected = 0;
         self.dismissed_completion_query = None;
         self.scroll_selection_into_view = false;
@@ -296,7 +298,6 @@ impl PopupApp {
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.peek_sensitive = None;
-        self.undo_slot = None;
         self.focus_guard.reset();
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     }
@@ -330,9 +331,13 @@ impl eframe::App for PopupApp {
         self.motion_budget.begin_frame(now);
         let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
         self.scroll_tuner.sample(scroll_delta, now);
-        if !self.design_applied {
-            design::apply(ctx);
-            self.design_applied = true;
+        let design_signature = (
+            ctx.style().visuals.dark_mode,
+            self.preferences.reduced_motion,
+        );
+        if self.design_signature != Some(design_signature) {
+            design::apply(ctx, self.preferences.reduced_motion);
+            self.design_signature = Some(design_signature);
         }
 
         // 1. Keep the hidden resident path content-light. A hidden supervisory
@@ -436,7 +441,19 @@ impl eframe::App for PopupApp {
         if !focused {
             self.peek_sensitive = None;
         }
-        let focus_loss = self.focus_guard.update(focused, now);
+        let focus_loss = if self.surface == PopupSurface::History {
+            self.focus_guard.update(focused, now)
+        } else {
+            self.focus_guard.reset();
+            FocusLossState::Focused
+        };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+            if self.surface == PopupSurface::History {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
         if focus_loss == FocusLossState::Expired {
             self.actions.push_back(UiAction::Hide);
             self.hide(ctx);
@@ -461,11 +478,11 @@ impl eframe::App for PopupApp {
         // 4. Compute the filtered list and preserve selection by stable id.
         let filtered = self.filtered(&clips);
         let total = filtered.len();
-        if revision_changed
-            && let Some(previous_id) = self.preview_clip_id
-            && let Some(index) = filtered.iter().position(|hit| hit.id == previous_id)
-        {
-            self.selected = index;
+        if let Some(previous_id) = self.preview_clip_id {
+            self.selected = filtered
+                .iter()
+                .position(|hit| hit.id == previous_id)
+                .unwrap_or(0);
         } else if total == 0 {
             self.selected = 0;
         } else if self.selected >= total {
@@ -517,7 +534,6 @@ impl eframe::App for PopupApp {
             && !self.command_palette_open
             && self.action_flyout.is_none()
             && !self.feedback_preview
-            && !query_completions_active
             && focused_widget.is_none_or(|id| id == history_search_id());
         let keyboard_page = (logical_viewport_size(ctx).y
             / self
@@ -540,18 +556,25 @@ impl eframe::App for PopupApp {
                 if query_completions_active {
                     if i.key_pressed(Key::Escape) {
                         dismiss_completions = true;
+                        return;
                     } else if i.key_pressed(Key::ArrowDown) {
                         self.query_completion_selected =
                             (self.query_completion_selected + 1).min(query_completions.len() - 1);
+                        return;
                     } else if i.key_pressed(Key::ArrowUp) {
                         self.query_completion_selected =
                             self.query_completion_selected.saturating_sub(1);
-                    } else if i.key_pressed(Key::Enter) {
+                        return;
+                    } else if QUERY_COMPLETION_ACCEPT_KEYS
+                        .iter()
+                        .copied()
+                        .any(|key| i.key_pressed(key))
+                    {
                         accepted_completion = query_completions
                             .get(self.query_completion_selected)
                             .cloned();
+                        return;
                     }
-                    return;
                 }
                 if i.key_pressed(Key::Escape) {
                     if self.command_palette_open {
@@ -714,10 +737,13 @@ impl eframe::App for PopupApp {
             .get(self.selected)
             .and_then(|hit| clip_by_id.get(&hit.id))
             .copied();
+        let encryption_at_rest = capabilities.iter().any(|capability| {
+            capability.feature == "encryption_at_rest"
+                && capability.level == CapabilityViewLevel::Active
+        });
         let selected_id = selected_clip.map(|clip| clip.id);
         if selected_id != self.preview_clip_id {
             self.preview_clip_id = selected_id;
-            self.preview_fade_started = now;
             self.preview_transform = PreviewTransform::Original;
         }
         let viewport = logical_viewport_size(ctx);
@@ -746,17 +772,71 @@ impl eframe::App for PopupApp {
             if show_hotkey_coachmark && let Some(hotkey) = hotkey_label.as_deref() {
                 self.render_hotkey_coachmark(ui, hotkey);
             }
+            if let Some(notice) = &notice {
+                self.render_notice(ui, notice);
+            }
 
             match self.surface {
                 PopupSurface::History => {
                     ui.horizontal(|ui| {
                         render_capture_status(ui, paused, pause_reason, capture_health);
                         ui.separator();
-                        render_security_status(ui, security_posture);
+                        if render_security_status(ui, security_posture).clicked() {
+                            self.surface = PopupSurface::Trust;
+                            self.request_focus_next_frame = false;
+                        }
+                        if ui.available_width() > 360.0 {
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "{total} items · {} saved · {} skipped",
+                                    compact_count(capture_stats.captured),
+                                    compact_count(capture_stats.intentionally_skipped)
+                                ))
+                                .small()
+                                .color(design::secondary_text(ui)),
+                            );
+                            if capture_stats.lost > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} lost",
+                                        compact_count(capture_stats.lost)
+                                    ))
+                                    .small()
+                                    .color(design::danger(ui)),
+                                );
+                            }
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(clip) = selected_clip {
+                                let action = ui
+                                    .add_enabled_ui(
+                                        self.delivery.allows(clip.meta.sensitive),
+                                        |ui| {
+                                            design::primary_button(ui, self.delivery.action_label())
+                                        },
+                                    )
+                                    .inner
+                                    .on_hover_text(format!(
+                                        "{} selected clip (Enter)",
+                                        self.delivery.action_label()
+                                    ))
+                                    .on_disabled_hover_text(
+                                        "Safe sensitive clipboard output is unavailable",
+                                    );
+                                if action.clicked() {
+                                    self.actions.push_back(UiAction::Paste(clip.id));
+                                }
+                            }
                             if self.undo_slot.is_some()
-                                && design::icon_button(ui, Icon::Undo, "Undo last action", false)
-                                    .clicked()
+                                && design::icon_button_kind(
+                                    ui,
+                                    Icon::Undo,
+                                    "Undo last action",
+                                    false,
+                                    design::IconButtonKind::Ghost,
+                                )
+                                .clicked()
                             {
                                 self.apply_undo();
                             }
@@ -780,9 +860,8 @@ impl eframe::App for PopupApp {
                         });
                     });
                     if let Some(health) = health_alert {
-                        self.render_health_alert(ui, health);
-                    }
-                    if let Some(alert) = size_budget_alert {
+                        self.render_health_alert(ui, health, size_budget_alert.is_some());
+                    } else if let Some(alert) = size_budget_alert {
                         self.render_size_budget_alert(ui, alert);
                     }
                     if recoverable_skip {
@@ -796,38 +875,18 @@ impl eframe::App for PopupApp {
                                 self.actions.push_back(UiAction::RecoverSkipped);
                             }
                         });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.small(format!("{total} items"));
-                            ui.separator();
-                            ui.small(format!(
-                                "{} saved · {} skipped",
-                                compact_count(capture_stats.captured),
-                                compact_count(capture_stats.intentionally_skipped)
-                            ));
-                            let loss_color = if capture_stats.lost == 0 {
-                                ui.visuals().weak_text_color()
-                            } else {
-                                design::danger(ui)
-                            };
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} lost",
-                                    compact_count(capture_stats.lost)
-                                ))
-                                .small()
-                                .color(loss_color),
-                            );
-                        });
-                    }
-                    if let Some(notice) = &notice {
-                        self.render_notice(ui, notice);
                     }
                     self.render_history_filters(ui, &clips);
                     ui.separator();
 
                     if total == 0 {
-                        self.render_empty_history(ui, clips.is_empty());
+                        self.render_empty_history(
+                            ui,
+                            clips.is_empty(),
+                            paused,
+                            pause_reason,
+                            capture_health,
+                        );
                     } else {
                         // Stable-height virtualized rows keep controls from shifting.
                         let row_height = self.preferences.density.row_height(viewport.y);
@@ -839,6 +898,7 @@ impl eframe::App for PopupApp {
                             let offset = (selected_center - visible_height * 0.5).max(0.0);
                             scroll = scroll.vertical_scroll_offset(offset);
                         }
+                        let mut active_history_option = None;
                         let history_list =
                             scroll.show_rows(ui, row_height, total, |ui, row_range| {
                                 for row in row_range {
@@ -849,7 +909,7 @@ impl eframe::App for PopupApp {
                                         continue;
                                     };
                                     let selected = row == self.selected;
-                                    self.render_row(
+                                    let option_id = self.render_row(
                                         ui,
                                         ctx,
                                         row,
@@ -862,14 +922,28 @@ impl eframe::App for PopupApp {
                                         row_height,
                                         session_protected.contains(&clip.id),
                                         memory_only_clips.contains(&clip.id),
+                                        encryption_at_rest,
                                     );
+                                    if selected {
+                                        active_history_option = Some(option_id);
+                                    }
                                 }
                             });
                         ctx.accesskit_node_builder(history_list.id, |node| {
-                            node.set_role(egui::accesskit::Role::List);
+                            node.set_role(egui::accesskit::Role::ListBox);
                             node.set_label("Clipboard history");
                             node.set_size_of_set(total);
                         });
+                        if !query_completions_active {
+                            ctx.accesskit_node_builder(history_search_id(), |node| {
+                                node.set_role(egui::accesskit::Role::EditableComboBox);
+                                node.set_label("Search clipboard history");
+                                node.set_expanded(false);
+                                if let Some(active) = active_history_option {
+                                    node.set_active_descendant(active.value().into());
+                                }
+                            });
+                        }
                         self.scroll_selection_into_view = false;
                     }
                 }
@@ -946,9 +1020,17 @@ impl PopupApp {
                     self.action_flyout = None;
                 }
             }
+            if !PopupSurface::PRIMARY.contains(&self.surface) {
+                ui.separator();
+                ui.label(
+                    RichText::new(self.surface.label())
+                        .strong()
+                        .color(design::accent(ui)),
+                );
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if design::icon_button(ui, Icon::Close, "Hide vbuff", false).clicked() {
+                if design::icon_button(ui, Icon::Close, "Close vbuff window", false).clicked() {
                     hide_requested = true;
                 }
                 self.render_action_menu(ui, paused);
@@ -981,8 +1063,12 @@ impl PopupApp {
             };
             egui::Frame::new()
                 .fill(ui.visuals().extreme_bg_color)
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(8, 3))
+                .stroke(Stroke::new(1.0_f32, design::border_strong(ui)))
+                .corner_radius(design::RADIUS_CONTROL)
+                .inner_margin(egui::Margin::symmetric(
+                    design::SPACE_S as i8,
+                    design::SPACE_XS as i8,
+                ))
                 .show(ui, |ui| {
                     let search_response = ui
                         .horizontal(|ui| {
@@ -1009,6 +1095,7 @@ impl PopupApp {
                             {
                                 self.query.clear();
                                 self.selected = 0;
+                                self.preview_clip_id = None;
                                 self.request_focus_next_frame = true;
                             }
                             response
@@ -1034,7 +1121,7 @@ impl PopupApp {
                 self.surface = PopupSurface::Settings;
                 ui.close();
             }
-            if ui.button("Trust and privacy").clicked() {
+            if ui.button("Privacy and status").clicked() {
                 self.surface = PopupSurface::Trust;
                 ui.close();
             }
@@ -1058,6 +1145,11 @@ impl PopupApp {
                 .checkbox(&mut self.preferences.large_preview, "Large preview")
                 .changed()
             {
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Quit vbuff").clicked() {
+                self.actions.push_back(UiAction::Quit);
                 ui.close();
             }
         });
@@ -1123,6 +1215,7 @@ impl PopupApp {
         if let Some(completion) = chosen {
             replace_last_query_token(&mut self.query, &completion);
             self.selected = 0;
+            self.preview_clip_id = None;
             self.query_completion_selected = 0;
             self.dismissed_completion_query = None;
             self.request_focus_next_frame = true;
@@ -1163,11 +1256,12 @@ impl PopupApp {
                 });
             if self.history_scope != previous_scope {
                 self.selected = 0;
+                self.preview_clip_id = None;
             }
             for app in recent_apps {
                 let selected = self.history_scope == HistoryScope::Source(app.clone());
                 if ui
-                    .selectable_label(selected, short_app_name(&app))
+                    .selectable_label(selected, format!("Source: {}", short_app_name(&app)))
                     .clicked()
                 {
                     self.history_scope = if selected {
@@ -1176,6 +1270,7 @@ impl PopupApp {
                         HistoryScope::Source(app)
                     };
                     self.selected = 0;
+                    self.preview_clip_id = None;
                 }
             }
             if self.history_scope != HistoryScope::All
@@ -1183,11 +1278,17 @@ impl PopupApp {
             {
                 self.history_scope = HistoryScope::All;
                 self.selected = 0;
+                self.preview_clip_id = None;
             }
         });
     }
 
-    fn render_health_alert(&mut self, ui: &mut egui::Ui, health: CaptureHealth) {
+    fn render_health_alert(
+        &mut self,
+        ui: &mut egui::Ui,
+        health: CaptureHealth,
+        has_additional_alert: bool,
+    ) {
         let danger = design::danger(ui);
         egui::Frame::new()
             .fill(Color32::from_rgba_unmultiplied(
@@ -1210,6 +1311,9 @@ impl PopupApp {
                         if ui.small_button("Review").clicked() {
                             self.surface = PopupSurface::Trust;
                             self.actions.push_back(UiAction::DismissHealthAlert);
+                        }
+                        if has_additional_alert && ui.small_button("+1 more").clicked() {
+                            self.surface = PopupSurface::Settings;
                         }
                     });
                 });
@@ -1290,7 +1394,7 @@ impl PopupApp {
                         .weak(),
                 );
 
-                ui.add_space(16.0);
+                ui.add_space(design::SPACE_L);
                 design::section_heading(ui, "Defaults", None);
                 ui.horizontal(|ui| {
                     for profile in [
@@ -1308,15 +1412,19 @@ impl PopupApp {
                     }
                 });
 
-                ui.add_space(16.0);
-                design::section_heading(ui, "Clipboard health", None);
+                ui.add_space(design::SPACE_L);
+                design::section_heading(ui, "Storage and cleanup", None);
                 ui.checkbox(
                     &mut self.preferences.show_health_digest,
-                    "Show health digest",
+                    "Show storage details",
                 );
                 if self.preferences.show_health_digest {
+                    let column_width = ((ui.available_width() - design::SPACE_M) / 2.0).max(120.0);
                     egui::Grid::new("clipboard_health_digest")
                         .num_columns(2)
+                        .min_col_width(column_width)
+                        .max_col_width(column_width)
+                        .spacing([design::SPACE_M, design::SPACE_XS])
                         .striped(true)
                         .show(ui, |ui| {
                             digest_row(ui, "Database", human_bytes(digest.database_bytes));
@@ -1333,8 +1441,8 @@ impl PopupApp {
                         });
                 }
 
-                ui.add_space(16.0);
-                design::section_heading(ui, "Pinned items", Some("review after 90 days"));
+                ui.add_space(design::SPACE_L);
+                design::section_heading(ui, "Old pinned items", Some("review after 90 days"));
                 let stale = stale_pin_candidates(
                     clips,
                     Utc::now(),
@@ -1386,7 +1494,7 @@ impl PopupApp {
                     }
                 }
 
-                ui.add_space(16.0);
+                ui.add_space(design::SPACE_L);
                 design::section_heading(ui, "Appearance", None);
                 ui.horizontal(|ui| {
                     ui.label("Density");
@@ -1405,7 +1513,7 @@ impl PopupApp {
                 ui.checkbox(&mut self.preferences.large_preview, "Large preview pane");
                 ui.checkbox(&mut self.preferences.reduced_motion, "Reduced motion");
 
-                ui.add_space(16.0);
+                ui.add_space(design::SPACE_L);
                 design::section_heading(ui, "Ergonomics", None);
                 ui.horizontal(|ui| {
                     ui.label("One-handed");
@@ -1421,7 +1529,7 @@ impl PopupApp {
                         "Right",
                     );
                 });
-                ui.add_space(16.0);
+                ui.add_space(design::SPACE_L);
                 egui::CollapsingHeader::new("Developer diagnostics")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -1483,12 +1591,8 @@ impl PopupApp {
                 "Clipboard history".to_owned(),
                 true,
             ),
-            (PaletteCommand::Compose, "Compose clips".to_owned(), true),
-            (
-                PaletteCommand::Trust,
-                "Trust and diagnostics".to_owned(),
-                true,
-            ),
+            (PaletteCommand::Compose, "Open Stack".to_owned(), true),
+            (PaletteCommand::Trust, "Privacy and status".to_owned(), true),
             (PaletteCommand::Settings, "Settings".to_owned(), true),
             (
                 PaletteCommand::PasteSelected,
@@ -1504,7 +1608,7 @@ impl PopupApp {
             ),
             (
                 PaletteCommand::AddSelectedToStack,
-                "Add selected clip to stack".to_owned(),
+                "Add selected clip to Stack".to_owned(),
                 true,
             ),
             (
@@ -1694,7 +1798,7 @@ impl PopupApp {
                 if ui.button("Peek").clicked() {
                     command = Some(PaletteCommand::PeekSelected);
                 }
-            } else if clip.primary_text().is_some() && ui.button("Add to stack").clicked() {
+            } else if clip.primary_text().is_some() && ui.button("Add to Stack").clicked() {
                 command = Some(PaletteCommand::AddSelectedToStack);
             }
             if !memory_only
@@ -1707,9 +1811,9 @@ impl PopupApp {
             if !memory_only
                 && ui
                     .button(if protected {
-                        "Remove session protection"
+                        "Remove capacity-cleanup exception"
                     } else {
-                        "Protect for this session"
+                        "Keep through capacity cleanup this session"
                     })
                     .clicked()
             {
@@ -1718,7 +1822,11 @@ impl PopupApp {
                 self.action_flyout = None;
             }
             if memory_only {
-                ui.label(RichText::new("Memory only until expiry").small().weak());
+                ui.label(
+                    RichText::new("Memory only until expiry or exit")
+                        .small()
+                        .weak(),
+                );
             }
             if ui.button("Preview").clicked() {
                 self.preferences.large_preview = true;
@@ -1778,48 +1886,95 @@ impl PopupApp {
         self.last_announcement_revision = revision;
     }
 
-    fn render_empty_history(&mut self, ui: &mut egui::Ui, history_is_empty: bool) {
+    fn render_empty_history(
+        &mut self,
+        ui: &mut egui::Ui,
+        history_is_empty: bool,
+        paused: bool,
+        pause_reason: Option<CapturePauseReason>,
+        capture_health: CaptureHealth,
+    ) {
         ui.with_layout(
             egui::Layout::top_down_justified(egui::Align::Center),
             |ui| {
-                ui.add_space(56.0);
+                ui.add_space(design::SPACE_XL * 2.0);
                 let truly_empty = history_is_empty && self.query.trim().is_empty();
-                ui.label(
-                    RichText::new(if truly_empty {
-                        "No clipboard history yet"
-                    } else {
-                        "No matching clips"
-                    })
-                    .strong(),
-                );
                 if truly_empty {
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("Add local examples").small().weak());
-                    ui.horizontal(|ui| {
-                        const PACK_BUTTON_WIDTH: f32 = 88.0;
-                        let row_width = PACK_BUTTON_WIDTH * 2.0 + ui.spacing().item_spacing.x;
-                        ui.add_space(((ui.available_width() - row_width) / 2.0).max(0.0));
-                        if ui
-                            .add_sized([PACK_BUTTON_WIDTH, 28.0], egui::Button::new("Developer"))
-                            .clicked()
-                        {
+                    let (heading, detail) = if paused {
+                        (
+                            pause_reason.map_or("Capture paused", CapturePauseReason::label),
+                            match pause_reason {
+                                Some(CapturePauseReason::Manual) => {
+                                    "Resume capture to save new clipboard items."
+                                }
+                                Some(CapturePauseReason::Idle) => {
+                                    "Capture resumes automatically when activity returns."
+                                }
+                                Some(CapturePauseReason::ScreenLocked) => {
+                                    "Capture resumes automatically after the session unlocks."
+                                }
+                                Some(CapturePauseReason::RemoteControl) => {
+                                    "Capture resumes automatically after remote control ends."
+                                }
+                                Some(CapturePauseReason::SecurityPolicy) => {
+                                    "Review privacy requirements before capture can resume."
+                                }
+                                None => "Resume capture to save new clipboard items.",
+                            },
+                        )
+                    } else {
+                        match capture_health {
+                            CaptureHealth::Starting => (
+                                "Preparing clipboard capture",
+                                "vbuff is connecting to the system clipboard.",
+                            ),
+                            CaptureHealth::Watching => (
+                                "Copy something to get started",
+                                "vbuff is watching the clipboard and will show the next eligible copy.",
+                            ),
+                            _ => (
+                                capture_health.label(),
+                                "Clipboard capture needs attention before new items can appear.",
+                            ),
+                        }
+                    };
+                    ui.label(RichText::new(heading).strong().size(15.0));
+                    ui.label(
+                        RichText::new(detail)
+                            .small()
+                            .color(design::secondary_text(ui)),
+                    );
+                    ui.add_space(design::SPACE_S);
+                    if paused && pause_reason == Some(CapturePauseReason::Manual) {
+                        if ui.button("Resume capture").clicked() {
+                            self.actions.push_back(UiAction::TogglePause);
+                        }
+                    } else if (pause_reason == Some(CapturePauseReason::SecurityPolicy)
+                        || (!paused && capture_health != CaptureHealth::Watching))
+                        && ui.button("Review privacy and status").clicked()
+                    {
+                        self.surface = PopupSurface::Trust;
+                    }
+                    ui.add_space(design::SPACE_M);
+                    ui.menu_button("Load local examples...", |ui| {
+                        if ui.button("Developer examples").clicked() {
                             self.actions
                                 .push_back(UiAction::InstallStarterPack(StarterPack::Developer));
+                            ui.close();
                         }
-                        if ui
-                            .add_sized([PACK_BUTTON_WIDTH, 28.0], egui::Button::new("Writing"))
-                            .clicked()
-                        {
+                        if ui.button("Writing examples").clicked() {
                             self.actions
                                 .push_back(UiAction::InstallStarterPack(StarterPack::Writing));
+                            ui.close();
                         }
                     });
                 } else {
+                    ui.label(RichText::new("No matching clips").strong().size(15.0));
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("No clips satisfy the current search and filters")
                             .small()
-                            .weak(),
+                            .color(design::secondary_text(ui)),
                     );
                     let broadened = broaden_query(&self.query);
                     let command = if broadened != self.query {
@@ -1838,6 +1993,7 @@ impl PopupApp {
                             self.query.clear();
                         }
                         self.selected = 0;
+                        self.preview_clip_id = None;
                         self.request_focus_next_frame = true;
                     }
                 }
@@ -1847,12 +2003,20 @@ impl PopupApp {
 
     fn render_compose_surface(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.compose_mode, ComposeMode::Stack, "Stack");
-            ui.selectable_value(&mut self.compose_mode, ComposeMode::Form, "Form");
+            ui.selectable_value(&mut self.compose_mode, ComposeMode::Stack, "Sequence");
+            ui.selectable_value(&mut self.compose_mode, ComposeMode::Form, "Fields");
             ui.selectable_value(&mut self.compose_mode, ComposeMode::Merge, "Merge");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(!self.paste_stack.items().is_empty(), |ui| {
-                    if design::icon_button(ui, Icon::Delete, "Clear paste stack", false).clicked() {
+                    if design::icon_button_kind(
+                        ui,
+                        Icon::Delete,
+                        "Clear Stack",
+                        false,
+                        design::IconButtonKind::Danger,
+                    )
+                    .clicked()
+                    {
                         self.paste_stack.clear();
                     }
                 });
@@ -1864,7 +2028,17 @@ impl PopupApp {
         if self.paste_stack.items().is_empty() {
             ui.add_space(72.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Paste stack is empty").strong());
+                ui.label(RichText::new("Stack is empty").strong().size(15.0));
+                ui.label(
+                    RichText::new("Choose clips in History, then add them from the row menu.")
+                        .small()
+                        .color(design::secondary_text(ui)),
+                );
+                ui.add_space(design::SPACE_S);
+                if ui.button("Add from History").clicked() {
+                    self.surface = PopupSurface::History;
+                    self.request_focus_next_frame = true;
+                }
             });
             return;
         }
@@ -1933,32 +2107,35 @@ impl PopupApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if design::icon_button(
+                                        if design::icon_button_kind(
                                             ui,
                                             Icon::Delete,
                                             "Remove item",
                                             false,
+                                            design::IconButtonKind::Danger,
                                         )
                                         .clicked()
                                         {
                                             row_actions.push(StackRowAction::Delete(item.id));
                                         }
-                                        if design::icon_button(
+                                        if design::icon_button_kind(
                                             ui,
                                             Icon::Duplicate,
                                             "Duplicate item",
                                             false,
+                                            design::IconButtonKind::Ghost,
                                         )
                                         .clicked()
                                         {
                                             row_actions.push(StackRowAction::Duplicate(item.id));
                                         }
                                         ui.add_enabled_ui(index + 1 < item_ids.len(), |ui| {
-                                            if design::icon_button(
+                                            if design::icon_button_kind(
                                                 ui,
                                                 Icon::Down,
                                                 "Move down",
                                                 false,
+                                                design::IconButtonKind::Ghost,
                                             )
                                             .clicked()
                                             {
@@ -1966,8 +2143,14 @@ impl PopupApp {
                                             }
                                         });
                                         ui.add_enabled_ui(index > 0, |ui| {
-                                            if design::icon_button(ui, Icon::Up, "Move up", false)
-                                                .clicked()
+                                            if design::icon_button_kind(
+                                                ui,
+                                                Icon::Up,
+                                                "Move up",
+                                                false,
+                                                design::IconButtonKind::Ghost,
+                                            )
+                                            .clicked()
                                             {
                                                 row_actions.push(StackRowAction::Up(item.id));
                                             }
@@ -1977,8 +2160,19 @@ impl PopupApp {
                                         } else {
                                             "Copy this item"
                                         };
-                                        if design::icon_button(ui, Icon::Paste, tooltip, false)
-                                            .clicked()
+                                        let delivery_icon = if self.delivery.automatic_paste {
+                                            Icon::Paste
+                                        } else {
+                                            Icon::Copy
+                                        };
+                                        if design::icon_button_kind(
+                                            ui,
+                                            delivery_icon,
+                                            tooltip,
+                                            false,
+                                            design::IconButtonKind::Primary,
+                                        )
+                                        .clicked()
                                         {
                                             self.actions.push_back(UiAction::PasteText {
                                                 text: text.clone(),
@@ -2049,7 +2243,20 @@ impl PopupApp {
             } else {
                 "Copy merged text"
             };
-            if design::icon_button(ui, Icon::Paste, tooltip, false).clicked() {
+            let delivery_icon = if self.delivery.automatic_paste {
+                Icon::Paste
+            } else {
+                Icon::Copy
+            };
+            if design::icon_button_kind(
+                ui,
+                delivery_icon,
+                tooltip,
+                false,
+                design::IconButtonKind::Primary,
+            )
+            .clicked()
+            {
                 self.actions.push_back(UiAction::PasteText {
                     text: merged.clone(),
                     sensitive: false,
@@ -2139,15 +2346,6 @@ impl PopupApp {
     }
 
     fn render_preview_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, clip: &Clip) {
-        let fade = if self.preferences.reduced_motion {
-            1.0
-        } else {
-            (self.preview_fade_started.elapsed().as_secs_f32() / 0.12).clamp(0.0, 1.0)
-        };
-        if fade < 1.0 {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
-        ui.set_opacity(fade);
         ui.horizontal(|ui| {
             ui.heading(clip.meta.kind.label());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2222,30 +2420,45 @@ impl PopupApp {
             return;
         }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(
-                &mut self.preview_transform,
-                PreviewTransform::Original,
-                "Original",
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Transform")
+                    .small()
+                    .color(design::secondary_text(ui)),
             );
-            ui.selectable_value(&mut self.preview_transform, PreviewTransform::Trim, "Trim");
-            ui.selectable_value(
-                &mut self.preview_transform,
-                PreviewTransform::Uppercase,
-                "Uppercase",
-            );
-            ui.selectable_value(
-                &mut self.preview_transform,
-                PreviewTransform::PrettyJson,
-                "JSON",
-            );
-            if clip.meta.kind == ContentKind::Url {
-                ui.selectable_value(
-                    &mut self.preview_transform,
-                    PreviewTransform::CleanLink,
-                    "Clean link",
-                );
-            }
+            let picker_width = ui.available_width().clamp(120.0, 184.0);
+            egui::ComboBox::from_id_salt("preview_transform_picker")
+                .selected_text(preview_transform_label(self.preview_transform))
+                .width(picker_width)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.preview_transform,
+                        PreviewTransform::Original,
+                        "Original",
+                    );
+                    ui.selectable_value(
+                        &mut self.preview_transform,
+                        PreviewTransform::Trim,
+                        "Trim",
+                    );
+                    ui.selectable_value(
+                        &mut self.preview_transform,
+                        PreviewTransform::Uppercase,
+                        "Uppercase",
+                    );
+                    ui.selectable_value(
+                        &mut self.preview_transform,
+                        PreviewTransform::PrettyJson,
+                        "Pretty JSON",
+                    );
+                    if clip.meta.kind == ContentKind::Url {
+                        ui.selectable_value(
+                            &mut self.preview_transform,
+                            PreviewTransform::CleanLink,
+                            "Clean link",
+                        );
+                    }
+                });
         });
         let transformed = match self.preview_transform {
             PreviewTransform::Original => Ok(canonical.to_owned()),
@@ -2375,7 +2588,8 @@ impl PopupApp {
         row_height: f32,
         session_protected: bool,
         memory_only: bool,
-    ) {
+        encryption_at_rest: bool,
+    ) -> egui::Id {
         let bg = if selected {
             ui.visuals().selection.bg_fill
         } else if row.is_multiple_of(2) {
@@ -2391,9 +2605,9 @@ impl PopupApp {
             ui.horizontal(|ui| {
                 if row < 9 && quick_pick {
                     let quick_pick_color = if selected {
-                        ui.visuals().selection.stroke.color
+                        design::accent(ui)
                     } else {
-                        ui.visuals().selection.bg_fill
+                        design::secondary_text(ui)
                     };
                     ui.add_sized(
                         [18.0, design::THUMBNAIL_SIZE],
@@ -2444,22 +2658,48 @@ impl PopupApp {
                             } else {
                                 egui::Label::new(RichText::new(preview).strong())
                             };
-                        let response = ui
-                            .add_enabled(
-                                self.delivery.allows(clip.meta.sensitive),
-                                label.truncate().sense(egui::Sense::click()),
+                        let delivery_allowed = self.delivery.allows(clip.meta.sensitive);
+                        let response = ui.add_sized(
+                            [ui.available_width(), 22.0],
+                            label.truncate().sense(egui::Sense::click()),
+                        );
+                        let response = if delivery_allowed {
+                            response
+                        } else {
+                            response.on_hover_text(
+                                "Selection and preview are available; safe sensitive output requires proven OS-history exclusion",
                             )
-                            .on_disabled_hover_text(
-                                "Sensitive clips require proven OS-history exclusion",
-                            );
-                        if response.clicked() {
-                            self.actions.push_back(UiAction::Paste(clip.id));
+                        };
+                        if response.double_clicked() {
+                            self.selected = row;
+                            self.preview_clip_id = Some(clip.id);
+                            if delivery_allowed {
+                                self.actions.push_back(UiAction::Paste(clip.id));
+                            }
+                        } else if response.clicked() {
+                            self.selected = row;
+                            self.preview_clip_id = Some(clip.id);
                         }
 
                         ui.horizontal(|ui| {
                             let mut meta = vec![clip.meta.kind.label().to_string()];
                             if let Some(app) = &clip.meta.source_app {
                                 meta.push(short_app_name(app));
+                            }
+                            if clip.meta.sensitive {
+                                if memory_only {
+                                    meta.push("Memory only".into());
+                                } else if encryption_at_rest {
+                                    meta.push("Encrypted local history".into());
+                                } else {
+                                    meta.push("Unencrypted local history".into());
+                                }
+                                if clip.meta.expires_at.is_none() {
+                                    meta.push("No automatic expiry".into());
+                                }
+                                if !self.delivery.allows(true) {
+                                    meta.push("Safe copy unavailable".into());
+                                }
                             }
                             for badge in clip_badges(clip).into_iter().take(2) {
                                 meta.push(badge.label().into());
@@ -2483,10 +2723,7 @@ impl PopupApp {
                                 }
                             }
                             if session_protected {
-                                meta.push("Protected from capacity cleanup".into());
-                            }
-                            if memory_only {
-                                meta.push("Memory only".into());
+                                meta.push("Kept from capacity cleanup this session".into());
                             }
                             if let Some(delta) = hit.duplicate_delta {
                                 meta.push(format!(
@@ -2505,9 +2742,16 @@ impl PopupApp {
                                 meta.push(match_explanation_label(explanation).into());
                             }
                             meta.push(relative_time(clip.meta.created_at, Utc::now()));
+                            let meta_color = if selected {
+                                design::selected_secondary_text(ui)
+                            } else {
+                                design::secondary_text(ui)
+                            };
                             ui.add(
-                                egui::Label::new(RichText::new(meta.join(" · ")).small())
-                                    .truncate(),
+                                egui::Label::new(
+                                    RichText::new(meta.join(" · ")).small().color(meta_color),
+                                )
+                                .truncate(),
                             );
                             if hit.hidden_variants > 0
                                 && ui
@@ -2522,33 +2766,58 @@ impl PopupApp {
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if design::icon_button(ui, Icon::Menu, "Clip actions", false).clicked() {
+                    if design::icon_button_kind(
+                        ui,
+                        Icon::Menu,
+                        "Clip actions",
+                        false,
+                        design::IconButtonKind::Ghost,
+                    )
+                    .clicked()
+                    {
                         self.selected = row;
+                        self.preview_clip_id = Some(clip.id);
                         self.action_flyout = Some(clip.id);
                     }
                     if self.undo_applies_to(clip.id) {
-                        if design::icon_button(ui, Icon::Undo, "Undo row action", false).clicked() {
+                        if design::icon_button_kind(
+                            ui,
+                            Icon::Undo,
+                            "Undo row action",
+                            false,
+                            design::IconButtonKind::Ghost,
+                        )
+                        .clicked()
+                        {
                             self.apply_undo();
                         }
                     } else if clip.meta.sensitive {
-                        let response = design::icon_button(ui, Icon::Eye, "Peek", false);
+                        let response = design::icon_button_kind(
+                            ui,
+                            Icon::Eye,
+                            "Reveal for two seconds; does not copy",
+                            false,
+                            design::IconButtonKind::Ghost,
+                        );
                         if response.clicked() {
                             self.peek_sensitive =
                                 Some((clip.id, Instant::now() + Duration::from_secs(2)));
                         }
                     } else {
                         let pin_hover = if clip.pinned { "Unpin" } else { "Pin" };
-                        if design::icon_button(
+                        if design::icon_button_kind(
                             ui,
                             Icon::Pin {
                                 filled: clip.pinned,
                             },
                             pin_hover,
                             clip.pinned,
+                            design::IconButtonKind::Ghost,
                         )
                         .clicked()
                         {
                             self.selected = row;
+                            self.preview_clip_id = Some(clip.id);
                             self.actions
                                 .push_back(UiAction::SetPinned(clip.id, !clip.pinned));
                             self.undo_slot = Some(UndoSlot {
@@ -2563,13 +2832,24 @@ impl PopupApp {
                 });
             });
         });
+        if selected {
+            let stripe = egui::Rect::from_min_max(
+                row_output.response.rect.left_top(),
+                egui::pos2(
+                    row_output.response.rect.left() + 3.0,
+                    row_output.response.rect.bottom(),
+                ),
+            );
+            ui.painter().rect_filled(stripe, 0.0, design::accent(ui));
+        }
         ctx.accesskit_node_builder(row_output.response.id, |node| {
-            node.set_role(egui::accesskit::Role::ListItem);
+            node.set_role(egui::accesskit::Role::ListBoxOption);
             node.set_label(accessible_name);
             node.set_selected(selected);
             node.set_position_in_set(row + 1);
             node.set_size_of_set(total);
         });
+        row_output.response.id
     }
 
     fn render_clear_history_confirmation(&mut self, ctx: &egui::Context) {
@@ -2581,7 +2861,7 @@ impl PopupApp {
             egui::Modal::new(egui::Id::new("clear_history_confirmation")).show(ctx, |ui| {
                 ui.set_width(300.0);
                 ui.heading("Clear clipboard history?");
-                ui.label("Pinned and session-protected clips will be kept.");
+                ui.label("Pinned clips and items kept from capacity cleanup will remain.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let cancel = ui.button("Cancel").clicked();
@@ -2758,8 +3038,14 @@ fn render_capture_status(
 }
 
 fn digest_row(ui: &mut egui::Ui, label: &str, value: String) {
-    ui.label(RichText::new(label).small().weak());
-    ui.label(RichText::new(value).small().monospace());
+    ui.label(
+        RichText::new(label)
+            .small()
+            .color(design::secondary_text(ui)),
+    );
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(RichText::new(value).small().monospace());
+    });
     ui.end_row();
 }
 
@@ -2788,21 +3074,28 @@ fn human_duration(seconds: u64) -> String {
     }
 }
 
-fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) {
+fn render_security_status(ui: &mut egui::Ui, posture: SecurityPostureSummary) -> egui::Response {
     let color = security_color(ui, posture.level);
-    design::status_dot(ui, color);
-    ui.label(RichText::new(posture.level.label()).small().color(color))
-        .on_hover_text(format!(
-            "{} active, {} degraded, {} unavailable{}",
-            posture.active,
-            posture.degraded,
-            posture.unavailable,
-            if posture.strict_mode {
-                " · strict mode"
-            } else {
-                ""
-            }
-        ));
+    let label = match posture.level {
+        SecurityPostureLevel::Protected => "Protected",
+        SecurityPostureLevel::Partial => "Needs attention",
+        SecurityPostureLevel::Blocked => "Protection blocked",
+    };
+    ui.add_sized(
+        [142.0, design::ICON_BUTTON_SIZE],
+        egui::Button::new(RichText::new(label).small().strong().color(color)),
+    )
+    .on_hover_text(format!(
+        "Open privacy and status · {} active, {} degraded, {} unavailable{}",
+        posture.active,
+        posture.degraded,
+        posture.unavailable,
+        if posture.strict_mode {
+            " · strict mode"
+        } else {
+            ""
+        }
+    ))
 }
 
 fn security_color(ui: &egui::Ui, level: SecurityPostureLevel) -> Color32 {
@@ -3098,6 +3391,16 @@ fn merge_template_label(template: MergeTemplate) -> &'static str {
     }
 }
 
+const fn preview_transform_label(transform: PreviewTransform) -> &'static str {
+    match transform {
+        PreviewTransform::Original => "Original",
+        PreviewTransform::Trim => "Trim",
+        PreviewTransform::Uppercase => "Uppercase",
+        PreviewTransform::PrettyJson => "Pretty JSON",
+        PreviewTransform::CleanLink => "Clean link",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3151,6 +3454,19 @@ mod tests {
     }
 
     #[test]
+    fn every_density_row_fits_thumbnail_and_vertical_margins() {
+        let minimum = design::THUMBNAIL_SIZE + design::ROW_MARGIN * 2.0;
+        for (density, viewport_height) in [
+            (DensityMode::Compact, 420.0),
+            (DensityMode::Comfortable, 420.0),
+            (DensityMode::Auto, 420.0),
+            (DensityMode::Auto, 620.0),
+        ] {
+            assert!(density.row_height(viewport_height) >= minimum);
+        }
+    }
+
+    #[test]
     fn query_completion_replaces_only_the_last_token() {
         let mut query = "release notes ki".to_owned();
         replace_last_query_token(&mut query, "kind:");
@@ -3159,6 +3475,13 @@ mod tests {
         let mut unicode_query = "привет ap".to_owned();
         replace_last_query_token(&mut unicode_query, "app:");
         assert_eq!(unicode_query, "привет app:");
+    }
+
+    #[test]
+    fn enter_executes_the_selected_clip_instead_of_accepting_completion() {
+        assert!(QUERY_COMPLETION_ACCEPT_KEYS.contains(&Key::Tab));
+        assert!(QUERY_COMPLETION_ACCEPT_KEYS.contains(&Key::ArrowRight));
+        assert!(!QUERY_COMPLETION_ACCEPT_KEYS.contains(&Key::Enter));
     }
 
     #[test]

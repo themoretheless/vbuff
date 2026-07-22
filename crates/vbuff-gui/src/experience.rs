@@ -72,9 +72,9 @@ pub enum DensityMode {
 impl DensityMode {
     pub fn row_height(self, viewport_height: f32) -> f32 {
         match self {
-            Self::Compact => 54.0,
+            Self::Compact => 56.0,
             Self::Comfortable => 68.0,
-            Self::Auto if viewport_height < 560.0 => 54.0,
+            Self::Auto if viewport_height < 560.0 => 56.0,
             Self::Auto => 60.0,
         }
     }
@@ -259,11 +259,11 @@ pub enum ClipBadge {
 impl ClipBadge {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Verified => "Verified",
-            Self::Lossless => "Lossless",
-            Self::Partial => "Partial",
+            Self::Verified => "Bytes checked",
+            Self::Lossless => "Read succeeded",
+            Self::Partial => "Formats partial",
             Self::Sensitive => "Sensitive",
-            Self::LocalOnly => "Local",
+            Self::LocalOnly => "No sync",
         }
     }
 }
