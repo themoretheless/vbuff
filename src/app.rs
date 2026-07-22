@@ -240,11 +240,15 @@ impl Runtime {
         if let Ok(mut target) = self.event_waker.lock() {
             *target = Some(ctx.clone());
         }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.popup.request_hide(ctx);
-        }
         self.ensure_tray();
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
+            if self.can_hide_to_resident_surface() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.popup.request_hide(ctx);
+            } else {
+                self.quit_requested = true;
+            }
+        }
         ctx.request_repaint_after(SUPERVISORY_REPAINT_INTERVAL);
 
         while let Ok(intent) = self.instance_intents.try_recv() {
@@ -309,6 +313,25 @@ impl Runtime {
 
     #[cfg(not(feature = "tray"))]
     fn ensure_tray(&mut self) {}
+
+    #[cfg(feature = "tray")]
+    fn can_hide_to_resident_surface(&self) -> bool {
+        self.tray.is_some()
+    }
+
+    #[cfg(not(feature = "tray"))]
+    fn can_hide_to_resident_surface(&self) -> bool {
+        false
+    }
+
+    fn hide_or_quit(&mut self, ctx: &egui::Context) {
+        if self.can_hide_to_resident_surface() {
+            self.popup.request_hide(ctx);
+        } else {
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
 
     #[cfg(feature = "tray")]
     fn tray_commands(&self) -> Vec<AppCommand> {
@@ -384,15 +407,18 @@ impl Runtime {
             }
             AppCommand::SetSessionProtected(id, protected) => {
                 if let Err(error) = self.history.set_session_protected(id, protected) {
-                    self.notice(NoticeLevel::Error, "Couldn't update session protection");
-                    tracing::warn!("updating session protection failed: {error}");
+                    self.notice(
+                        NoticeLevel::Error,
+                        "Couldn't update the capacity-cleanup exception",
+                    );
+                    tracing::warn!("updating capacity-cleanup exception failed: {error}");
                 } else {
                     self.notice(
                         NoticeLevel::Info,
                         if protected {
-                            "Clip protected for this session"
+                            "Kept from capacity cleanup until vbuff exits; expiry and manual deletion still apply"
                         } else {
-                            "Session protection removed"
+                            "Capacity-cleanup exception removed"
                         },
                     );
                 }
@@ -446,7 +472,7 @@ impl Runtime {
                 Ok(()) => {
                     self.notice(
                         NoticeLevel::Info,
-                        "History cleared; pinned and session-protected clips kept",
+                        "History cleared; pinned clips and capacity-cleanup exceptions kept",
                     );
                 }
                 Err(error) => {
@@ -513,8 +539,7 @@ impl Runtime {
                     tracing::warn!("saving hotkey coachmark state failed: {error}");
                 }
             }
-            AppCommand::Hide => self.popup.request_hide(ctx),
-            #[cfg(feature = "tray")]
+            AppCommand::Hide => self.hide_or_quit(ctx),
             AppCommand::Quit => {
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -544,12 +569,10 @@ impl Runtime {
         match self.paste.schedule(flavors, sensitive, Instant::now()) {
             Ok(outcome) => {
                 if outcome == PasteOutcome::CopiedOnly {
-                    self.notice(
-                        NoticeLevel::Warning,
-                        "Clip copied; automatic paste is unavailable, paste it manually",
-                    );
-                    self.announce("Clip copied; paste it manually");
-                    tracing::warn!("clip copied; automatic paste is unavailable");
+                    self.announce("Copied. Paste manually.");
+                    self.clear_notice();
+                    self.hide_or_quit(ctx);
+                    tracing::info!("clip copied; automatic paste is unavailable");
                 } else {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.clear_notice();
@@ -561,9 +584,9 @@ impl Runtime {
                 // Keep the popup visible: sending a paste after a failed write
                 // could paste unrelated clipboard contents into the target app.
                 let message = if sensitive {
-                    "Sensitive clip was not copied because OS history exclusion is unavailable"
+                    "Not copied. Sensitive clipboard-history protection is unavailable; clipboard unchanged."
                 } else {
-                    "Couldn't stage the selected clip"
+                    "Copy failed; clipboard unchanged."
                 };
                 self.notice(NoticeLevel::Error, message);
                 self.announce(message);

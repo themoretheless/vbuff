@@ -41,7 +41,6 @@ pub(crate) enum AppCommand {
     DismissNotice,
     DismissHotkeyCoachmark,
     Hide,
-    #[cfg(feature = "tray")]
     Quit,
 }
 
@@ -110,7 +109,6 @@ impl fmt::Debug for AppCommand {
             Self::DismissNotice => formatter.write_str("DismissNotice"),
             Self::DismissHotkeyCoachmark => formatter.write_str("DismissHotkeyCoachmark"),
             Self::Hide => formatter.write_str("Hide"),
-            #[cfg(feature = "tray")]
             Self::Quit => formatter.write_str("Quit"),
         }
     }
@@ -146,6 +144,7 @@ impl From<UiAction> for AppCommand {
             UiAction::DismissNotice => Self::DismissNotice,
             UiAction::DismissHotkeyCoachmark => Self::DismissHotkeyCoachmark,
             UiAction::Hide => Self::Hide,
+            UiAction::Quit => Self::Quit,
         }
     }
 }

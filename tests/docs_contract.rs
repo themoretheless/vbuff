@@ -231,7 +231,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("read `src/diagnostics.rs`"));
     assert!(readme.contains("read `src/single_instance/mod.rs`"));
     assert!(readme.contains("duplicate launch forwards `ShowPopup`"));
-    assert!(readme.contains("Twenty-four checked-in golden images"));
+    assert!(readme.contains("Twenty-eight checked-in golden images"));
     assert!(readme.contains("docs/decision-gates-151-200.md"));
     assert!(readme.contains("docs/decision-gates-201-250.md"));
     assert!(readme.contains("docs/decision-gates-251-300.md"));
@@ -254,7 +254,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("| `src/single_instance/` |"));
     assert!(architecture.contains("`CaptureHealth::Stalled`"));
     assert!(architecture.contains("schema v7"));
-    assert!(architecture.contains("History/Compose/Trust/Settings"));
+    assert!(architecture.contains("History/Stack/Privacy/Settings"));
     assert!(architecture.contains("workflow/everyday.rs"));
     assert!(architecture.contains("device_experience.rs"));
     assert!(architecture.contains("data_lifecycle.rs"));

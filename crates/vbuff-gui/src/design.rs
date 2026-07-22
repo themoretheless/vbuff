@@ -1,15 +1,24 @@
 //! Shared layout tokens and small native icon buttons for the popup.
 
 use egui::{
-    Color32, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, WidgetInfo,
-    WidgetType,
+    Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, Vec2,
+    WidgetInfo, WidgetType,
 };
 
 pub(crate) const POPUP_SIZE: [f32; 2] = [820.0, 620.0];
 pub(crate) const POPUP_MIN_SIZE: [f32; 2] = [520.0, 420.0];
-pub(crate) const ROW_MARGIN: f32 = 7.0;
+pub(crate) const SPACE_XS: f32 = 4.0;
+pub(crate) const SPACE_S: f32 = 8.0;
+pub(crate) const SPACE_M: f32 = 12.0;
+pub(crate) const SPACE_L: f32 = 16.0;
+pub(crate) const SPACE_XL: f32 = 24.0;
+pub(crate) const ROW_MARGIN: f32 = SPACE_S;
 pub(crate) const THUMBNAIL_SIZE: f32 = 40.0;
-pub(crate) const ICON_BUTTON_SIZE: f32 = 28.0;
+pub(crate) const CONTROL_M: f32 = 32.0;
+pub(crate) const CONTROL_L: f32 = 36.0;
+pub(crate) const ICON_BUTTON_SIZE: f32 = CONTROL_M;
+pub(crate) const RADIUS_CONTROL: f32 = 4.0;
+pub(crate) const RADIUS_OVERLAY: f32 = 6.0;
 pub(crate) const WARNING: Color32 = Color32::from_rgb(246, 194, 92);
 pub(crate) const DANGER: Color32 = Color32::from_rgb(255, 130, 142);
 
@@ -31,6 +40,18 @@ pub(crate) fn danger(ui: &Ui) -> Color32 {
 
 pub(crate) fn info(ui: &Ui) -> Color32 {
     info_for(ui.visuals().dark_mode)
+}
+
+pub(crate) fn secondary_text(ui: &Ui) -> Color32 {
+    secondary_text_for(ui.visuals().dark_mode)
+}
+
+pub(crate) fn selected_secondary_text(ui: &Ui) -> Color32 {
+    selected_secondary_text_for(ui.visuals().dark_mode)
+}
+
+pub(crate) fn border_strong(ui: &Ui) -> Color32 {
+    border_strong_for(ui.visuals().dark_mode)
 }
 
 const fn accent_for(dark: bool) -> Color32 {
@@ -73,6 +94,38 @@ const fn info_for(dark: bool) -> Color32 {
     }
 }
 
+const fn secondary_text_for(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(183, 190, 201)
+    } else {
+        Color32::from_rgb(82, 91, 103)
+    }
+}
+
+const fn selected_secondary_text_for(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(205, 213, 224)
+    } else {
+        Color32::from_rgb(61, 72, 86)
+    }
+}
+
+const fn border_strong_for(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(112, 122, 136)
+    } else {
+        Color32::from_rgb(102, 113, 126)
+    }
+}
+
+const fn on_accent_for(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(11, 29, 35)
+    } else {
+        Color32::WHITE
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
     Delete,
@@ -81,6 +134,7 @@ pub(crate) enum Icon {
     Resume,
     Close,
     Add,
+    Copy,
     Paste,
     Up,
     Down,
@@ -91,17 +145,47 @@ pub(crate) enum Icon {
     Undo,
 }
 
-pub(crate) fn apply(ctx: &egui::Context) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IconButtonKind {
+    Ghost,
+    Toolbar,
+    Primary,
+    Danger,
+}
+
+pub(crate) fn apply(ctx: &egui::Context, reduced_motion: bool) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(9.0, 5.0);
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(12.0));
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(13.5));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(18.0));
+    style.spacing.item_spacing = egui::vec2(SPACE_S, SPACE_S);
+    style.spacing.button_padding = egui::vec2(SPACE_M, SPACE_XS);
     style.spacing.interact_size = egui::vec2(ICON_BUTTON_SIZE, ICON_BUTTON_SIZE);
-    style.visuals.window_corner_radius = egui::CornerRadius::same(6);
-    style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(4);
+    style.animation_time = if reduced_motion { 0.0 } else { 1.0 / 12.0 };
+    style.scroll_animation = if reduced_motion {
+        egui::style::ScrollAnimation::none()
+    } else {
+        egui::style::ScrollAnimation::default()
+    };
+    style.visuals.window_corner_radius = egui::CornerRadius::same(RADIUS_OVERLAY as u8);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(RADIUS_OVERLAY as u8);
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL as u8);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL as u8);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL as u8);
+    style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL as u8);
+    style.visuals.weak_text_color = Some(secondary_text_for(style.visuals.dark_mode));
     if style.visuals.dark_mode {
         style.visuals.selection.bg_fill = Color32::from_rgb(24, 59, 85);
         style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
@@ -113,6 +197,8 @@ pub(crate) fn apply(ctx: &egui::Context) {
         style.visuals.faint_bg_color = Color32::from_rgb(32, 37, 44);
         style.visuals.extreme_bg_color = Color32::from_rgb(17, 20, 24);
         style.visuals.code_bg_color = Color32::from_rgb(20, 34, 38);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(69, 76, 87));
     } else {
         style.visuals.selection.bg_fill = Color32::from_rgb(220, 235, 250);
         style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(31, 77, 108));
@@ -124,24 +210,52 @@ pub(crate) fn apply(ctx: &egui::Context) {
         style.visuals.faint_bg_color = Color32::from_rgb(233, 238, 242);
         style.visuals.extreme_bg_color = Color32::WHITE;
         style.visuals.code_bg_color = Color32::from_rgb(228, 241, 243);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(151, 161, 173));
     }
     ctx.set_style(style);
 }
 
 pub(crate) fn navigation_tab(ui: &mut Ui, label: &'static str, selected: bool) -> Response {
-    ui.add_sized(
-        [68.0, ICON_BUTTON_SIZE],
-        egui::Button::selectable(selected, label),
-    )
+    let text = if selected {
+        egui::RichText::new(label).strong().color(accent(ui))
+    } else {
+        egui::RichText::new(label)
+    };
+    let response = ui.add_sized(
+        [72.0, CONTROL_M],
+        egui::Button::new(text).selected(selected).frame(false),
+    );
+    if selected {
+        let underline = Rect::from_min_max(
+            egui::pos2(response.rect.left() + SPACE_S, response.rect.bottom() - 2.0),
+            egui::pos2(response.rect.right() - SPACE_S, response.rect.bottom()),
+        );
+        ui.painter().rect_filled(underline, 1.0, accent(ui));
+    }
+    response
 }
 
 pub(crate) fn section_heading(ui: &mut Ui, title: &str, detail: Option<&str>) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title).strong().size(14.0));
+        ui.label(egui::RichText::new(title).strong().size(15.0));
         if let Some(detail) = detail {
             ui.label(egui::RichText::new(detail).small().weak());
         }
     });
+}
+
+pub(crate) fn primary_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add_sized(
+        [76.0, CONTROL_L],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .strong()
+                .color(on_accent_for(ui.visuals().dark_mode)),
+        )
+        .fill(accent(ui))
+        .stroke(Stroke::new(1.0_f32, accent(ui))),
+    )
 }
 
 /// A fixed-size symbol button with a tooltip and no font-dependent emoji.
@@ -151,25 +265,60 @@ pub(crate) fn icon_button(
     tooltip: &'static str,
     selected: bool,
 ) -> Response {
+    icon_button_kind(ui, icon, tooltip, selected, IconButtonKind::Toolbar)
+}
+
+pub(crate) fn icon_button_kind(
+    ui: &mut Ui,
+    icon: Icon,
+    tooltip: &'static str,
+    selected: bool,
+    kind: IconButtonKind,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON_SIZE), Sense::click());
     let visuals = ui.style().interact_selectable(&response, selected);
-    ui.painter().rect(
-        rect,
-        4.0,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-        StrokeKind::Inside,
-    );
+    let semantic = match kind {
+        IconButtonKind::Primary => accent(ui),
+        IconButtonKind::Danger => danger(ui),
+        IconButtonKind::Ghost | IconButtonKind::Toolbar => visuals.fg_stroke.color,
+    };
+    let bg_fill = match kind {
+        IconButtonKind::Toolbar => visuals.weak_bg_fill,
+        IconButtonKind::Ghost if selected || response.hovered() || response.has_focus() => {
+            visuals.weak_bg_fill
+        }
+        IconButtonKind::Ghost => Color32::TRANSPARENT,
+        IconButtonKind::Primary => semantic,
+        IconButtonKind::Danger if response.hovered() || response.has_focus() => {
+            Color32::from_rgba_unmultiplied(semantic.r(), semantic.g(), semantic.b(), 34)
+        }
+        IconButtonKind::Danger => Color32::TRANSPARENT,
+    };
+    let bg_stroke = if response.has_focus() {
+        Stroke::new(2.0_f32, accent(ui))
+    } else if kind == IconButtonKind::Toolbar {
+        visuals.bg_stroke
+    } else {
+        Stroke::NONE
+    };
+    ui.painter()
+        .rect(rect, RADIUS_CONTROL, bg_fill, bg_stroke, StrokeKind::Inside);
 
-    let stroke = Stroke::new(1.6_f32, visuals.fg_stroke.color);
+    let icon_color = match kind {
+        IconButtonKind::Primary => on_accent_for(ui.visuals().dark_mode),
+        IconButtonKind::Danger => semantic,
+        IconButtonKind::Ghost | IconButtonKind::Toolbar => visuals.fg_stroke.color,
+    };
+    let stroke = Stroke::new(1.5_f32, icon_color);
     let center = rect.center();
     match icon {
         Icon::Delete => draw_delete(ui, center, stroke),
         Icon::Pin { filled } => draw_pin(ui, center, stroke, filled),
         Icon::Pause => draw_pause(ui, center, stroke),
-        Icon::Resume => draw_resume(ui, center, visuals.fg_stroke.color),
+        Icon::Resume => draw_resume(ui, center, icon_color),
         Icon::Close => draw_close(ui, center, stroke),
         Icon::Add => draw_add(ui, center, stroke),
+        Icon::Copy => draw_copy(ui, center, stroke),
         Icon::Paste => draw_paste(ui, center, stroke),
         Icon::Up => draw_chevron(ui, center, stroke, -1.0),
         Icon::Down => draw_chevron(ui, center, stroke, 1.0),
@@ -288,6 +437,15 @@ fn draw_add(ui: &Ui, center: Pos2, stroke: Stroke) {
         ],
         stroke,
     );
+}
+
+fn draw_copy(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let back = Rect::from_center_size(center + egui::vec2(-2.0, -2.0), egui::vec2(8.0, 9.0));
+    let front = Rect::from_center_size(center + egui::vec2(2.0, 2.0), egui::vec2(8.0, 9.0));
+    ui.painter()
+        .rect_stroke(back, 1.0, stroke, StrokeKind::Inside);
+    ui.painter()
+        .rect_stroke(front, 1.0, stroke, StrokeKind::Inside);
 }
 
 fn draw_paste(ui: &Ui, center: Pos2, stroke: Stroke) {
@@ -411,6 +569,51 @@ mod tests {
                 );
                 assert!(ratio >= 4.5, "semantic color contrast was {ratio:.2}:1");
             }
+        }
+    }
+
+    #[test]
+    fn secondary_text_passes_wcag_aa_on_both_panel_themes() {
+        for (dark, background) in [
+            (true, Color32::from_rgb(24, 27, 32)),
+            (false, Color32::from_rgb(245, 247, 249)),
+        ] {
+            let foreground = secondary_text_for(dark);
+            let ratio = contrast_ratio(
+                [foreground.r(), foreground.g(), foreground.b()],
+                [background.r(), background.g(), background.b()],
+            );
+            assert!(ratio >= 4.5, "secondary text contrast was {ratio:.2}:1");
+        }
+    }
+
+    #[test]
+    fn strong_borders_pass_non_text_contrast_on_both_panel_themes() {
+        for (dark, background) in [
+            (true, Color32::from_rgb(24, 27, 32)),
+            (false, Color32::from_rgb(245, 247, 249)),
+        ] {
+            let foreground = border_strong_for(dark);
+            let ratio = contrast_ratio(
+                [foreground.r(), foreground.g(), foreground.b()],
+                [background.r(), background.g(), background.b()],
+            );
+            assert!(ratio >= 3.0, "strong border contrast was {ratio:.2}:1");
+        }
+    }
+
+    #[test]
+    fn selected_secondary_text_passes_wcag_aa_on_selection_fills() {
+        for (dark, background) in [
+            (true, Color32::from_rgb(24, 59, 85)),
+            (false, Color32::from_rgb(220, 235, 250)),
+        ] {
+            let foreground = selected_secondary_text_for(dark);
+            let ratio = contrast_ratio(
+                [foreground.r(), foreground.g(), foreground.b()],
+                [background.r(), background.g(), background.b()],
+            );
+            assert!(ratio >= 4.5, "selected metadata contrast was {ratio:.2}:1");
         }
     }
 }

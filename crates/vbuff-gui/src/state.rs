@@ -182,7 +182,7 @@ pub enum UiAction {
     PasteText { text: String, sensitive: bool },
     /// Pin or unpin a clip.
     SetPinned(ClipId, bool),
-    /// Protect or unprotect a clip until this resident process exits.
+    /// Exempt or unexempt a clip from capacity cleanup until this process exits.
     SetSessionProtected(ClipId, bool),
     /// Create a text-only derivative while preserving the canonical clip.
     CreatePlainTextClone(ClipId),
@@ -190,7 +190,7 @@ pub enum UiAction {
     Delete(ClipId),
     /// Restore one recently deleted in-memory clip.
     RestoreClip(Box<Clip>),
-    /// Clear history while preserving pinned and session-protected clips.
+    /// Clear history while preserving pinned clips and cleanup exceptions.
     ClearHistory,
     /// Toggle capture pause.
     TogglePause,
@@ -215,8 +215,10 @@ pub enum UiAction {
     DismissNotice,
     /// Permanently dismiss the first-run hotkey coachmark.
     DismissHotkeyCoachmark,
-    /// Hide the popup (Esc / focus loss).
+    /// Close the popup; the runtime hides or exits based on resident availability.
     Hide,
+    /// Exit the resident application.
+    Quit,
 }
 
 impl fmt::Debug for UiAction {
@@ -277,6 +279,7 @@ impl fmt::Debug for UiAction {
             Self::DismissNotice => formatter.write_str("DismissNotice"),
             Self::DismissHotkeyCoachmark => formatter.write_str("DismissHotkeyCoachmark"),
             Self::Hide => formatter.write_str("Hide"),
+            Self::Quit => formatter.write_str("Quit"),
         }
     }
 }

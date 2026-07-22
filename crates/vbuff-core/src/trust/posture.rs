@@ -84,12 +84,17 @@ impl PrivacyScore {
         };
         factor(&mut factors, "retention", retention_points);
 
-        let value = (50_i16
+        let mut value = (50_i16
             + factors
                 .iter()
                 .map(|factor| i16::from(factor.points))
                 .sum::<i16>())
         .clamp(0, 100) as u8;
+        if (!input.encryption_at_rest || !input.sensitive_memory_only) && value > 54 {
+            let adjustment = 54_i16 - i16::from(value);
+            factor(&mut factors, "minimum_protection_gate", adjustment as i8);
+            value = 54;
+        }
         let level = match value {
             80..=100 => PrivacyScoreLevel::Strong,
             55..=79 => PrivacyScoreLevel::Balanced,
@@ -296,6 +301,40 @@ mod tests {
         let export = RedactedPolicyExport::new(posture, 4, 2).to_json().unwrap();
         assert!(export.contains("\"schema_version\": 1"));
         assert!(!export.contains("source_app"));
+    }
+
+    #[test]
+    fn privacy_score_requires_encrypted_storage_for_strong_level() {
+        let score = PrivacyScore::calculate(PrivacyPostureInput {
+            encryption_at_rest: false,
+            strict_local_only: true,
+            sensitive_memory_only: true,
+            telemetry_enabled: false,
+            sync_enabled: false,
+            denied_source_count: 2,
+            retention_days: Some(7),
+        });
+
+        assert_eq!(score.value, 54);
+        assert_eq!(score.level, PrivacyScoreLevel::NeedsAttention);
+        assert_eq!(score.factors.last().unwrap().key, "minimum_protection_gate");
+    }
+
+    #[test]
+    fn privacy_score_requires_sensitive_memory_only_for_strong_level() {
+        let score = PrivacyScore::calculate(PrivacyPostureInput {
+            encryption_at_rest: true,
+            strict_local_only: true,
+            sensitive_memory_only: false,
+            telemetry_enabled: false,
+            sync_enabled: false,
+            denied_source_count: 2,
+            retention_days: Some(7),
+        });
+
+        assert_eq!(score.value, 54);
+        assert_eq!(score.level, PrivacyScoreLevel::NeedsAttention);
+        assert_eq!(score.factors.last().unwrap().key, "minimum_protection_gate");
     }
 
     #[test]

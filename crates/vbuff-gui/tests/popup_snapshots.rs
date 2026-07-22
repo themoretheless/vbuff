@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use egui_kittest::{Harness, SnapshotOptions};
 use vbuff_core::content_hash_from_flavors;
+use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, PopupApp};
 use vbuff_types::{
     CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, Clip, ClipId, ClipMeta,
@@ -54,6 +55,33 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
                 harness.snapshot_options(name, &snapshots);
             }
         }
+    }
+}
+
+#[test]
+fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
+    let snapshots = SnapshotOptions::new()
+        .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
+    for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
+        let wide_state = Arc::new(Mutex::new(snapshot_state(Surface::Populated)));
+        let mut wide = Harness::builder()
+            .with_size(egui::vec2(820.0, 620.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(|_| PopupApp::new(wide_state));
+        wide.run_steps(2);
+        wide.snapshot_options(format!("popup_{theme_name}_1x_wide_populated"), &snapshots);
+
+        let minimum_state = Arc::new(Mutex::new(snapshot_state(Surface::Alerts)));
+        let mut minimum = Harness::builder()
+            .with_size(egui::vec2(520.0, 420.0))
+            .with_pixels_per_point(1.5)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(|_| PopupApp::new(minimum_state));
+        minimum.run_steps(2);
+        minimum.snapshot_options(format!("popup_{theme_name}_1_5x_min_alerts"), &snapshots);
     }
 }
 
@@ -128,6 +156,15 @@ fn snapshot_state(surface: Surface) -> AppState {
         unavailable: 1,
         strict_mode: false,
     };
+    state.privacy_score = Some(PrivacyScore::calculate(PrivacyPostureInput {
+        encryption_at_rest: false,
+        strict_local_only: true,
+        sensitive_memory_only: true,
+        telemetry_enabled: false,
+        sync_enabled: false,
+        denied_source_count: 1,
+        retention_days: Some(7),
+    }));
     state.capabilities = vec![
         CapabilityView {
             feature: "core_dumps".into(),
