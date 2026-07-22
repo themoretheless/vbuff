@@ -30,7 +30,11 @@ fn is_protected(clip: &Clip) -> bool {
 /// policy.
 ///
 /// Returns the ids of clips that should be deleted (oldest unprotected first).
-/// `clips` need not be sorted; the function determines recency from the ULID.
+/// `clips` need not be sorted; the function determines recency from each
+/// clip's `meta.updated_at`, not its id/creation time - a clip's [`ClipId`]
+/// is fixed at first capture and never changes when a repeat copy bumps it
+/// back to the top, so sorting by id would treat a just-re-copied clip as
+/// old and evict it ahead of clips nobody has touched in weeks.
 pub fn evict(clips: &[Clip], policy: &EvictionPolicy) -> Vec<vbuff_types::ClipId> {
     if clips.len() <= policy.max_history {
         return Vec::new();
@@ -39,9 +43,9 @@ pub fn evict(clips: &[Clip], policy: &EvictionPolicy) -> Vec<vbuff_types::ClipId
     // How many we must remove overall.
     let mut overflow = clips.len() - policy.max_history;
 
-    // Candidates: unprotected clips, oldest first (ascending ULID).
+    // Candidates: unprotected clips, least-recently-touched first.
     let mut candidates: Vec<&Clip> = clips.iter().filter(|c| !is_protected(c)).collect();
-    candidates.sort_by_key(|a| a.id.0);
+    candidates.sort_by_key(|a| a.meta.updated_at);
 
     let mut to_evict = Vec::new();
     for clip in candidates {
@@ -57,17 +61,44 @@ pub fn evict(clips: &[Clip], policy: &EvictionPolicy) -> Vec<vbuff_types::ClipId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
     use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
 
+    /// Build a test clip whose id AND `updated_at` both derive from `ts`, so
+    /// tests can keep using a simple integer for "how old" while exercising
+    /// the real recency field the policy now sorts by.
     fn clip(ts: u64, pinned: bool) -> Clip {
+        let when = DateTime::from_timestamp_millis(ts as i64).unwrap();
         Clip {
             id: ClipId(ulid::Ulid::from_parts(ts, 0)),
             flavors: vec![Flavor::inline("text/plain", b"x".to_vec())],
             content_hash: [0u8; 32],
-            meta: ClipMeta::now(ContentKind::Text, 1, None),
+            meta: ClipMeta {
+                created_at: when,
+                updated_at: when,
+                byte_size: 1,
+                source_app: None,
+                kind: ContentKind::Text,
+            },
             pinned,
             favorite: false,
         }
+    }
+
+    #[test]
+    fn recopy_bumps_updated_at_and_protects_from_eviction_order() {
+        // A clip captured first (ts=1, so id-oldest) but re-copied most
+        // recently (updated_at bumped past the others) must NOT be treated
+        // as the oldest just because its id says so.
+        let mut recopied = clip(1, false);
+        recopied.meta.updated_at = DateTime::from_timestamp_millis(999).unwrap();
+        let clips = vec![recopied.clone(), clip(2, false), clip(3, false)];
+        let policy = EvictionPolicy { max_history: 2 };
+        let evicted = evict(&clips, &policy);
+        assert_eq!(evicted.len(), 1);
+        // ts=2 has the smallest updated_at now, not the id-oldest (ts=1).
+        assert_eq!(evicted[0], ClipId(ulid::Ulid::from_parts(2, 0)));
+        assert!(!evicted.contains(&recopied.id));
     }
 
     #[test]

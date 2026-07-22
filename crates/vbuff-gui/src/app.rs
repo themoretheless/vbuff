@@ -1,4 +1,4 @@
-//! The eframe popup application.
+//! The eframe popup application: orchestration only.
 //!
 //! Renders a borderless, always-on-top popup: a search box at the top that
 //! filters as you type, and a virtualized results list below. Keyboard-driven:
@@ -7,8 +7,8 @@
 //! and Esc to close the popup. The runtime keeps the process resident only when
 //! it has a recoverable resident surface.
 //!
-//! The app does not perform side effects itself. It pushes [`UiAction`]s into a
-//! queue, which the wiring drains each frame via [`PopupApp::take_actions`].
+//! The app does not perform side effects itself. It pushes [`UiAction`]s into
+//! a queue, which the wiring drains each frame via [`PopupApp::take_actions`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -295,7 +295,7 @@ impl PopupApp {
     }
 
     /// Hide the popup.
-    fn hide(&mut self, ctx: &egui::Context) {
+    pub(crate) fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.peek_sensitive = None;
         self.focus_guard.reset();

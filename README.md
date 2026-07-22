@@ -18,6 +18,12 @@ vbuff therefore does not try to win by accumulating the longest feature list. It
 
 vbuff is designed as one codebase with native, per-OS backends behind common Rust traits. The table below is the **target backend matrix**, not a list of active implementations. Today the executable polls generic `arboard` for text-or-image clipboard access. It cannot prove source application, concealed/private markers, clipboard generation, provenance, or complete flavor enumeration. Rules that require those signals must report them unavailable rather than infer them.
 
+> **Target design, not current state.** The table below is the per-OS native backend architecture vbuff is being
+> built toward. The current repository ships exactly one cross-platform clipboard backend (`arboard`, polling,
+> text + single-image only, no concealed-hint support) and one hotkey backend (`global-hotkey`, which does not
+> cover Wayland). None of the native XFIXES/`wlr-data-control`/`AddClipboardFormatListener` paths, and none of the
+> concealed-hint honoring, exist yet. See [docs/code-audit-top-50.md](docs/code-audit-top-50.md) items #11-#20.
+
 | Platform | Clipboard capture | Global hotkey | Paste-back | Notes |
 |---|---|---|---|---|
 | **macOS** | `NSPasteboard` `changeCount` polling (~150-250 ms, adaptive idle backoff) | Carbon `RegisterEventHotKey` | Focus restore + synthetic Cmd+V | Paste-back needs **Accessibility** permission (granted in System Settings). Honors `org.nspasteboard.ConcealedType` / `TransientType`. |
@@ -35,14 +41,19 @@ Source-app attribution and per-app exclusion require a trustworthy foreground id
 
 Curated from the project's feature catalog (the strongest MVP and v1 items, not the full 640). This section describes the intended product; the authoritative current implementation is listed under **Status** and in the batch ledger below.
 
+> **Reading this section.** These are the *target* MVP/v1 feature set, not all shipped yet. Bullets marked
+> **(target)** describe design intent with no corresponding code in the repo today; see
+> [docs/code-audit-top-50.md](docs/code-audit-top-50.md) for the full, file-and-line-grounded gap list between this
+> page and the current binary.
+
 ### Capture everything, byte-for-byte
 
-- Background watcher captures **every** clipboard change automatically, idling near 0% CPU.
-- Stores **plain text, rich text/HTML, RTF and images** out of the box; files/folders, custom MIME types and color clips follow in v1/v2.
-- **Captures all flavors of a single copy atomically** (a web copy keeps HTML + plain text + image together) so you choose the representation at paste time.
+- Background watcher captures clipboard changes via a fixed-interval `arboard` poll today (target: event-driven per-OS backends, near-0%-idle CPU - **target**, see audit #11-13).
+- Currently captures **plain text and a single raster image** per copy via `arboard`; rich text/HTML, RTF, files/folders, custom MIME types and color clips are **target** (audit #14-15).
+- Atomic multi-flavor capture (HTML + plain text + image together) is **target**; today only one flavor is ever stored per copy (audit #14).
 - **Byte-for-byte fidelity**: no whitespace, newline or encoding normalization, so editor selections and exact payloads round-trip.
 - **Deduplicates** re-copied content (move-to-top instead of a duplicate row) via a BLAKE3 content hash.
-- **Pause / resume**, **incognito mode**, and a **manual capture-on-demand** hotkey.
+- **Pause / resume** works today. Incognito mode and a manual capture-on-demand hotkey are **target** (audit #7-8).
 
 ### Instant keyboard-driven recall
 
@@ -50,27 +61,27 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 - Fully keyboard-driven: navigate, filter, paste-back and pin without touching the mouse.
 - **Number-key quick-pick** for the top items, and per-action shortcuts (paste, paste-plain, pin, delete).
 - Type / pinned / favorite filters, empty and no-results states, dark/light themes, image thumbnails, per-type icons.
-- Virtualized list keeps search-as-you-type fluid over very large histories; FTS5 indexed search is enabled in v1 for 100k+ items.
+- Search today is a client-side substring filter over the most recent 1,000 clips; FTS5 indexed search for 100k+ items is **target**, and no FTS5 schema exists yet (audit #21-23).
 
 ### Reliable paste-back
 
 - Restores focus to the previously active app and injects a real paste, so the clip lands where you were typing.
 - **Plain vs keep-formatting** paste, with a one-shot paste-as-plain action.
 - **Enter** to paste-back, double-click to paste, or a number key for quick-pick; **copy-only** fallback when paste injection is unavailable.
-- Self-write suppression so vbuff never re-captures its own paste.
+- Self-write suppression is **target**; today a paste triggers a harmless but needless re-insert cycle on the next capture-thread poll (audit #44).
 
 ### Organization that survives restarts
 
 - **Pin to top** and **star as favorite**; pinned items are exempt from eviction and persist across restarts as a reusable snippet bank.
 - Promote a clip to a **permanent** item that never auto-prunes.
 - Tags, folders/collections, named tabs, pinboards, notes, color labels and manual drag-reorder arrive in v1.
-- Configurable retention: count cap, total-size cap, time expiry, or unlimited mode (pins/favorites always exempt).
+- Configurable retention: count cap, total-size cap, time expiry, or unlimited mode (pins/favorites always exempt). Today only a count cap is implemented; total-size cap and time expiry are **target**.
 
 ### Snippets and quick transforms (growing through v1)
 
-- Saved snippets with abbreviation expansion, insert-by-hotkey, folders and a built-in editor; date/time placeholders in the MVP set.
-- Promote any clip into a snippet in one keystroke.
-- Quick-action palette with change-case, trim whitespace, strip formatting and literal find-and-replace; programmer-case, regex replace, base64/URL encode-decode and JSON pretty-print expand the set in v1.
+- Saved snippets with abbreviation expansion, insert-by-hotkey, folders and a built-in editor; date/time placeholders in the MVP set. **(target - not in this repo yet)**
+- Promote any clip into a snippet in one keystroke. **(target)**
+- Quick-action palette with change-case, trim whitespace, strip formatting and literal find-and-replace; programmer-case, regex replace, base64/URL encode-decode and JSON pretty-print expand the set in v1. **(target - no transform code exists yet)**
 - One product instead of a separate clipboard manager *and* a separate text expander.
 
 ### Private and trustworthy by construction
@@ -103,7 +114,7 @@ Schema 7 and its lifecycle APIs include migration, archive, retention, quarantin
 
 ## Architecture at a glance
 
-vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit- and property-testable on any host with mock backends.
+vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit-testable on any host without touching the OS. Mock implementations of the four `vbuff-platform` traits are a **target** (not present in the repo yet - [docs/code-audit-top-50.md](docs/code-audit-top-50.md) #34), so today only pure logic is tested; the real clipboard/hotkey/paste code paths have no automated test coverage.
 
 | Crate | Role | In MVP? |
 |---|---|---|
@@ -339,6 +350,8 @@ The backlog remains research input, not promised scope. Contract-only sync, plug
 - [docs/ideas-611-620.md](docs/ideas-611-620.md) - ten review-derived state-machine, replay, configuration, and release-evidence candidates, also outside the active goal.
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 verified high-signal repositories plus the scientific papers, standards, and concrete lessons behind items 501-600.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
+- [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in *this repo's own code* today, each grounded in a file and line, cross-referenced against the claims made in this README, `architecture.md`, and `recommendation.md`.
+- [docs/problems-improvements-top-500.md](docs/problems-improvements-top-500.md) - 506 more, extending the 50 above (items 51-556 combined): SOLID/DRY architecture, security, platform parity, storage, concurrency, performance, testing, Rust idiom, config UX, GUI/visual design, docs, and dependency/supply-chain findings, generated by a 16-lens multi-agent pass and cross-checked (`cargo audit` independently confirmed every advisory it cites).
 
 ---
 

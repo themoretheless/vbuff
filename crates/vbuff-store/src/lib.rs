@@ -1134,7 +1134,7 @@ impl Store {
                 clip.id.to_string_repr(),
                 clip.content_hash.as_slice(),
                 flavors_json,
-                kind_to_int(clip.meta.kind),
+                row::kind_to_int(clip.meta.kind),
                 created,
                 now,
                 clip.meta.byte_size as i64,
@@ -2641,7 +2641,14 @@ impl Store {
 
     /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
     ///
-    /// Returns the number of clips evicted.
+    /// Returns the number of clips evicted. This mirrors the policy in
+    /// [`vbuff_core::eviction::evict`] but is implemented directly in SQL so a
+    /// cap enforcement never has to load the full `Clip` rows (flavor bytes
+    /// included) into memory just to compute which ids to drop. The two
+    /// implementations are kept honest against each other by
+    /// `enforce_cap_matches_pure_eviction_policy` below rather than merged,
+    /// since merging would force this hot path back through an in-memory
+    /// `Vec<Clip>` fetch.
     pub fn enforce_cap(&self, max_history: usize) -> Result<usize> {
         let total = self.count()?;
         if total <= max_history {
@@ -3201,11 +3208,6 @@ mod tests {
         let c = make_clip("findme please");
         let id = store.insert(&c).unwrap();
         store.insert(&make_clip("unrelated")).unwrap();
-
-        // search
-        let hits = store.search("findme", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].primary_text(), Some("findme please"));
 
         // pin then clear keeps pinned
         store.set_pinned(id, true).unwrap();

@@ -358,6 +358,12 @@ impl Flavor {
 pub struct ClipMeta {
     /// When the clip was first captured.
     pub created_at: DateTime<Utc>,
+    /// When the clip was last touched: bumped on a dedup re-copy (the store's
+    /// "move to top" behavior). Equal to `created_at` until the first bump.
+    /// This is the field eviction/recency policy should sort by, never
+    /// `created_at` alone and never the clip id, since a clip's id is fixed
+    /// at first capture and does not change when a repeat copy bumps it.
+    pub updated_at: DateTime<Utc>,
     /// Total byte size across all flavors.
     pub byte_size: u64,
     /// Source application identifier, if known (bundle id / exe / WM_CLASS).
@@ -399,7 +405,8 @@ impl ClipMeta {
             ..CaptureProvenance::default()
         };
         ClipMeta {
-            created_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             byte_size,
             source_app,
             kind,

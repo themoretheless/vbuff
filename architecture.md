@@ -14,6 +14,14 @@ This document separates the running implementation from the intended architectur
 
 The target system remains durable searchable history with SQLCipher at-rest encryption, native all-flavor capture, target-confirmed paste, and opt-in peer-to-peer sync. Current-versus-target status is tracked in the [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), [batch 201-250](docs/implementation-batch-201-250.md), [batch 251-300](docs/implementation-batch-251-300.md), and [batch 301-350](docs/implementation-batch-301-350.md) ledgers; current sharp edges live in the [public limitation ledger](docs/limitations.md).
 
+> **This document describes the target architecture, not the current state of the repository.** The shipped MVP
+> binary today is a single generic `arboard`-polling clipboard backend (text + one image flavor, no concealed-hint
+> support, no source-app attribution), an unencrypted plain-SQLite store with no FTS5, and `global-hotkey` (which
+> does not cover Wayland) - none of the native per-OS backends, encryption, or FTS5 described below exist yet. See
+> [docs/code-audit-top-50.md](docs/code-audit-top-50.md) for the full, file-and-line-grounded list of what diverges
+> from this design as of the current commit, so it can be read as an implementation checklist rather than mistaken
+> for a status report.
+
 ---
 
 ## Target goals & non-goals
@@ -1183,6 +1191,8 @@ Cross-cutting guarantees that back the table: pure behavior runs against the sam
 - [docs/ideas-611-620.md](docs/ideas-611-620.md) - second post-600 pass covering invariant-safe state, deterministic evidence, and key lifecycle
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 high-signal repositories and the primary research/standards evidence catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
+- [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in the current code, cross-referenced against this document's claims
+- [docs/problems-improvements-top-500.md](docs/problems-improvements-top-500.md) - items 51-556: the SOLID/DRY, security, platform, storage, concurrency, performance, testing, code-quality, config, GUI-design, docs, and dependency findings behind the "Current module map" and "Design system" sections above
 - [docs/competitor-extras.md](docs/competitor-extras.md) - additional/advanced competitor features
 
 ---

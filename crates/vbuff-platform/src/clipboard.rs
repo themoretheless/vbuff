@@ -8,17 +8,10 @@
 use std::borrow::Cow;
 
 use arboard::{Clipboard, ImageData};
-use vbuff_types::{Body, Flavor};
+use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
 
 use crate::traits::{CapturedClipboard, ClipboardBackend};
 use crate::{PlatformError, Result};
-
-/// MIME used for raw RGBA image payloads captured via arboard.
-///
-/// arboard hands us raw RGBA8 pixels plus width/height, not an encoded PNG, so
-/// we tag it with a vbuff-specific MIME that records the dimensions. The GUI and
-/// paste-back paths understand this format.
-pub const RGBA_MIME_PREFIX: &str = "image/x-vbuff-rgba";
 
 /// An `arboard`-backed clipboard.
 pub struct ArboardClipboard {
