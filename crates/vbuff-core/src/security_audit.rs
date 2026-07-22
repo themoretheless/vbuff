@@ -1,6 +1,6 @@
 //! Tamper-evident, content-free local security audit records.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::Zeroize;
 

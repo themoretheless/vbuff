@@ -45,9 +45,9 @@ eframe = { version = "0.35", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-egui = "0.32"
+egui = "0.35"
 egui_extras = { version = "0.35", features = ["image"] }
-egui_kittest = { version = "=0.32.3", features = ["eframe", "snapshot", "wgpu"] }
+egui_kittest = { version = "=0.35.0", features = ["eframe", "snapshot", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 # Platform integrations
@@ -70,8 +70,8 @@ ed25519-dalek = "3.0"
 x25519-dalek = { version = "3.0.0", features = ["getrandom", "static_secrets", "zeroize"] }
 bip39 = "2.2.2"
 hkdf = "0.13"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 base64 = "0.22"
 zstd = "0.13"
 getrandom = "0.3"

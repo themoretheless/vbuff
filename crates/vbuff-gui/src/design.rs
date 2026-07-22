@@ -154,7 +154,8 @@ pub(crate) enum IconButtonKind {
 }
 
 pub(crate) fn apply(ctx: &egui::Context, reduced_motion: bool) {
-    let mut style = (*ctx.style()).clone();
+    let theme = ctx.theme();
+    let mut style = (*ctx.style_of(theme)).clone();
     style
         .text_styles
         .insert(TextStyle::Small, FontId::proportional(12.0));
@@ -213,7 +214,7 @@ pub(crate) fn apply(ctx: &egui::Context, reduced_motion: bool) {
         style.visuals.widgets.noninteractive.bg_stroke =
             Stroke::new(1.0_f32, Color32::from_rgb(151, 161, 173));
     }
-    ctx.set_style(style);
+    ctx.set_style_of(theme, style);
 }
 
 pub(crate) fn navigation_tab(ui: &mut Ui, label: &'static str, selected: bool) -> Response {

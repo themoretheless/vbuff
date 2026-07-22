@@ -1117,6 +1117,7 @@ impl Store {
         }
         let flavors_json = serde_clip::flavors_to_json(&stored_flavors)?;
         let created = clip.meta.created_at.timestamp_millis();
+        let updated = clip.meta.updated_at.timestamp_millis();
 
         transaction.execute(
             r#"
@@ -1136,7 +1137,7 @@ impl Store {
                 flavors_json,
                 kind_to_int(clip.meta.kind),
                 created,
-                now,
+                updated,
                 clip.meta.byte_size as i64,
                 clip.meta.source_app,
                 preview,
@@ -2805,6 +2806,7 @@ struct RawRow {
     flavors_json: String,
     kind: i64,
     created_at: i64,
+    updated_at: i64,
     byte_size: i64,
     source_app: Option<String>,
     metadata_json: String,
@@ -2819,7 +2821,7 @@ fn row_to_clip(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         flavors_json: row.get(2)?,
         kind: row.get(3)?,
         created_at: row.get(4)?,
-        // index 5 (updated_at) is used for ordering only.
+        updated_at: row.get(5)?,
         byte_size: row.get(6)?,
         source_app: row.get(7)?,
         metadata_json: row.get(8)?,
@@ -2839,6 +2841,7 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
     }
     let created_at =
         chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
+    let updated_at = chrono::DateTime::from_timestamp_millis(raw.updated_at).unwrap_or(created_at);
     let stored_meta: StoredMetadata = serde_json::from_str(&raw.metadata_json)?;
     let mut meta = ClipMeta::now(
         kind_from_int(raw.kind),
@@ -2846,6 +2849,7 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
         raw.source_app,
     );
     meta.created_at = created_at;
+    meta.updated_at = updated_at;
     stored_meta.apply_to(&mut meta);
     Ok(Clip {
         id,

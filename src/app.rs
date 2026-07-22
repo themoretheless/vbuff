@@ -92,8 +92,8 @@ pub(crate) fn run(
         #[cfg(feature = "tray")]
         menu_events,
     );
-    let result = eframe::run_simple_native("vbuff", native_options, move |ctx, frame| {
-        runtime.update(ctx, frame);
+    let result = eframe::run_ui_native("vbuff", native_options, move |ui, frame| {
+        runtime.update(ui, frame);
     });
 
     if let (Some(id), Some(backend)) = (hotkey_id, hotkey_backend.as_mut())
@@ -236,7 +236,8 @@ impl Runtime {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if let Ok(mut target) = self.event_waker.lock() {
             *target = Some(ctx.clone());
         }
@@ -244,7 +245,7 @@ impl Runtime {
         if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
             if self.can_hide_to_resident_surface() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.popup.request_hide(ctx);
+                self.popup.request_hide(&ctx);
             } else {
                 self.quit_requested = true;
             }
@@ -253,7 +254,7 @@ impl Runtime {
 
         while let Ok(intent) = self.instance_intents.try_recv() {
             match intent {
-                ClientIntent::ShowPopup => self.handle(AppCommand::Show, ctx),
+                ClientIntent::ShowPopup => self.handle(AppCommand::Show, &ctx),
                 ClientIntent::Ping => {}
             }
         }
@@ -262,15 +263,15 @@ impl Runtime {
             if event.state == global_hotkey::HotKeyState::Pressed
                 && self.hotkey_id == Some(event.id)
             {
-                self.handle(AppCommand::Show, ctx);
+                self.handle(AppCommand::Show, &ctx);
             }
         }
 
         for command in self.tray_commands() {
-            self.handle(command, ctx);
+            self.handle(command, &ctx);
         }
 
-        self.popup.update(ctx, frame);
+        self.popup.ui(ui, frame);
         let popup_commands: Vec<AppCommand> = self
             .popup
             .take_actions()
@@ -278,10 +279,10 @@ impl Runtime {
             .map(AppCommand::from)
             .collect();
         for command in popup_commands {
-            self.handle(command, ctx);
+            self.handle(command, &ctx);
         }
 
-        self.poll_pending_paste(ctx);
+        self.poll_pending_paste(&ctx);
     }
 
     #[cfg(feature = "tray")]

@@ -325,18 +325,19 @@ impl eframe::App for PopupApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root_ui.ctx().clone();
         let now = Instant::now();
         let preferences_before = self.preferences.clone();
         self.motion_budget.begin_frame(now);
         let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
         self.scroll_tuner.sample(scroll_delta, now);
         let design_signature = (
-            ctx.style().visuals.dark_mode,
+            ctx.style_of(ctx.theme()).visuals.dark_mode,
             self.preferences.reduced_motion,
         );
         if self.design_signature != Some(design_signature) {
-            design::apply(ctx, self.preferences.reduced_motion);
+            design::apply(&ctx, self.preferences.reduced_motion);
             self.design_signature = Some(design_signature);
         }
 
@@ -354,11 +355,11 @@ impl eframe::App for PopupApp {
             )
         };
         if show_requested {
-            self.show(ctx);
+            self.show(&ctx);
         }
         if !self.visible {
             self.render_accessibility_announcement(
-                ctx,
+                &ctx,
                 hidden_announcement.as_deref(),
                 hidden_announcement_revision,
             );
@@ -456,7 +457,7 @@ impl eframe::App for PopupApp {
         ));
         if focus_loss == FocusLossState::Expired {
             self.actions.push_back(UiAction::Hide);
-            self.hide(ctx);
+            self.hide(&ctx);
             return;
         }
         let focus_grace_fraction = match focus_loss {
@@ -535,11 +536,11 @@ impl eframe::App for PopupApp {
             && self.action_flyout.is_none()
             && !self.feedback_preview
             && focused_widget.is_none_or(|id| id == history_search_id());
-        let keyboard_page = (logical_viewport_size(ctx).y
+        let keyboard_page = (logical_viewport_size(&ctx).y
             / self
                 .preferences
                 .density
-                .row_height(logical_viewport_size(ctx).y))
+                .row_height(logical_viewport_size(&ctx).y))
         .floor()
         .max(1.0) as usize;
         let mut accepted_completion = None;
@@ -723,7 +724,7 @@ impl eframe::App for PopupApp {
 
         // If Esc requested a hide, do it now.
         if self.actions.iter().any(|a| *a == UiAction::Hide) {
-            self.hide(ctx);
+            self.hide(&ctx);
         }
 
         // 6. Render the panel.
@@ -746,19 +747,19 @@ impl eframe::App for PopupApp {
             self.preview_clip_id = selected_id;
             self.preview_transform = PreviewTransform::Original;
         }
-        let viewport = logical_viewport_size(ctx);
+        let viewport = logical_viewport_size(&ctx);
         let preview_width = (viewport.x * 0.36).clamp(280.0, 330.0);
         let wide_preview = self.preferences.large_preview
             && self.surface == PopupSurface::History
             && viewport.x - preview_width >= 480.0;
         if wide_preview && let Some(clip) = selected_clip {
-            egui::SidePanel::right("large_clip_preview")
-                .exact_width(preview_width)
+            egui::Panel::right("large_clip_preview")
+                .exact_size(preview_width)
                 .resizable(false)
-                .show(ctx, |ui| self.render_preview_pane(ui, ctx, clip));
+                .show(root_ui, |ui| self.render_preview_pane(ui, &ctx, clip));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             if let Some(fraction) = focus_grace_fraction {
                 ui.set_opacity(0.62 + 0.38 * fraction);
                 ui.add(
@@ -911,7 +912,7 @@ impl eframe::App for PopupApp {
                                     let selected = row == self.selected;
                                     let option_id = self.render_row(
                                         ui,
-                                        ctx,
+                                        &ctx,
                                         row,
                                         clip,
                                         *hit,
@@ -966,18 +967,18 @@ impl eframe::App for PopupApp {
             }
         });
 
-        self.render_clear_history_confirmation(ctx);
-        self.render_delete_confirmation(ctx);
-        self.render_profile_confirmation(ctx, health_digest.stored_items);
-        self.render_feedback_preview(ctx, &capabilities);
-        self.render_command_palette(ctx, paused, &filtered, &clip_by_id, &memory_only_clips);
-        self.render_action_flyout(ctx, &clip_by_id, &session_protected, &memory_only_clips);
+        self.render_clear_history_confirmation(&ctx);
+        self.render_delete_confirmation(&ctx);
+        self.render_profile_confirmation(&ctx, health_digest.stored_items);
+        self.render_feedback_preview(&ctx, &capabilities);
+        self.render_command_palette(&ctx, paused, &filtered, &clip_by_id, &memory_only_clips);
+        self.render_action_flyout(&ctx, &clip_by_id, &session_protected, &memory_only_clips);
         self.render_accessibility_announcement(
-            ctx,
+            &ctx,
             accessibility_announcement.as_deref(),
             announcement_revision,
         );
-        self.render_motion_inspector(ctx);
+        self.render_motion_inspector(&ctx);
 
         if self.preferences != preferences_before {
             self.actions.push_back(UiAction::SetUiPreferences {
@@ -1081,7 +1082,7 @@ impl PopupApp {
                             let edit = egui::TextEdit::singleline(&mut self.query)
                                 .id_source(history_search_id())
                                 .hint_text(hint)
-                                .frame(false);
+                                .frame(egui::Frame::NONE);
                             let response =
                                 ui.add_sized([search_width, design::ICON_BUTTON_SIZE], edit);
                             if self.request_focus_next_frame {
@@ -3225,7 +3226,7 @@ fn render_kind_icon(ui: &mut egui::Ui, clip: &Clip) {
 }
 
 fn logical_viewport_size(ctx: &egui::Context) -> egui::Vec2 {
-    ctx.screen_rect().size()
+    ctx.content_rect().size()
 }
 
 fn history_search_id() -> egui::Id {

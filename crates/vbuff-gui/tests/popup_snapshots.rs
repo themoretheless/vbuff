@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use egui_kittest::{Harness, SnapshotOptions};
+use egui_kittest::{Harness, SnapshotOptions, SnapshotResults};
 use vbuff_core::content_hash_from_flavors;
 use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, PopupApp};
@@ -12,6 +12,7 @@ use vbuff_types::{
 
 #[test]
 fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
+    let mut results = SnapshotResults::new();
     let snapshots = SnapshotOptions::new()
         .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
     for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
@@ -53,6 +54,7 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
                     harness.run_steps(2);
                 }
                 harness.snapshot_options(name, &snapshots);
+                results.extend(harness.take_snapshot_results());
             }
         }
     }
@@ -60,6 +62,7 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
 
 #[test]
 fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
+    let mut results = SnapshotResults::new();
     let snapshots = SnapshotOptions::new()
         .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
     for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
@@ -72,6 +75,7 @@ fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
             .build_eframe(|_| PopupApp::new(wide_state));
         wide.run_steps(2);
         wide.snapshot_options(format!("popup_{theme_name}_1x_wide_populated"), &snapshots);
+        results.extend(wide.take_snapshot_results());
 
         let minimum_state = Arc::new(Mutex::new(snapshot_state(Surface::Alerts)));
         let mut minimum = Harness::builder()
@@ -82,6 +86,7 @@ fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
             .build_eframe(|_| PopupApp::new(minimum_state));
         minimum.run_steps(2);
         minimum.snapshot_options(format!("popup_{theme_name}_1_5x_min_alerts"), &snapshots);
+        results.extend(minimum.take_snapshot_results());
     }
 }
 
