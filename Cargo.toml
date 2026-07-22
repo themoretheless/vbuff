@@ -38,7 +38,7 @@ semver = { version = "1", features = ["serde"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 
 # GUI
-eframe = { version = "0.32", default-features = false, features = [
+eframe = { version = "0.35", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
