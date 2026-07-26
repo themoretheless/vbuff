@@ -14,3 +14,9 @@ blake3.workspace = true
 sha2.workspace = true
 semver.workspace = true
 url.workspace = true
+atomic-write-file.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ed25519-dalek.workspace = true
+semver.workspace = true
