@@ -28,7 +28,7 @@ const MAX_NEARBY_TARGETS: usize = 16;
 const MAX_NEARBY_AGE_MS: u64 = 5 * 60 * 1_000;
 const MAX_QR_TOKEN_TTL_MS: u64 = 5 * 60 * 1_000;
 
-fn valid_identifier(value: &str, maximum_bytes: usize) -> bool {
+pub(crate) fn valid_identifier(value: &str, maximum_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum_bytes
         && value
