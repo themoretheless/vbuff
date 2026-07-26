@@ -12,6 +12,7 @@ const MAX_TARGET_LEN: usize = 96;
 const MAX_KEY_ID_LEN: usize = 96;
 const MAX_ARTIFACT_URL_LEN: usize = 2 * 1024;
 const UPDATE_SIGNATURE_DOMAIN: &[u8] = b"vbuff-update-manifest-v1\0";
+const ROTATION_CONFIRMATION_DOMAIN: &[u8] = b"vbuff-update-key-rotation-v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -26,6 +27,69 @@ pub struct KeyRotation {
     pub key_id: String,
     pub public_key: [u8; 32],
     pub activates_at_sequence: u64,
+    /// Proof-of-possession: Ed25519 signature by the new key over the
+    /// domain-separated rotation blob (see `confirmation_bytes`). Without it a
+    /// lost or mistyped new key would brick the update channel irrevocably.
+    pub confirmation: Vec<u8>,
+}
+
+impl KeyRotation {
+    /// Build a rotation entry together with a fresh proof-of-possession
+    /// signed by `new_key`. `manifest_sequence` is the sequence of the
+    /// manifest that will carry this rotation.
+    pub fn confirmed(
+        key_id: impl Into<String>,
+        new_key: &SigningKey,
+        activates_at_sequence: u64,
+        manifest_sequence: u64,
+    ) -> Result<Self> {
+        let key_id = key_id.into();
+        validate_key_id(&key_id)?;
+        let public_key = new_key.verifying_key().to_bytes();
+        let blob = Self::confirmation_bytes(
+            &key_id,
+            &public_key,
+            activates_at_sequence,
+            manifest_sequence,
+        )?;
+        let confirmation = new_key.sign(&blob).to_bytes().to_vec();
+        Ok(Self {
+            key_id,
+            public_key,
+            activates_at_sequence,
+            confirmation,
+        })
+    }
+
+    fn confirmation_bytes(
+        key_id: &str,
+        public_key: &[u8; 32],
+        activates_at_sequence: u64,
+        manifest_sequence: u64,
+    ) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct RotationPayload<'a> {
+            key_id: &'a str,
+            public_key: &'a [u8; 32],
+            activates_at_sequence: u64,
+            manifest_sequence: u64,
+        }
+        let payload = serde_json::to_vec(&RotationPayload {
+            key_id,
+            public_key,
+            activates_at_sequence,
+            manifest_sequence,
+        })
+        .map_err(|error| UpdateError::Serialization(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(
+            ROTATION_CONFIRMATION_DOMAIN.len() + key_id.len() + 1 + payload.len(),
+        );
+        bytes.extend_from_slice(ROTATION_CONFIRMATION_DOMAIN);
+        bytes.extend_from_slice(key_id.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,9 +106,17 @@ pub struct UpdateManifest {
 
 impl UpdateManifest {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 {
+        // Schema 2 adds proof-of-possession to key rotations. Older clients
+        // reject schema 2 outright (fail-closed), so rotation manifests are
+        // never applied by clients that cannot confirm the new key.
+        if !matches!(self.schema, 1 | 2) {
             return Err(UpdateError::InvalidManifest(
                 "unsupported manifest schema".into(),
+            ));
+        }
+        if self.schema == 1 && self.next_key.is_some() {
+            return Err(UpdateError::InvalidManifest(
+                "key rotation requires manifest schema 2".into(),
             ));
         }
         if self.sequence == 0 {
@@ -101,6 +173,11 @@ impl UpdateManifest {
             }
             VerifyingKey::from_bytes(&rotation.public_key)
                 .map_err(|_| UpdateError::InvalidManifest("rotated key is invalid".into()))?;
+            if rotation.confirmation.len() != Signature::BYTE_SIZE {
+                return Err(UpdateError::InvalidManifest(
+                    "rotation confirmation is invalid".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -151,18 +228,30 @@ pub struct UpdateKeyring {
 }
 
 impl UpdateKeyring {
+    /// Trust a new key id. Refuses to overwrite an existing id: key ids are
+    /// claimed exactly once, so a compromised active key cannot squat or
+    /// replace another trusted key (which would also erase its revocation).
     pub fn trust(&mut self, key_id: impl Into<String>, key: TrustedKey) -> Result<()> {
         let key_id = key_id.into();
         validate_key_id(&key_id)?;
         VerifyingKey::from_bytes(&key.public_key)
             .map_err(|_| UpdateError::InvalidManifest("trusted key is invalid".into()))?;
+        if self.keys.contains_key(&key_id) {
+            return Err(UpdateError::DuplicateKeyId);
+        }
         self.keys.insert(key_id, key);
         Ok(())
     }
 
+    /// Revoke a key starting at `at_sequence`. Repeated revocation keeps the
+    /// earliest sequence: a later manifest must never resurrect a key by
+    /// pushing its revocation into the future.
     pub fn revoke(&mut self, key_id: &str, at_sequence: u64) -> Result<()> {
         let key = self.keys.get_mut(key_id).ok_or(UpdateError::UntrustedKey)?;
-        key.revoked_at_sequence = Some(at_sequence);
+        key.revoked_at_sequence = Some(
+            key.revoked_at_sequence
+                .map_or(at_sequence, |previous| previous.min(at_sequence)),
+        );
         Ok(())
     }
 
@@ -230,6 +319,26 @@ impl UpdateVerifier {
         }
 
         if let Some(rotation) = &signed.manifest.next_key {
+            // Proof-of-possession: the new key must have signed this exact
+            // rotation (key id, public key, activation, manifest sequence).
+            // Checked after the manifest signature so an unsigned manifest
+            // cannot probe confirmation failures, and before the keyring is
+            // mutated so a failed check leaves no trace.
+            let confirmation = Signature::from_slice(&rotation.confirmation)
+                .map_err(|_| UpdateError::RotationNotConfirmed)?;
+            let rotated_key = VerifyingKey::from_bytes(&rotation.public_key)
+                .map_err(|_| UpdateError::RotationNotConfirmed)?;
+            rotated_key
+                .verify(
+                    &KeyRotation::confirmation_bytes(
+                        &rotation.key_id,
+                        &rotation.public_key,
+                        rotation.activates_at_sequence,
+                        signed.manifest.sequence,
+                    )?,
+                    &confirmation,
+                )
+                .map_err(|_| UpdateError::RotationNotConfirmed)?;
             self.keyring.trust(
                 rotation.key_id.clone(),
                 TrustedKey {
@@ -238,6 +347,10 @@ impl UpdateVerifier {
                     revoked_at_sequence: None,
                 },
             )?;
+            // Rotation retires the signing key once the new key activates;
+            // keeping it valid past that point would defeat the rotation.
+            self.keyring
+                .revoke(&signed.key_id, rotation.activates_at_sequence)?;
         }
         self.highest_accepted_sequence = signed.manifest.sequence;
 
@@ -252,6 +365,10 @@ impl UpdateVerifier {
 
     pub fn keyring(&self) -> &UpdateKeyring {
         &self.keyring
+    }
+
+    pub fn highest_accepted_sequence(&self) -> u64 {
+        self.highest_accepted_sequence
     }
 }
 
@@ -377,11 +494,8 @@ mod tests {
         let first = SigningKey::from_bytes(&[1; 32]);
         let second = SigningKey::from_bytes(&[2; 32]);
         let mut rotating = manifest(10, "0.2.0");
-        rotating.next_key = Some(KeyRotation {
-            key_id: "release-2".into(),
-            public_key: second.verifying_key().to_bytes(),
-            activates_at_sequence: 11,
-        });
+        rotating.schema = 2;
+        rotating.next_key = Some(KeyRotation::confirmed("release-2", &second, 11, 10).unwrap());
         let signed = SignedUpdateManifest::sign("release-1", rotating, &first).unwrap();
         let mut verifier = verifier(&first);
         verifier
@@ -393,6 +507,212 @@ mod tests {
             verifier
                 .verify(&next, &Version::parse("0.2.0").unwrap(), b"install")
                 .is_ok()
+        );
+
+        // The rotation retired the previous key at the activation sequence.
+        let stale = SignedUpdateManifest::sign("release-1", manifest(12, "0.4.0"), &first).unwrap();
+        assert_eq!(
+            verifier.verify(&stale, &Version::parse("0.3.0").unwrap(), b"install"),
+            Err(UpdateError::UntrustedKey)
+        );
+    }
+
+    #[test]
+    fn rotated_key_is_rejected_before_activation() {
+        let first = SigningKey::from_bytes(&[1; 32]);
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let mut rotating = manifest(10, "0.2.0");
+        rotating.schema = 2;
+        rotating.next_key = Some(KeyRotation::confirmed("release-2", &second, 12, 10).unwrap());
+        let signed = SignedUpdateManifest::sign("release-1", rotating, &first).unwrap();
+        let mut verifier = verifier(&first);
+        verifier
+            .verify(&signed, &Version::parse("0.1.0").unwrap(), b"install")
+            .unwrap();
+
+        // Past the watermark but before activation: the new key is not live.
+        let early = SignedUpdateManifest::sign("release-2", manifest(11, "0.3.0"), &second).unwrap();
+        assert_eq!(
+            verifier.verify(&early, &Version::parse("0.2.0").unwrap(), b"install"),
+            Err(UpdateError::UntrustedKey)
+        );
+
+        let activated =
+            SignedUpdateManifest::sign("release-2", manifest(12, "0.3.0"), &second).unwrap();
+        assert!(
+            verifier
+                .verify(&activated, &Version::parse("0.2.0").unwrap(), b"install")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn trust_rejects_duplicate_key_id_without_overwriting() {
+        let first = SigningKey::from_bytes(&[1; 32]);
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let mut keyring = UpdateKeyring::default();
+        let original = TrustedKey {
+            public_key: first.verifying_key().to_bytes(),
+            activates_at_sequence: 1,
+            revoked_at_sequence: Some(9),
+        };
+        keyring.trust("release-1", original.clone()).unwrap();
+        let overwrite = TrustedKey {
+            public_key: second.verifying_key().to_bytes(),
+            activates_at_sequence: 1,
+            revoked_at_sequence: None,
+        };
+        assert_eq!(
+            keyring.trust("release-1", overwrite),
+            Err(UpdateError::DuplicateKeyId)
+        );
+        assert_eq!(keyring.keys.get("release-1"), Some(&original));
+    }
+
+    #[test]
+    fn revoke_keeps_earliest_sequence() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let mut keyring = UpdateKeyring::default();
+        keyring
+            .trust(
+                "release-1",
+                TrustedKey {
+                    public_key: key.verifying_key().to_bytes(),
+                    activates_at_sequence: 1,
+                    revoked_at_sequence: None,
+                },
+            )
+            .unwrap();
+        keyring.revoke("release-1", 20).unwrap();
+        keyring.revoke("release-1", 12).unwrap();
+        assert_eq!(
+            keyring.keys.get("release-1").unwrap().revoked_at_sequence,
+            Some(12)
+        );
+        keyring.revoke("release-1", 15).unwrap();
+        assert_eq!(
+            keyring.keys.get("release-1").unwrap().revoked_at_sequence,
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn compromised_key_cannot_squat_another_trusted_key_id() {
+        let compromised = SigningKey::from_bytes(&[9; 32]);
+        let victim = SigningKey::from_bytes(&[5; 32]);
+        let replacement = SigningKey::from_bytes(&[6; 32]);
+        let mut keyring = UpdateKeyring::default();
+        keyring
+            .trust(
+                "compromised",
+                TrustedKey {
+                    public_key: compromised.verifying_key().to_bytes(),
+                    activates_at_sequence: 1,
+                    revoked_at_sequence: None,
+                },
+            )
+            .unwrap();
+        keyring
+            .trust(
+                "root",
+                TrustedKey {
+                    public_key: victim.verifying_key().to_bytes(),
+                    activates_at_sequence: 1,
+                    revoked_at_sequence: None,
+                },
+            )
+            .unwrap();
+        let mut verifier = UpdateVerifier::new(keyring, 0);
+
+        // The compromised key publishes a rotation that claims the victim's
+        // key id. The confirmation is valid (the attacker owns the
+        // replacement key); only the duplicate-id refusal stops it.
+        let mut attack = manifest(10, "0.2.0");
+        attack.schema = 2;
+        attack.next_key = Some(KeyRotation::confirmed("root", &replacement, 11, 10).unwrap());
+        let attack = SignedUpdateManifest::sign("compromised", attack, &compromised).unwrap();
+        assert_eq!(
+            verifier.verify(&attack, &Version::parse("0.1.0").unwrap(), b"install"),
+            Err(UpdateError::DuplicateKeyId)
+        );
+
+        // The failed manifest left no trace: the victim can still ship.
+        let legit = SignedUpdateManifest::sign("root", manifest(10, "0.2.0"), &victim).unwrap();
+        assert!(
+            verifier
+                .verify(&legit, &Version::parse("0.1.0").unwrap(), b"install")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn schema_one_rejects_key_rotation() {
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let mut rotating = manifest(10, "0.2.0");
+        rotating.next_key =
+            Some(KeyRotation::confirmed("release-2", &second, 11, 10).unwrap());
+        assert!(matches!(
+            rotating.validate(),
+            Err(UpdateError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn schema_two_requires_confirmation() {
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let mut rotating = manifest(10, "0.2.0");
+        rotating.schema = 2;
+        rotating.next_key = Some(KeyRotation {
+            key_id: "release-2".into(),
+            public_key: second.verifying_key().to_bytes(),
+            activates_at_sequence: 11,
+            confirmation: Vec::new(),
+        });
+        assert!(matches!(
+            rotating.validate(),
+            Err(UpdateError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn rotation_confirmation_by_an_unrelated_key_is_rejected() {
+        let first = SigningKey::from_bytes(&[1; 32]);
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let third = SigningKey::from_bytes(&[3; 32]);
+        let mut rotating = manifest(10, "0.2.0");
+        rotating.schema = 2;
+        let mut rotation = KeyRotation::confirmed("release-2", &second, 11, 10).unwrap();
+        // Re-sign the exact rotation blob with a key that is not the new key.
+        let blob = KeyRotation::confirmation_bytes(
+            "release-2",
+            &second.verifying_key().to_bytes(),
+            11,
+            10,
+        )
+        .unwrap();
+        rotation.confirmation = third.sign(&blob).to_bytes().to_vec();
+        rotating.next_key = Some(rotation);
+        let signed = SignedUpdateManifest::sign("release-1", rotating, &first).unwrap();
+        assert_eq!(
+            verifier(&first).verify(&signed, &Version::parse("0.1.0").unwrap(), b"install"),
+            Err(UpdateError::RotationNotConfirmed)
+        );
+    }
+
+    #[test]
+    fn tampered_confirmation_breaks_the_manifest_signature() {
+        let first = SigningKey::from_bytes(&[1; 32]);
+        let second = SigningKey::from_bytes(&[2; 32]);
+        let mut rotating = manifest(10, "0.2.0");
+        rotating.schema = 2;
+        rotating.next_key = Some(KeyRotation::confirmed("release-2", &second, 11, 10).unwrap());
+        let mut signed = SignedUpdateManifest::sign("release-1", rotating, &first).unwrap();
+        // The confirmation is part of the signed canonical manifest, so
+        // flipping it after signing invalidates the manifest signature.
+        signed.manifest.next_key.as_mut().unwrap().confirmation[0] ^= 1;
+        assert_eq!(
+            verifier(&first).verify(&signed, &Version::parse("0.1.0").unwrap(), b"install"),
+            Err(UpdateError::InvalidSignature)
         );
     }
 
