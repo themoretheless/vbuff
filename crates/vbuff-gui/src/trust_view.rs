@@ -4,8 +4,9 @@ use chrono::Utc;
 use egui::RichText;
 use vbuff_core::trust::{PrivacyScore, PrivacyScoreLevel};
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, PrivacyDecisionLevel, PrivacyLedgerSummary,
-    SecurityPostureLevel, SecurityPostureSummary, SloMetricState, SloStatusSummary,
+    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, PrivacyDecisionLevel,
+    PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary, SloMetricState,
+    SloStatusSummary,
 };
 
 use crate::design;
@@ -104,31 +105,58 @@ fn render_privacy_score(ui: &mut egui::Ui, score: Option<&PrivacyScore>) {
 }
 
 fn render_attention_items(ui: &mut egui::Ui, capabilities: &[CapabilityView]) {
-    design::section_heading(ui, "Needs attention", None);
-    let mut issues = capabilities.iter().filter(|capability| {
+    let is_gap = |capability: &&CapabilityView| {
         matches!(
             capability.level,
             CapabilityViewLevel::Degraded | CapabilityViewLevel::Unavailable
         )
-    });
-    let Some(first) = issues.next() else {
-        ui.label(RichText::new("No detected platform gaps").weak());
-        return;
     };
+    let mut required = capabilities
+        .iter()
+        .filter(|capability| capability.severity == CapabilityViewSeverity::RequiredForCapture)
+        .filter(is_gap)
+        .peekable();
+    let mut informational = capabilities
+        .iter()
+        .filter(|capability| capability.severity == CapabilityViewSeverity::Informational)
+        .filter(is_gap)
+        .peekable();
 
-    for capability in std::iter::once(first).chain(issues) {
-        let color = capability_color(ui, capability.level);
-        ui.horizontal(|ui| {
-            design::status_dot(ui, color);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(capability.feature.replace('_', " ")).strong());
-                    ui.label(RichText::new(capability.level.label()).small().color(color));
-                });
-                ui.label(RichText::new(&capability.detail).small().weak());
-            });
-        });
+    design::section_heading(ui, "Needs attention", None);
+    if required.peek().is_none() {
+        ui.label(RichText::new("No detected platform gaps").weak());
+    } else {
+        for capability in required {
+            render_capability_issue(ui, capability, true);
+        }
     }
+
+    if informational.peek().is_some() {
+        ui.add_space(8.0);
+        design::section_heading(ui, "Known platform limitations", None);
+        for capability in informational {
+            render_capability_issue(ui, capability, false);
+        }
+    }
+}
+
+fn render_capability_issue(ui: &mut egui::Ui, capability: &CapabilityView, emphasized: bool) {
+    let color = capability_color(ui, capability.level);
+    ui.horizontal(|ui| {
+        design::status_dot(ui, color);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let feature = capability.feature.replace('_', " ");
+                if emphasized {
+                    ui.label(RichText::new(feature).strong());
+                } else {
+                    ui.label(RichText::new(feature).weak());
+                }
+                ui.label(RichText::new(capability.level.label()).small().color(color));
+            });
+            ui.label(RichText::new(&capability.detail).small().weak());
+        });
+    });
 }
 
 fn render_privacy_ledger(ui: &mut egui::Ui, ledger: &PrivacyLedgerSummary) {

@@ -9,8 +9,8 @@ use vbuff_core::capture::{
     AdaptivePollScheduler, CaptureAction, CaptureDecision, CaptureInput, CaptureLossLedger,
     CaptureOutcome, CapturePolicy, CaptureRule, DropClass, DropReason, GenerationObservation,
     GenerationTracker, PollObservation, SelectionSource, SelfWriteLedger, SkippedCapture,
-    SkippedCaptureRing, SourcePredicate, SubsystemBudget, annotate_integrity,
-    prune_redundant_flavors, verify_integrity,
+    SkippedCaptureRing, SourcePredicate, SubsystemBudget, UnknownEvidencePolicy,
+    annotate_integrity, prune_redundant_flavors, verify_integrity,
 };
 use vbuff_core::observability::RedactedClipFields;
 use vbuff_core::reliability::{
@@ -19,7 +19,7 @@ use vbuff_core::reliability::{
 };
 use vbuff_core::{content_hash_from_flavors, detect_kind};
 use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardSelection};
-use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta};
+use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta, NoticeLevel, ProvenanceConfidence};
 
 use crate::config::{Config, SourceRuleAction};
 use crate::diagnostics::Diagnostics;
@@ -37,14 +37,18 @@ enum WorkerExit {
 }
 
 /// Keeps storage failures dominant until a later write proves recovery.
+/// A source-privacy degradation is sticky for the worker's lifetime: it
+/// reflects backend evidence, not a transient I/O error, so a successful
+/// read must not silently clear it back to "Watching".
 #[derive(Default)]
 struct CaptureHealthState {
     storage_degraded: bool,
+    source_privacy_degraded: bool,
 }
 
 impl CaptureHealthState {
     fn read_succeeded(&self) -> Option<CaptureHealth> {
-        (!self.storage_degraded).then_some(CaptureHealth::Watching)
+        (!self.storage_degraded).then_some(self.healthy_baseline())
     }
 
     fn read_failed(&self) -> Option<CaptureHealth> {
@@ -53,12 +57,24 @@ impl CaptureHealthState {
 
     fn store_succeeded(&mut self) -> CaptureHealth {
         self.storage_degraded = false;
-        CaptureHealth::Watching
+        self.healthy_baseline()
     }
 
     fn store_failed(&mut self) -> CaptureHealth {
         self.storage_degraded = true;
         CaptureHealth::StorageError
+    }
+
+    fn degrade_source_privacy(&mut self) {
+        self.source_privacy_degraded = true;
+    }
+
+    fn healthy_baseline(&self) -> CaptureHealth {
+        if self.source_privacy_degraded {
+            CaptureHealth::DegradedSourcePrivacy
+        } else {
+            CaptureHealth::Watching
+        }
     }
 }
 
@@ -198,6 +214,33 @@ fn run_worker(
     diagnostics.poll_interval(scheduler.interval());
     let mut last_hash: Option<[u8; 32]> = None;
     let mut health_state = CaptureHealthState::default();
+    // Honest degradation: source-dependent privacy rules are armed, but this
+    // backend cannot prove where copies come from. Surface the degradation
+    // once at startup; the sticky health flag keeps it visible.
+    let rules_armed = !policy.excluded_apps.is_empty() || !policy.rules.is_empty();
+    if rules_armed && clipboard.evidence().provenance == ProvenanceConfidence::Unknown {
+        match policy.unknown_evidence {
+            UnknownEvidencePolicy::Allow => {
+                tracing::warn!(
+                    "unknown_evidence_policy=allow: source privacy rules run without \
+                     provenance evidence (legacy fail-open)"
+                );
+            }
+            UnknownEvidencePolicy::Guard | UnknownEvidencePolicy::Skip => {
+                health_state.degrade_source_privacy();
+                if diagnostics.capture_health(CaptureHealth::DegradedSourcePrivacy) {
+                    tracing::warn!(
+                        mode = ?policy.unknown_evidence,
+                        "clipboard backend cannot prove source identity; source privacy degraded"
+                    );
+                }
+                diagnostics.notice(
+                    NoticeLevel::Warning,
+                    "Source privacy degraded: the clipboard backend cannot identify source apps",
+                );
+            }
+        }
+    }
     let mut generation_tracker = GenerationTracker::default();
     let mut loss_ledger = CaptureLossLedger::default();
     let mut skipped = SkippedCaptureRing::new(8);
@@ -376,7 +419,8 @@ fn run_worker(
             },
             primary_intended: captured.primary_intended,
             coherent_generation: captured.coherent_generation,
-            concealed: captured.concealed,
+            concealment: captured.concealment,
+            provenance_confidence: captured.provenance_confidence,
             self_write,
         };
         let decision = if explicit_recovery
@@ -680,6 +724,7 @@ fn capture_policy(config: &Config) -> CapturePolicy {
         skip_whitespace_only: config.skip_whitespace_only,
         detect_secrets: config.detect_secrets,
         secret_ttl: Duration::from_secs(config.secret_ttl_seconds.max(1)),
+        unknown_evidence: unknown_evidence_policy(&config.unknown_evidence_policy),
         excluded_apps: config
             .excluded_apps
             .iter()
@@ -688,6 +733,24 @@ fn capture_policy(config: &Config) -> CapturePolicy {
             .collect(),
         rules,
         ..CapturePolicy::default()
+    }
+}
+
+/// Map the owner-facing config string to the gate's degradation mode.
+/// `Config::validate` rejects invalid values at load time; this fallback
+/// stays fail-closed (Guard) for any value that bypasses validation.
+fn unknown_evidence_policy(value: &str) -> UnknownEvidencePolicy {
+    match value {
+        "guard" => UnknownEvidencePolicy::Guard,
+        "skip" => UnknownEvidencePolicy::Skip,
+        "allow" => UnknownEvidencePolicy::Allow,
+        other => {
+            tracing::warn!(
+                value = %other,
+                "invalid unknown_evidence_policy; falling back to guard"
+            );
+            UnknownEvidencePolicy::Guard
+        }
     }
 }
 
@@ -792,6 +855,7 @@ fn build_clip(
     let source_app = captured.provenance.app_id.clone();
     let mut meta = ClipMeta::now(kind, byte_size, source_app);
     meta.provenance = captured.provenance;
+    meta.provenance_confidence = captured.provenance_confidence;
     meta.generation = captured.generation;
     meta.lineage = captured.lineage;
     meta.sensitive = sensitive;
@@ -824,6 +888,9 @@ mod tests {
                 app_id: source_app.map(str::to_owned),
                 ..Default::default()
             },
+            // The legacy-behavior fixtures prove provenance; unknown-evidence
+            // degradation gets dedicated cases below.
+            provenance_confidence: ProvenanceConfidence::Proven,
             ..CapturedClipboard::default()
         }
     }
@@ -835,7 +902,8 @@ mod tests {
             source: SelectionSource::Clipboard,
             primary_intended: true,
             coherent_generation: true,
-            concealed: false,
+            concealment: captured.concealment,
+            provenance_confidence: captured.provenance_confidence,
             self_write: false,
         })
     }
@@ -863,6 +931,46 @@ mod tests {
             decision(&policy, &captured("hello", Some("com.apple.Safari"))),
             CaptureDecision::Capture { .. }
         ));
+    }
+
+    #[test]
+    fn unknown_evidence_policy_maps_from_config_with_guard_fallback() {
+        for (value, expected) in [
+            ("guard", UnknownEvidencePolicy::Guard),
+            ("skip", UnknownEvidencePolicy::Skip),
+            ("allow", UnknownEvidencePolicy::Allow),
+            ("bogus", UnknownEvidencePolicy::Guard),
+        ] {
+            let config = Config {
+                unknown_evidence_policy: value.into(),
+                ..Default::default()
+            };
+            assert_eq!(capture_policy(&config).unknown_evidence, expected);
+        }
+    }
+
+    #[test]
+    fn unknown_provenance_with_armed_rules_guards_capture() {
+        let config = Config {
+            excluded_apps: vec!["onepassword".into()],
+            ..Default::default()
+        };
+        let policy = capture_policy(&config);
+        let mut capture = captured("hello", Some("com.AgileBits.OnePassword7"));
+        capture.provenance_confidence = ProvenanceConfidence::Unknown;
+
+        assert_eq!(
+            decision(&policy, &capture),
+            CaptureDecision::Capture {
+                action: CaptureAction::Capture,
+                sensitive: true,
+                sync_eligible: false,
+                ai_allowed: false,
+                memory_only: false,
+                expires_after: Some(policy.secret_ttl),
+                sensitivity_reason: Some(vbuff_types::SensitivityReason::OperatingSystemHint),
+            }
+        );
     }
 
     #[test]
@@ -896,6 +1004,10 @@ mod tests {
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));
         assert_eq!(clip.meta.provenance.app_id.as_deref(), Some("editor.app"));
+        assert_eq!(
+            clip.meta.provenance_confidence,
+            ProvenanceConfidence::Proven
+        );
         assert!(clip.meta.sensitive);
         assert_eq!(
             clip.meta.sensitivity_reason,
@@ -915,6 +1027,27 @@ mod tests {
         assert_eq!(state.read_failed(), None);
         assert_eq!(state.store_succeeded(), CaptureHealth::Watching);
         assert_eq!(state.read_succeeded(), Some(CaptureHealth::Watching));
+    }
+
+    #[test]
+    fn source_privacy_degradation_is_sticky_but_yields_to_storage_errors() {
+        let mut state = CaptureHealthState::default();
+        state.degrade_source_privacy();
+
+        assert_eq!(
+            state.read_succeeded(),
+            Some(CaptureHealth::DegradedSourcePrivacy)
+        );
+        assert_eq!(state.store_succeeded(), CaptureHealth::DegradedSourcePrivacy);
+        assert_eq!(
+            state.read_succeeded(),
+            Some(CaptureHealth::DegradedSourcePrivacy)
+        );
+
+        // A storage failure still dominates while it is unresolved.
+        assert_eq!(state.store_failed(), CaptureHealth::StorageError);
+        assert_eq!(state.read_succeeded(), None);
+        assert_eq!(state.store_succeeded(), CaptureHealth::DegradedSourcePrivacy);
     }
 
     #[test]

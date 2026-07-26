@@ -11,9 +11,9 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use vbuff_core::capture::{CaptureDecision, CaptureInput, CapturePolicy, SelectionSource};
 use vbuff_core::content_hash_from_flavors;
-use vbuff_types::{Body, Clip, ClipId};
+use vbuff_types::{Body, Clip, ClipId, ConcealmentSignal, ProvenanceConfidence};
 
-use crate::{Result, Store, StoreError, now_millis, raw_to_clip, row_to_clip};
+use crate::{Result, Store, StoreError, duration_millis_i64, now_millis, raw_to_clip, row_to_clip};
 
 const MAX_COLLECTION_ID_BYTES: usize = 96;
 const MAX_COLLECTION_NAME_BYTES: usize = 160;
@@ -23,6 +23,9 @@ const MAX_IMPORT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_RESTORE_SELECTION: usize = 1_000;
 const MAX_EXPORT_CLIPS: usize = 10_000;
 const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+/// Quarantine payloads are cleartext rows in the plaintext database, so their
+/// residency is bounded even when no restore/reject decision ever arrives.
+const IMPORT_QUARANTINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ArchiveVisibility {
@@ -890,6 +893,15 @@ impl Store {
             return Err(StoreError::Maintenance("invalid import candidate".into()));
         }
         let clip = sanitize_import_privacy(clip.clone())?;
+        // The quarantine stores payload_json as cleartext rows in the
+        // plaintext database with no expiry column, so sensitive payloads
+        // (declared or detected) are refused until the quarantine is
+        // encrypted. Restore/reject of already-staged rows keeps working.
+        if clip.meta.sensitive {
+            return Err(StoreError::Maintenance(
+                "sensitive imports are refused until quarantine encryption lands".into(),
+            ));
+        }
         let payload = serde_json::to_string(&clip)?;
         if payload.len() > MAX_IMPORT_BYTES {
             return Err(StoreError::Maintenance(
@@ -1038,6 +1050,24 @@ impl Store {
         Ok(deleted == 1)
     }
 
+    /// Delete quarantined imports older than [`IMPORT_QUARANTINE_MAX_AGE`].
+    ///
+    /// Quarantine rows carry cleartext payloads in the plaintext database, so
+    /// they must not accumulate forever when the user never restores or
+    /// rejects them. Runs automatically on every store open; returns the
+    /// number of expired entries removed.
+    pub fn purge_import_quarantine(&self) -> Result<usize> {
+        let cutoff = now_millis() - duration_millis_i64(IMPORT_QUARANTINE_MAX_AGE)?;
+        let deleted = self.conn.execute(
+            "DELETE FROM import_quarantine WHERE staged_at <= ?1",
+            params![cutoff],
+        )?;
+        if deleted > 0 {
+            self.scrub_deleted_pages()?;
+        }
+        Ok(deleted)
+    }
+
     pub fn export_json(
         &self,
         version: ExportSchemaVersion,
@@ -1163,7 +1193,8 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
         source: SelectionSource::Clipboard,
         primary_intended: true,
         coherent_generation: true,
-        concealed: false,
+        concealment: ConcealmentSignal::Unknown,
+        provenance_confidence: ProvenanceConfidence::Unknown,
         self_write: false,
     });
     let CaptureDecision::Capture {
@@ -1189,6 +1220,9 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
     // review workflow can grant broader use.
     clip.meta.sync_eligible = false;
     clip.meta.ai_allowed = false;
+    // Imported provenance is equally untrusted: never let an import claim
+    // evidence the capturing backend did not supply.
+    clip.meta.provenance_confidence = ProvenanceConfidence::Unknown;
     if sensitive {
         clip.meta.sensitive = true;
         clip.meta.sensitivity_reason = sensitivity_reason.or(clip.meta.sensitivity_reason);
@@ -1352,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn import_reclassifies_secret_content_instead_of_trusting_metadata() {
+    fn import_refuses_detected_secret_content_until_quarantine_encryption() {
         let store = Store::open_in_memory().unwrap();
         let mut untrusted = clip("ghp_abcdefghijklmnopqrstuvwxyz123456");
         untrusted.meta.sensitive = false;
@@ -1361,18 +1395,75 @@ mod tests {
         untrusted.meta.sync_eligible = true;
         untrusted.meta.ai_allowed = true;
 
+        // Detection still tightens the untrusted record to sensitive, and a
+        // sensitive payload is refused rather than staged as cleartext.
+        assert!(store.stage_import(&untrusted, "backup.json").is_err());
+        assert!(store.import_quarantine(10).unwrap().is_empty());
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn import_refuses_declared_sensitive_metadata_until_quarantine_encryption() {
+        let store = Store::open_in_memory().unwrap();
+        let mut declared = clip("no detectable secret here");
+        declared.meta.sensitive = true;
+        declared.meta.sensitivity_reason =
+            Some(vbuff_types::SensitivityReason::CaptureRule);
+        declared.meta.sync_eligible = false;
+
+        assert!(store.stage_import(&declared, "backup.json").is_err());
+        assert!(store.import_quarantine(10).unwrap().is_empty());
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn non_sensitive_import_restores_with_privacy_flags_clamped() {
+        let store = Store::open_in_memory().unwrap();
+        let mut untrusted = clip("ordinary imported text");
+        untrusted.meta.sync_eligible = true;
+        untrusted.meta.ai_allowed = true;
+
         let import_id = store.stage_import(&untrusted, "backup.json").unwrap();
-        store
+        let report = store
             .restore_imports(&RestoreSelection {
                 import_ids: vec![import_id],
             })
             .unwrap();
+        assert_eq!(report.restored, 1);
         let restored = store.list(1).unwrap().pop().unwrap();
-        assert!(restored.meta.sensitive);
-        assert!(restored.meta.sensitivity_reason.is_some());
-        assert!(restored.meta.expires_at.is_some());
+        assert!(!restored.meta.sensitive);
         assert!(!restored.meta.sync_eligible);
         assert!(!restored.meta.ai_allowed);
+    }
+
+    #[test]
+    fn stale_import_quarantine_entries_are_purged_and_become_unavailable() {
+        let store = Store::open_in_memory().unwrap();
+        let fresh_id = store.stage_import(&clip("fresh import"), "backup.json").unwrap();
+        let stale_id = store.stage_import(&clip("stale import"), "backup.json").unwrap();
+        // Age one entry beyond the quarantine TTL.
+        store
+            .conn
+            .execute(
+                "UPDATE import_quarantine SET staged_at = ?1 WHERE import_id = ?2",
+                params![now_millis() - 8 * 24 * 60 * 60 * 1_000, stale_id],
+            )
+            .unwrap();
+
+        assert_eq!(store.purge_import_quarantine().unwrap(), 1);
+        let entries = store.import_quarantine(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].import_id, fresh_id);
+
+        let report = store
+            .restore_imports(&RestoreSelection {
+                import_ids: vec![stale_id],
+            })
+            .unwrap();
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.unavailable, 1);
+        assert_eq!(store.count().unwrap(), 0);
+        assert_eq!(store.purge_import_quarantine().unwrap(), 0);
     }
 
     #[test]

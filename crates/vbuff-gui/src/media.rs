@@ -3,7 +3,7 @@
 use std::io::Cursor;
 
 use egui::TextureHandle;
-use vbuff_types::Body;
+use vbuff_types::{Body, is_rgba_mime, parse_rgba_dims_checked};
 
 const MAX_DECODE_DIMENSION: u32 = 4_096;
 const MAX_DECODE_RGBA_BYTES: u64 = 64 * 1024 * 1024;
@@ -24,14 +24,9 @@ fn decode_thumbnail(flavor: &vbuff_types::Flavor) -> Option<egui::ColorImage> {
         Body::Spilled { .. } => return None,
     };
 
-    if raw_rgba_mime(&flavor.mime) {
-        let (width, height) = parse_rgba_dims(&flavor.mime)?;
-        let required = width.checked_mul(height)?.checked_mul(4)?;
-        if width == 0
-            || height == 0
-            || required != bytes.len()
-            || u64::try_from(required).ok()? > MAX_DECODE_RGBA_BYTES
-        {
+    if is_rgba_mime(&flavor.mime) {
+        let (width, height, required) = parse_rgba_dims_checked(&flavor.mime)?;
+        if required != bytes.len() || u64::try_from(required).ok()? > MAX_DECODE_RGBA_BYTES {
             return None;
         }
         if width > TEXTURE_EDGE as usize || height > TEXTURE_EDGE as usize {
@@ -100,25 +95,6 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
         (f64::from(width) * scale).round().max(1.0) as u32,
         (f64::from(height) * scale).round().max(1.0) as u32,
     )
-}
-
-fn raw_rgba_mime(mime: &str) -> bool {
-    mime.split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/x-vbuff-rgba"))
-}
-
-fn parse_rgba_dims(mime: &str) -> Option<(usize, usize)> {
-    let mut width = None;
-    let mut height = None;
-    for part in mime.split(';') {
-        if let Some(value) = part.trim().strip_prefix("width=") {
-            width = value.parse().ok();
-        } else if let Some(value) = part.trim().strip_prefix("height=") {
-            height = value.parse().ok();
-        }
-    }
-    Some((width?, height?))
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub(crate) enum DoctorFormat {
 struct DoctorOutput {
     ok: bool,
     capture_allowed: bool,
+    required_capabilities_ok: bool,
     store_present: bool,
     version: &'static str,
     target_os: &'static str,
@@ -23,6 +24,10 @@ struct DoctorOutput {
     security_posture: SecurityPosture,
     store_open: StoreOpenProfile,
     store: StoreDoctorReport,
+}
+
+fn doctor_ok(store_present: bool, store: &StoreDoctorReport, posture: &SecurityPosture) -> bool {
+    store_present && store.is_healthy() && posture.required_capabilities_satisfied()
 }
 
 pub(crate) fn requested() -> Option<DoctorFormat> {
@@ -56,8 +61,9 @@ pub(crate) fn run(
         process_hardening.ptrace_blocked,
     );
     let output = DoctorOutput {
-        ok: store_present && store_report.is_healthy() && security_posture.is_fully_protected(),
+        ok: doctor_ok(store_present, &store_report, &security_posture),
         capture_allowed: security_posture.strict_allows_capture(),
+        required_capabilities_ok: security_posture.required_capabilities_satisfied(),
         store_present,
         version: env!("CARGO_PKG_VERSION"),
         target_os: std::env::consts::OS,
@@ -95,6 +101,16 @@ pub(crate) fn run(
                     .unwrap_or("not active"),
                 output.security_posture.strict_allows_capture()
             );
+            if !output.ok {
+                if !output.store_present {
+                    println!("problem: store is missing at the default location");
+                } else if !output.store.is_healthy() {
+                    println!("problem: store failed its health check");
+                }
+                for capability in output.security_posture.failing_required() {
+                    println!("problem: {} — {}", capability.feature, capability.detail);
+                }
+            }
         }
     }
     Ok(())
@@ -105,23 +121,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn doctor_ok_is_reachable_with_satisfied_required_capabilities() {
+        let store = Store::open_in_memory().unwrap();
+        let store_report = store.doctor().unwrap();
+        assert!(store_report.is_healthy());
+
+        let satisfied = SecurityPosture::detect(false, true, true);
+        assert!(doctor_ok(true, &store_report, &satisfied));
+
+        let failing = SecurityPosture::detect(false, false, true);
+        assert!(!doctor_ok(true, &store_report, &failing));
+        assert!(!doctor_ok(false, &store_report, &satisfied));
+    }
+
+    #[test]
     fn doctor_output_schema_is_stable_and_content_free() {
         let store = Store::open_in_memory().unwrap();
         let store_report = store.doctor().unwrap();
+        let security_posture = SecurityPosture::detect(false, false, false);
         let output = DoctorOutput {
-            ok: true,
+            ok: doctor_ok(true, &store_report, &security_posture),
             capture_allowed: true,
+            required_capabilities_ok: security_posture.required_capabilities_satisfied(),
             store_present: true,
             version: "test",
             target_os: "test",
             session: SessionContext::detect(),
             process_hardening: ProcessHardeningReport::default(),
-            security_posture: SecurityPosture::detect(false, false, false),
+            security_posture,
             store_open: StoreOpenProfile::default(),
             store: store_report,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"security_posture\""));
+        assert!(json.contains("\"required_capabilities_ok\""));
+        assert!(json.contains("\"severity\""));
         assert!(!json.contains("clipboard_content"));
     }
 }

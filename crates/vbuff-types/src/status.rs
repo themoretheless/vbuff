@@ -21,6 +21,10 @@ pub enum CaptureHealth {
     Stalled,
     /// Active read/write/restore probe did not complete coherently.
     SelfTestFailed,
+    /// Source-dependent privacy rules are armed, but the clipboard backend
+    /// cannot prove source identity; capture runs degraded according to the
+    /// configured unknown-evidence policy.
+    DegradedSourcePrivacy,
 }
 
 impl CaptureHealth {
@@ -34,6 +38,7 @@ impl CaptureHealth {
             Self::StorageError => "History write issue",
             Self::Stalled => "Capture stalled",
             Self::SelfTestFailed => "Capture self-test failed",
+            Self::DegradedSourcePrivacy => "Source privacy degraded",
         }
     }
 }
@@ -163,12 +168,23 @@ impl CapabilityViewLevel {
     }
 }
 
+/// Whether a capability gates strict-mode capture or is informational only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityViewSeverity {
+    RequiredForCapture,
+    #[default]
+    Informational,
+}
+
 /// Content-free capability evidence suitable for GUI and future IPC clients.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityView {
     pub feature: String,
     pub level: CapabilityViewLevel,
     pub detail: String,
+    #[serde(default)]
+    pub severity: CapabilityViewSeverity,
 }
 
 /// Classification of one content-free capture decision.
@@ -274,6 +290,14 @@ mod tests {
             serde_json::to_string(&CaptureHealth::Stalled).unwrap(),
             r#""stalled""#
         );
+        let degraded = CaptureHealth::DegradedSourcePrivacy;
+        let degraded_json = serde_json::to_string(&degraded).unwrap();
+        assert_eq!(degraded_json, r#""degraded_source_privacy""#);
+        assert_eq!(
+            serde_json::from_str::<CaptureHealth>(&degraded_json).unwrap(),
+            degraded
+        );
+        assert_eq!(degraded.label(), "Source privacy degraded");
 
         let notice = CommandNotice {
             level: NoticeLevel::Warning,

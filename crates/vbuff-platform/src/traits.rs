@@ -3,7 +3,10 @@
 //! These traits are intentionally minimal for the MVP. They are the seam at
 //! which native per-OS backends can later be swapped in.
 
-use vbuff_types::{CaptureGeneration, CaptureLineage, CaptureProvenance, Flavor};
+use vbuff_types::{
+    CaptureGeneration, CaptureLineage, CaptureProvenance, ConcealmentSignal, Flavor,
+    ProvenanceConfidence,
+};
 
 use crate::Result;
 
@@ -65,8 +68,13 @@ pub struct CapturedClipboard {
     pub coherent_generation: bool,
     /// PRIMARY has remained stable and an intent signal was observed.
     pub primary_intended: bool,
-    /// Authoritative OS sensitivity marker; the gate must fail closed.
-    pub concealed: bool,
+    /// OS concealment evidence for this read. `Unknown` means the backend
+    /// cannot read concealment markers — not that the content is proven
+    /// clear; policy decides how to degrade on that uncertainty.
+    pub concealment: ConcealmentSignal,
+    /// Confidence that `provenance` is authoritative. `Unknown` means
+    /// source-dependent rules cannot be evaluated honestly.
+    pub provenance_confidence: ProvenanceConfidence,
 }
 
 impl Default for CapturedClipboard {
@@ -79,7 +87,8 @@ impl Default for CapturedClipboard {
             selection: ClipboardSelection::Clipboard,
             coherent_generation: true,
             primary_intended: true,
-            concealed: false,
+            concealment: ConcealmentSignal::Unknown,
+            provenance_confidence: ProvenanceConfidence::Unknown,
         }
     }
 }
@@ -91,10 +100,31 @@ impl CapturedClipboard {
     }
 }
 
+/// Static description of the evidence a clipboard backend can authoritatively
+/// supply, independent of any single read.
+///
+/// Both signals default to `Unknown` (fail closed): a backend that does not
+/// override [`ClipboardBackend::evidence`] honestly reports that it can prove
+/// neither source attribution nor concealment state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendEvidence {
+    /// Confidence of the provenance this backend attaches to reads.
+    pub provenance: ProvenanceConfidence,
+    /// Concealment signal strength this backend can observe.
+    pub concealment: ConcealmentSignal,
+}
+
 /// Reads from and writes to the system clipboard.
 pub trait ClipboardBackend: Send {
     /// Read the current clipboard contents as a flavor set.
     fn read(&mut self) -> Result<CapturedClipboard>;
+
+    /// Evidence this backend can authoritatively supply. The default reports
+    /// `Unknown` for both signals so uninstrumented backends fail closed
+    /// instead of implying source/concealment proof they do not have.
+    fn evidence(&self) -> BackendEvidence {
+        BackendEvidence::default()
+    }
 
     /// Write a flavor set back to the clipboard (for paste-back).
     fn write(&mut self, flavors: &[Flavor]) -> Result<()>;

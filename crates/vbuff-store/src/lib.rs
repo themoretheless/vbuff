@@ -64,6 +64,12 @@ pub const DATA_CONTRACT_V2_SCHEMA_VERSION: i64 = 6;
 /// The current schema version, stored in `PRAGMA user_version`.
 pub const SCHEMA_VERSION: i64 = 7;
 
+/// Hard expiry ceiling applied at insert time to sensitive clips that carry
+/// no TTL of their own, so persistable secret classes never live in the
+/// plaintext database indefinitely. Memory-only classes are still refused
+/// outright, and an explicit shorter TTL always wins over this ceiling.
+pub const SENSITIVE_TTL_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StoreOpenProfile {
     pub private_path_ms: u64,
@@ -325,6 +331,7 @@ impl Store {
         store.backfill_normalized_fingerprints(128)?;
         store.rebuild_dedup_filter()?;
         store.gc_blobs()?;
+        store.purge_import_quarantine()?;
         Ok(store)
     }
 
@@ -509,6 +516,7 @@ impl Store {
             );
             INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('fts_dirty', 0);
             INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('secret_scan_cursor', 0);
+            INSERT OR IGNORE INTO maintenance_state(key, value) VALUES ('pending_wal_scrub', 0);
 
             CREATE TABLE IF NOT EXISTS content_audit (
                 clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
@@ -748,7 +756,8 @@ impl Store {
                 simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
                 simhash_b2 = NULL, simhash_b3 = NULL,
                 dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                dhash_b2 = NULL, dhash_b3 = NULL
+                dhash_b2 = NULL, dhash_b3 = NULL,
+                normalized_hash = NULL
             WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1;
             DELETE FROM clip_facets
             WHERE clip_id IN (
@@ -983,13 +992,26 @@ impl Store {
             if effective_meta.sensitivity_reason.is_none() {
                 effective_meta.sensitivity_reason = stored.sensitivity_reason;
             }
-            if !clip.meta.sensitive {
-                effective_meta.expires_at = stored.expires_at;
-            }
+            // The TTL merges monotonically: a re-copy may shorten the
+            // remaining lifetime, but never stretch or erase it
+            // (`None` means "no expiry", the loosest bound).
+            effective_meta.expires_at = match (stored.expires_at, clip.meta.expires_at) {
+                (Some(kept), Some(incoming)) => Some(kept.min(incoming)),
+                (kept, incoming) => kept.or(incoming),
+            };
         }
         if effective_meta.sensitive {
             effective_meta.sync_eligible = false;
             effective_meta.ai_allowed = false;
+            // Sensitive rows without an explicit TTL still expire: a hard
+            // ceiling keeps persistable secret classes from living in the
+            // plaintext database indefinitely. This covers both the fresh
+            // INSERT and the dedup-bump path below.
+            if effective_meta.expires_at.is_none() {
+                let ceiling = chrono::Duration::from_std(SENSITIVE_TTL_CEILING)
+                    .unwrap_or_else(|_| chrono::Duration::days(1));
+                effective_meta.expires_at = Some(chrono::Utc::now() + ceiling);
+            }
         }
         let metadata_json = serde_json::to_string(&StoredMetadata::from(&effective_meta))?;
         let expires_at = effective_meta
@@ -1213,6 +1235,7 @@ impl Store {
                    byte_size, source_app, metadata_json, pinned, favorite
             FROM clips
             WHERE normalized_hash = ?1
+              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
             ORDER BY updated_at DESC, seq DESC
             LIMIT ?2
             "#,
@@ -1481,13 +1504,7 @@ impl Store {
                     .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
                 deleted_any = true;
             } else if let Some(key) = grace_key {
-                self.delete_with_grace_inner(
-                    id,
-                    key,
-                    grace_window,
-                    DeletionReason::Retention,
-                    false,
-                )?;
+                self.delete_with_grace_inner(id, key, grace_window, DeletionReason::Retention)?;
                 report.encrypted += 1;
                 deleted_any = true;
             } else {
@@ -2006,7 +2023,8 @@ impl Store {
                     simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
                     simhash_b2 = NULL, simhash_b3 = NULL,
                     dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                    dhash_b2 = NULL, dhash_b3 = NULL
+                    dhash_b2 = NULL, dhash_b3 = NULL,
+                    normalized_hash = NULL
                 WHERE id = ?3
                 "#,
                 params![
@@ -2195,7 +2213,7 @@ impl Store {
     ) -> Result<String> {
         self.ensure_not_legal_hold(id)?;
         self.purge_grace_bin()?;
-        self.delete_with_grace_inner(id, key, window, reason, true)
+        self.delete_with_grace_inner(id, key, window, reason)
     }
 
     fn delete_with_grace_inner(
@@ -2204,7 +2222,6 @@ impl Store {
         key: &[u8; 32],
         window: Duration,
         reason: DeletionReason,
-        scrub_after: bool,
     ) -> Result<String> {
         let window_ms = duration_millis_i64(window)?;
         if window_ms == 0 || window > Duration::from_secs(7 * 24 * 60 * 60) {
@@ -2252,9 +2269,7 @@ impl Store {
             [id.to_string_repr()],
         )?;
         transaction.commit()?;
-        if scrub_after {
-            self.scrub_deleted_pages()?;
-        }
+        self.scrub_deleted_pages()?;
         Ok(recovery_id)
     }
 
@@ -2681,16 +2696,67 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Mark the WAL as needing a scrub after one or more deletions.
+    ///
+    /// Deliberately cheap: every deletion path (including the hot
+    /// `History::insert -> enforce_cap` one) only bumps the
+    /// `pending_wal_scrub` counter. The blocking `wal_checkpoint(TRUNCATE)`
+    /// runs later, from [`Store::scrub_wal_if_dirty`], so a busy checkpoint
+    /// can no longer turn an already-committed delete into a spurious error.
     fn scrub_deleted_pages(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE maintenance_state SET value = value + 1 WHERE key = 'pending_wal_scrub'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Truncate-checkpoint the WAL when earlier deletions marked it dirty.
+    ///
+    /// Deletion paths never checkpoint inline (see `scrub_deleted_pages`);
+    /// the scrub is deferred to this method, which the app drives from idle
+    /// maintenance and from shutdown. Returns `Ok(true)` when the WAL was
+    /// fully truncated and the dirty counter was reset, `Ok(false)` when
+    /// there was nothing to do or the truncate was blocked.
+    ///
+    /// A busy truncate (another connection holds a read transaction) is not
+    /// an error: a `PASSIVE` checkpoint is attempted as a best-effort
+    /// fallback, the dirty counter is preserved so the next call retries the
+    /// truncate, and `Ok(false)` is returned. `Err` is reserved for real
+    /// SQLite failures.
+    ///
+    /// Trade-off, stated honestly: between a deletion and the next
+    /// successful scrub — up to roughly the 60-second idle-maintenance
+    /// interval — pre-delete WAL frames can still hold recoverable bytes of
+    /// deleted clips. `secure_delete=ON` zeroes the deleted b-tree cells in
+    /// newly written pages, but older `-wal` frames are only reclaimed once
+    /// a truncating checkpoint runs (this method, SQLite's own automatic
+    /// checkpoint, or the last connection closing the database).
+    pub fn scrub_wal_if_dirty(&self) -> Result<bool> {
+        let pending: i64 = self.conn.query_row(
+            "SELECT value FROM maintenance_state WHERE key = 'pending_wal_scrub'",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending == 0 {
+            return Ok(false);
+        }
         let busy: i64 = self
             .conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         if busy != 0 {
-            return Err(StoreError::Maintenance(
-                "WAL truncate checkpoint was busy after deletion".into(),
-            ));
+            // A reader still pins the WAL: checkpoint what is reachable and
+            // keep the dirty marker so idle maintenance retries the truncate.
+            let _: i64 = self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(0))?;
+            return Ok(false);
         }
-        Ok(())
+        self.conn.execute(
+            "UPDATE maintenance_state SET value = 0 WHERE key = 'pending_wal_scrub'",
+            [],
+        )?;
+        Ok(true)
     }
 }
 
@@ -2867,6 +2933,9 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
 #[serde(default)]
 struct StoredMetadata {
     provenance: CaptureProvenance,
+    /// Fail-closed evidence confidence; rows written before this field
+    /// existed deserialize as `Unknown` (no schema migration needed).
+    provenance_confidence: vbuff_types::ProvenanceConfidence,
     generation: Option<CaptureGeneration>,
     lineage: CaptureLineage,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2880,6 +2949,7 @@ impl From<&ClipMeta> for StoredMetadata {
     fn from(meta: &ClipMeta) -> Self {
         Self {
             provenance: meta.provenance.clone(),
+            provenance_confidence: meta.provenance_confidence,
             generation: meta.generation,
             lineage: meta.lineage.clone(),
             expires_at: meta.expires_at,
@@ -2894,6 +2964,7 @@ impl From<&ClipMeta> for StoredMetadata {
 impl StoredMetadata {
     fn apply_to(self, meta: &mut ClipMeta) {
         meta.provenance = self.provenance;
+        meta.provenance_confidence = self.provenance_confidence;
         meta.generation = self.generation;
         meta.lineage = self.lineage;
         meta.expires_at = self.expires_at;
@@ -3147,6 +3218,42 @@ mod tests {
     }
 
     #[test]
+    fn stored_metadata_roundtrips_provenance_confidence() {
+        let mut meta = ClipMeta::now(ContentKind::Text, 5, Some("editor.app".into()));
+        meta.provenance_confidence = vbuff_types::ProvenanceConfidence::Proven;
+        let json = serde_json::to_string(&StoredMetadata::from(&meta)).unwrap();
+        assert!(json.contains(r#""provenance_confidence":"proven""#));
+
+        let stored: StoredMetadata = serde_json::from_str(&json).unwrap();
+        let mut restored = ClipMeta::now(ContentKind::Text, 5, None);
+        stored.apply_to(&mut restored);
+        assert_eq!(
+            restored.provenance_confidence,
+            vbuff_types::ProvenanceConfidence::Proven
+        );
+    }
+
+    #[test]
+    fn stored_metadata_without_confidence_field_fails_closed() {
+        let meta = ClipMeta::now(ContentKind::Text, 5, Some("editor.app".into()));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&StoredMetadata::from(&meta)).unwrap())
+                .unwrap();
+        // A row written before the field existed.
+        json.as_object_mut()
+            .unwrap()
+            .remove("provenance_confidence");
+
+        let stored: StoredMetadata = serde_json::from_value(json).unwrap();
+        let mut restored = ClipMeta::now(ContentKind::Text, 5, None);
+        stored.apply_to(&mut restored);
+        assert_eq!(
+            restored.provenance_confidence,
+            vbuff_types::ProvenanceConfidence::Unknown
+        );
+    }
+
+    #[test]
     fn sensitive_dedup_upgrade_scrubs_derivatives_and_cannot_be_downgraded() {
         let store = Store::open_in_memory().unwrap();
         let mut ordinary = make_clip("upgrade privacy needle");
@@ -3207,6 +3314,80 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_clip_without_ttl_receives_a_hard_expiry_ceiling() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("ceiling secret");
+        clip.meta.sensitive = true;
+        clip.meta.sensitivity_reason = Some(SensitivityReason::AccessToken);
+        clip.meta.expires_at = None;
+        store.insert(&clip).unwrap();
+
+        let stored = store.list(1).unwrap().pop().unwrap();
+        let expires = stored
+            .meta
+            .expires_at
+            .expect("sensitive rows must always expire");
+        let remaining = expires - chrono::Utc::now();
+        assert!(remaining > Duration::hours(23));
+        assert!(remaining <= Duration::hours(24));
+
+        // An explicit shorter TTL is preserved as-is: the ceiling only
+        // applies when no expiry was requested at all.
+        let explicit = chrono::Utc::now() + Duration::minutes(5);
+        let mut short = make_clip("short secret");
+        short.meta.sensitive = true;
+        short.meta.sensitivity_reason = Some(SensitivityReason::AccessToken);
+        short.meta.expires_at = Some(explicit);
+        store.insert(&short).unwrap();
+        let stored = store.list(1).unwrap().pop().unwrap();
+        assert_eq!(stored.meta.expires_at, Some(explicit));
+    }
+
+    #[test]
+    fn sensitive_dedup_bump_keeps_the_tighter_ttl() {
+        let store = Store::open_in_memory().unwrap();
+        let original_expiry = chrono::Utc::now() + Duration::minutes(10);
+        let mut original = make_clip("dedup ttl secret");
+        original.meta.sensitive = true;
+        original.meta.sensitivity_reason = Some(SensitivityReason::AccessToken);
+        original.meta.expires_at = Some(original_expiry);
+        let id = store.insert(&original).unwrap();
+
+        // Direction 1: a re-copy with no TTL must not erase the stored one.
+        let mut recopy = make_clip("dedup ttl secret");
+        recopy.meta.sensitive = true;
+        recopy.meta.sensitivity_reason = Some(SensitivityReason::AccessToken);
+        recopy.meta.expires_at = None;
+        assert_eq!(store.insert(&recopy).unwrap(), id);
+        assert_eq!(
+            store.list(1).unwrap()[0].meta.expires_at,
+            Some(original_expiry)
+        );
+
+        // A tighter re-copy shortens the deadline...
+        let tighter = chrono::Utc::now() + Duration::minutes(5);
+        let mut tightening = make_clip("dedup ttl secret");
+        tightening.meta.sensitive = true;
+        tightening.meta.expires_at = Some(tighter);
+        assert_eq!(store.insert(&tightening).unwrap(), id);
+        assert_eq!(store.list(1).unwrap()[0].meta.expires_at, Some(tighter));
+
+        // ...but Direction 2: a looser re-copy never stretches it back.
+        let mut stretching = make_clip("dedup ttl secret");
+        stretching.meta.sensitive = true;
+        stretching.meta.expires_at = Some(chrono::Utc::now() + Duration::hours(2));
+        assert_eq!(store.insert(&stretching).unwrap(), id);
+        assert_eq!(store.list(1).unwrap()[0].meta.expires_at, Some(tighter));
+
+        // An unmarked re-copy of the sensitive row also keeps the stored TTL.
+        let ordinary = make_clip("dedup ttl secret");
+        assert_eq!(store.insert(&ordinary).unwrap(), id);
+        let stored = store.list(1).unwrap().pop().unwrap();
+        assert!(stored.meta.sensitive);
+        assert_eq!(stored.meta.expires_at, Some(tighter));
+    }
+
+    #[test]
     fn pin_search_delete_clear() {
         let store = Store::open_in_memory().unwrap();
         let c = make_clip("findme please");
@@ -3239,6 +3420,50 @@ mod tests {
         assert_eq!(store.count().unwrap(), 3);
         // Pinned survived.
         assert!(store.list(10).unwrap().iter().any(|c| c.pinned));
+    }
+
+    fn pending_wal_scrub(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT value FROM maintenance_state WHERE key = 'pending_wal_scrub'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn delete_marks_wal_dirty_and_scrub_clears_it() {
+        let store = Store::open_in_memory().unwrap();
+        // Clean store: the scrub is a no-op.
+        assert!(!store.scrub_wal_if_dirty().unwrap());
+
+        let clip = make_clip("scrub me");
+        store.insert(&clip).unwrap();
+        // Inserts alone do not mark the WAL dirty.
+        assert!(!store.scrub_wal_if_dirty().unwrap());
+
+        store.delete(clip.id).unwrap();
+        assert_eq!(pending_wal_scrub(&store), 1);
+        assert!(store.scrub_wal_if_dirty().unwrap());
+        assert_eq!(pending_wal_scrub(&store), 0);
+        assert!(!store.scrub_wal_if_dirty().unwrap());
+    }
+
+    #[test]
+    fn enforce_cap_marks_wal_dirty_without_checkpointing_inline() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            store.insert(&make_clip(&format!("cap {i}"))).unwrap();
+        }
+        let evicted = store.enforce_cap(2).unwrap();
+        assert_eq!(evicted, 3);
+        // The eviction only marked the WAL dirty; the truncate checkpoint is
+        // deferred to scrub_wal_if_dirty.
+        assert!(pending_wal_scrub(&store) > 0);
+        assert!(store.scrub_wal_if_dirty().unwrap());
+        assert_eq!(pending_wal_scrub(&store), 0);
     }
 
     #[test]
@@ -3748,6 +3973,36 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_clawback_nulls_the_normalized_correlation_hash() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_clip("ghp_abcdefghijklmnopqrstuvwxyz123456"))
+            .unwrap();
+        let before: Option<Vec<u8>> = store
+            .conn
+            .query_row("SELECT normalized_hash FROM clips", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            before.is_some(),
+            "ordinary row must start with a normalized_hash"
+        );
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(report.reclassified, 1);
+
+        let after: Option<Vec<u8>> = store
+            .conn
+            .query_row("SELECT normalized_hash FROM clips", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            after.is_none(),
+            "reclassified row must lose its normalized_hash"
+        );
+    }
+
+    #[test]
     fn sensitive_clawback_cursor_reaches_rows_beyond_the_first_batch() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_clip("ordinary row one")).unwrap();
@@ -3984,6 +4239,33 @@ mod tests {
         assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 1);
         assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 0);
         assert!(store.near_duplicate_group(clip.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn near_duplicate_group_never_correlates_sensitive_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let first = make_clip("shared normalized  text");
+        let second = make_clip("  shared   normalized text ");
+        store.insert(&first).unwrap();
+        store.insert(&second).unwrap();
+        assert_eq!(store.near_duplicate_group(first.id, 10).unwrap().len(), 2);
+
+        // Simulate a row reclassified by an older binary whose clawback left
+        // normalized_hash intact: the group query must filter it out.
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET metadata_json = json_set(metadata_json, '$.sensitive', 1) WHERE id = ?1",
+                [second.id.to_string_repr()],
+            )
+            .unwrap();
+
+        let group = store.near_duplicate_group(first.id, 10).unwrap();
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].id, first.id);
+        // The sensitive row never appears in any group, not even its own.
+        let own_group = store.near_duplicate_group(second.id, 10).unwrap();
+        assert!(own_group.iter().all(|clip| clip.id != second.id));
     }
 
     #[test]

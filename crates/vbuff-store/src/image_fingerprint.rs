@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use vbuff_core::fingerprint::dhash_rgba;
-use vbuff_types::{Body, Clip};
+use vbuff_types::{Body, Clip, is_rgba_mime, parse_rgba_dims_checked};
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODED_RGBA_BYTES: u64 = 128 * 1024 * 1024;
@@ -11,11 +11,10 @@ pub(crate) fn clip_dhash(clip: &Clip) -> Option<u64> {
     let Body::Inline(bytes) = &flavor.body else {
         return None;
     };
-    if raw_rgba_mime(&flavor.mime) {
-        let (width, height) = parse_rgba_dims(&flavor.mime)?;
+    if is_rgba_mime(&flavor.mime) {
+        let (width, height, required) = parse_rgba_dims_checked(&flavor.mime)?;
         let width_u32 = u32::try_from(width).ok()?;
         let height_u32 = u32::try_from(height).ok()?;
-        let required = width.checked_mul(height)?.checked_mul(4)?;
         if width_u32 > MAX_IMAGE_DIMENSION
             || height_u32 > MAX_IMAGE_DIMENSION
             || required != bytes.len()
@@ -47,25 +46,6 @@ pub(crate) fn clip_dhash(clip: &Clip) -> Option<u64> {
     dhash_rgba(rgba.as_raw(), rgba.width() as usize, rgba.height() as usize)
 }
 
-fn raw_rgba_mime(mime: &str) -> bool {
-    mime.split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("image/x-vbuff-rgba"))
-}
-
-fn parse_rgba_dims(mime: &str) -> Option<(usize, usize)> {
-    let mut width = None;
-    let mut height = None;
-    for part in mime.split(';') {
-        if let Some(value) = part.trim().strip_prefix("width=") {
-            width = value.parse().ok();
-        } else if let Some(value) = part.trim().strip_prefix("height=") {
-            height = value.parse().ok();
-        }
-    }
-    Some((width?, height?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +63,21 @@ mod tests {
             favorite: false,
         };
         assert_eq!(clip_dhash(&clip), Some(0));
+    }
+
+    #[test]
+    fn rejects_overflow_rgba_dims() {
+        let clip = Clip {
+            id: ClipId::new(),
+            flavors: vec![Flavor::inline(
+                "image/x-vbuff-rgba;width=18446744073709551615;height=2",
+                vec![0_u8; 4],
+            )],
+            content_hash: [0; 32],
+            meta: ClipMeta::now(ContentKind::Image, 4, None),
+            pinned: false,
+            favorite: false,
+        };
+        assert_eq!(clip_dhash(&clip), None);
     }
 }

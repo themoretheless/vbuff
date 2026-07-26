@@ -215,7 +215,8 @@ pub enum UiAction {
     DismissNotice,
     /// Permanently dismiss the first-run hotkey coachmark.
     DismissHotkeyCoachmark,
-    /// Close the popup; the runtime hides or exits based on resident availability.
+    /// Close the popup; the runtime always hides it and never exits here —
+    /// exiting happens only through an explicit [`UiAction::Quit`].
     Hide,
     /// Exit the resident application.
     Quit,

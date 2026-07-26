@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use regex::Regex;
 use url::Url;
-use vbuff_types::{CaptureProvenance, Flavor, SensitivityReason};
+use vbuff_types::{
+    CaptureProvenance, ConcealmentSignal, Flavor, ProvenanceConfidence, SensitivityReason,
+};
 
 use crate::secret::{SecretKind, detect_secrets};
 use crate::trust::{handling_for_secret, sensitivity_reason_for_secret};
@@ -41,6 +43,8 @@ pub enum DropReason {
     ExcludedSource,
     SourceRule,
     Concealed,
+    ConcealmentUnknown,
+    ProvenanceUnknown,
     SelfWriteSuppressed,
     PrimaryWithoutIntent,
     NoRealizedFlavor,
@@ -79,6 +83,8 @@ impl DropReason {
             | Self::ExcludedSource
             | Self::SourceRule
             | Self::Concealed
+            | Self::ConcealmentUnknown
+            | Self::ProvenanceUnknown
             | Self::SelfWriteSuppressed
             | Self::PrimaryWithoutIntent
             | Self::DebounceCollapsed => DropClass::Intentional,
@@ -102,6 +108,8 @@ impl DropReason {
             Self::ExcludedSource => "excluded_source",
             Self::SourceRule => "source_rule",
             Self::Concealed => "concealed",
+            Self::ConcealmentUnknown => "concealment_unknown",
+            Self::ProvenanceUnknown => "provenance_unknown",
             Self::SelfWriteSuppressed => "self_write_suppressed",
             Self::PrimaryWithoutIntent => "primary_without_intent",
             Self::NoRealizedFlavor => "no_realized_flavor",
@@ -118,8 +126,12 @@ impl DropReason {
         }
     }
 
+    /// True when the user may explicitly re-grab the skipped clipboard within
+    /// the recovery window. A provenance-unknown skip is exactly the
+    /// false-positive class that recovery exists for: the gate refused an
+    /// ambiguous capture, and the user can override with explicit consent.
     pub const fn is_recoverable(self) -> bool {
-        false
+        matches!(self, Self::ProvenanceUnknown)
     }
 }
 
@@ -183,7 +195,12 @@ pub struct CaptureInput<'a> {
     pub source: SelectionSource,
     pub primary_intended: bool,
     pub coherent_generation: bool,
-    pub concealed: bool,
+    /// OS concealment evidence. `Unknown` means the backend cannot read
+    /// concealment markers — never treat it as "proven clear".
+    pub concealment: ConcealmentSignal,
+    /// Confidence that `provenance` is authoritative. Source-dependent rules
+    /// are only meaningful when this is `Proven`.
+    pub provenance_confidence: ProvenanceConfidence,
     pub self_write: bool,
 }
 
@@ -201,6 +218,26 @@ pub enum CaptureDecision {
     Skip(DropReason),
 }
 
+/// How the capture gate resolves evidence a clipboard backend cannot supply.
+///
+/// Unknown provenance only matters when source rules are armed
+/// (`excluded_apps`/`rules` non-empty); without armed rules every mode
+/// behaves identically, which keeps the default user experience unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnknownEvidencePolicy {
+    /// Keep capturing, but route the clip into the sensitive lane (masked,
+    /// sync/AI disabled, bounded TTL) instead of evaluating source rules
+    /// against evidence the backend did not supply.
+    #[default]
+    Guard,
+    /// Refuse the capture outright; the skip is user-recoverable for
+    /// provenance, since this is the classic false-positive class.
+    Skip,
+    /// Preserve the legacy fail-open behavior: evaluate source rules against
+    /// possibly-absent provenance. Deliberate opt-out.
+    Allow,
+}
+
 #[derive(Clone, Debug)]
 pub struct CapturePolicy {
     pub skip_whitespace_only: bool,
@@ -209,6 +246,7 @@ pub struct CapturePolicy {
     pub otp_ttl: Duration,
     pub detect_secrets: bool,
     pub secret_ttl: Duration,
+    pub unknown_evidence: UnknownEvidencePolicy,
 }
 
 impl Default for CapturePolicy {
@@ -220,6 +258,7 @@ impl Default for CapturePolicy {
             otp_ttl: Duration::from_secs(90),
             detect_secrets: true,
             secret_ttl: Duration::from_secs(10 * 60),
+            unknown_evidence: UnknownEvidencePolicy::default(),
         }
     }
 }
@@ -238,11 +277,47 @@ impl CapturePolicy {
         if input.source == SelectionSource::Primary && !input.primary_intended {
             return CaptureDecision::Skip(DropReason::PrimaryWithoutIntent);
         }
-        if input.concealed {
-            return CaptureDecision::Skip(DropReason::Concealed);
+        match input.concealment {
+            ConcealmentSignal::Concealed => return CaptureDecision::Skip(DropReason::Concealed),
+            ConcealmentSignal::Unknown
+                if self.unknown_evidence == UnknownEvidencePolicy::Skip =>
+            {
+                return CaptureDecision::Skip(DropReason::ConcealmentUnknown);
+            }
+            // `Unknown` concealment is the permanent state of the generic
+            // arboard backend; treating it as concealed would mask the entire
+            // history and make the app useless. Guard/Allow deliberately keep
+            // capturing here — the residual risk is covered by the content
+            // detectors below and by strict security mode.
+            ConcealmentSignal::Clear | ConcealmentSignal::Unknown => {}
         }
         if !input.flavors.iter().any(Flavor::is_realized) {
             return CaptureDecision::Skip(DropReason::NoRealizedFlavor);
+        }
+
+        // Source-dependent rules are only meaningful when the backend proved
+        // where this copy came from. With armed rules and unproven
+        // provenance, degrade according to the configured policy instead of
+        // matching rules against evidence that was never supplied.
+        let rules_armed = !self.excluded_apps.is_empty() || !self.rules.is_empty();
+        if rules_armed && input.provenance_confidence == ProvenanceConfidence::Unknown {
+            match self.unknown_evidence {
+                UnknownEvidencePolicy::Guard => {
+                    return CaptureDecision::Capture {
+                        action: CaptureAction::Capture,
+                        sensitive: true,
+                        sync_eligible: false,
+                        ai_allowed: false,
+                        memory_only: false,
+                        expires_after: Some(self.secret_ttl),
+                        sensitivity_reason: Some(SensitivityReason::OperatingSystemHint),
+                    };
+                }
+                UnknownEvidencePolicy::Skip => {
+                    return CaptureDecision::Skip(DropReason::ProvenanceUnknown);
+                }
+                UnknownEvidencePolicy::Allow => {}
+            }
         }
 
         let source_app = input.provenance.app_id.as_deref().unwrap_or_default();
@@ -320,6 +395,10 @@ impl CapturePolicy {
             } else if let Some(kind) = secret_kind {
                 let handling = handling_for_secret(kind);
                 Some(handling.ttl.min(self.secret_ttl))
+            } else if forced_sensitive {
+                // A rule-forced sensitive capture is still a secret class:
+                // bound it by the user's secret TTL instead of no expiry.
+                Some(self.secret_ttl)
             } else {
                 None
             },
@@ -371,7 +450,10 @@ mod tests {
             source: SelectionSource::Clipboard,
             primary_intended: true,
             coherent_generation: true,
-            concealed: false,
+            // Tests exercise proven, clear evidence by default; the unknown
+            // evidence paths get their own dedicated cases below.
+            concealment: ConcealmentSignal::Clear,
+            provenance_confidence: ProvenanceConfidence::Proven,
             self_write: false,
         }
     }
@@ -543,7 +625,7 @@ mod tests {
                 sync_eligible: false,
                 ai_allowed: false,
                 memory_only: false,
-                expires_after: None,
+                expires_after: Some(Duration::from_secs(10 * 60)),
                 sensitivity_reason: Some(SensitivityReason::CaptureRule),
             }
         );
@@ -575,5 +657,191 @@ mod tests {
             policy.decide(input(&flavors, &provenance)),
             CaptureDecision::Skip(DropReason::NoRealizedFlavor)
         );
+    }
+
+    fn armed_policy(mode: UnknownEvidencePolicy) -> CapturePolicy {
+        CapturePolicy {
+            excluded_apps: vec!["onepassword".into()],
+            rules: vec![CaptureRule {
+                predicate: SourcePredicate {
+                    app_contains: Some("bank".into()),
+                    title_regex: None,
+                    url_host_suffix: None,
+                },
+                action: CaptureAction::Skip,
+            }],
+            unknown_evidence: mode,
+            ..CapturePolicy::default()
+        }
+    }
+
+    #[test]
+    fn unknown_provenance_with_armed_rules_guard_captures_as_sensitive() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        // Provenance that *would* match the armed rules if it were proven:
+        // guard mode must not evaluate the rules at all.
+        let provenance = CaptureProvenance {
+            app_id: Some("com.AgileBits.OnePassword7".into()),
+            ..Default::default()
+        };
+        let policy = armed_policy(UnknownEvidencePolicy::Guard);
+        let mut candidate = input(&flavors, &provenance);
+        candidate.provenance_confidence = ProvenanceConfidence::Unknown;
+
+        assert_eq!(
+            policy.decide(candidate),
+            CaptureDecision::Capture {
+                action: CaptureAction::Capture,
+                sensitive: true,
+                sync_eligible: false,
+                ai_allowed: false,
+                memory_only: false,
+                expires_after: Some(policy.secret_ttl),
+                sensitivity_reason: Some(SensitivityReason::OperatingSystemHint),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_provenance_with_armed_rules_skip_drops_recoverably() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let provenance = CaptureProvenance::default();
+        let policy = armed_policy(UnknownEvidencePolicy::Skip);
+        let mut candidate = input(&flavors, &provenance);
+        candidate.provenance_confidence = ProvenanceConfidence::Unknown;
+
+        assert_eq!(
+            policy.decide(candidate),
+            CaptureDecision::Skip(DropReason::ProvenanceUnknown)
+        );
+        assert!(DropReason::ProvenanceUnknown.is_recoverable());
+    }
+
+    #[test]
+    fn unknown_provenance_with_armed_rules_allow_keeps_legacy_matching() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let policy = armed_policy(UnknownEvidencePolicy::Allow);
+
+        // Legacy behavior: matching against absent provenance fails open.
+        let unknown = CaptureProvenance::default();
+        let mut candidate = input(&flavors, &unknown);
+        candidate.provenance_confidence = ProvenanceConfidence::Unknown;
+        assert!(matches!(
+            policy.decide(candidate),
+            CaptureDecision::Capture {
+                sensitive: false,
+                ..
+            }
+        ));
+
+        // And the armed exclusion still applies when provenance data exists.
+        let excluded = CaptureProvenance {
+            app_id: Some("com.AgileBits.OnePassword7".into()),
+            ..Default::default()
+        };
+        let mut candidate = input(&flavors, &excluded);
+        candidate.provenance_confidence = ProvenanceConfidence::Unknown;
+        assert_eq!(
+            policy.decide(candidate),
+            CaptureDecision::Skip(DropReason::ExcludedSource)
+        );
+    }
+
+    #[test]
+    fn unknown_provenance_without_armed_rules_captures_normally_in_all_modes() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let provenance = CaptureProvenance::default();
+        for mode in [
+            UnknownEvidencePolicy::Guard,
+            UnknownEvidencePolicy::Skip,
+            UnknownEvidencePolicy::Allow,
+        ] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let mut candidate = input(&flavors, &provenance);
+            candidate.provenance_confidence = ProvenanceConfidence::Unknown;
+            assert_eq!(
+                policy.decide(candidate),
+                CaptureDecision::Capture {
+                    action: CaptureAction::Capture,
+                    sensitive: false,
+                    sync_eligible: true,
+                    ai_allowed: true,
+                    memory_only: false,
+                    expires_after: None,
+                    sensitivity_reason: None,
+                },
+                "mode {mode:?} must not degrade the default user experience"
+            );
+        }
+    }
+
+    #[test]
+    fn concealment_signal_is_a_three_state_gate() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let provenance = CaptureProvenance::default();
+
+        // Concealed always skips, in every mode.
+        for mode in [
+            UnknownEvidencePolicy::Guard,
+            UnknownEvidencePolicy::Skip,
+            UnknownEvidencePolicy::Allow,
+        ] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let mut candidate = input(&flavors, &provenance);
+            candidate.concealment = ConcealmentSignal::Concealed;
+            assert_eq!(
+                policy.decide(candidate),
+                CaptureDecision::Skip(DropReason::Concealed),
+                "mode {mode:?} must still honor an affirmative concealed signal"
+            );
+        }
+
+        // Unknown concealment only skips in Skip mode; Guard/Allow keep the
+        // generic backend usable (residual risk: content detectors).
+        let skip_policy = CapturePolicy {
+            unknown_evidence: UnknownEvidencePolicy::Skip,
+            ..CapturePolicy::default()
+        };
+        let mut candidate = input(&flavors, &provenance);
+        candidate.concealment = ConcealmentSignal::Unknown;
+        assert_eq!(
+            skip_policy.decide(candidate),
+            CaptureDecision::Skip(DropReason::ConcealmentUnknown)
+        );
+        for mode in [UnknownEvidencePolicy::Guard, UnknownEvidencePolicy::Allow] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let mut candidate = input(&flavors, &provenance);
+            candidate.concealment = ConcealmentSignal::Unknown;
+            assert!(matches!(
+                policy.decide(candidate),
+                CaptureDecision::Capture { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn new_drop_reasons_are_intentional_and_named_stably() {
+        assert_eq!(DropReason::ProvenanceUnknown.class(), DropClass::Intentional);
+        assert_eq!(
+            DropReason::ConcealmentUnknown.class(),
+            DropClass::Intentional
+        );
+        assert_eq!(DropReason::ProvenanceUnknown.as_str(), "provenance_unknown");
+        assert_eq!(
+            DropReason::ConcealmentUnknown.as_str(),
+            "concealment_unknown"
+        );
+        assert!(DropReason::ProvenanceUnknown.is_recoverable());
+        assert!(!DropReason::ConcealmentUnknown.is_recoverable());
+        assert!(!DropReason::Concealed.is_recoverable());
     }
 }
