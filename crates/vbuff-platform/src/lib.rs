@@ -38,7 +38,7 @@ pub use traits::{
     ClipboardWriteReceipt, ConfirmedPasteBackend, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
 };
 
-pub use capabilities::{CapabilityLevel, FeatureCapability, SecurityPosture};
+pub use capabilities::{CapabilityLevel, CapabilitySeverity, FeatureCapability, SecurityPosture};
 pub use cf_html::{CfHtml, CfHtmlError, parse_cf_html};
 pub use desktop::{
     DesktopShell, LinuxTrayFallback, PastePermissionLevel, PastePermissionSelfCheck,

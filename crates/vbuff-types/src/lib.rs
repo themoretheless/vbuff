@@ -21,12 +21,15 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 pub use ipc::{ClientIntent, ServerResponse};
-pub use rgba::{RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
+pub use rgba::{
+    RGBA_MIME_PREFIX, is_rgba_mime, parse_rgba_dims, parse_rgba_dims_checked, rgba_mime,
+    rgba_required_len,
+};
 pub use status::{
-    CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, CapturePauseReason,
-    CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyDecisionLevel,
-    PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary,
-    SloMetricState, SloStatusSummary,
+    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CaptureBudgetAlert, CaptureHealth,
+    CapturePauseReason, CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel,
+    PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel,
+    SecurityPostureSummary, SloMetricState, SloStatusSummary,
 };
 
 /// A ULID-based identifier for a clip.
@@ -183,6 +186,41 @@ pub struct SelectionRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Confidence that a clipboard backend's provenance evidence is authoritative.
+///
+/// Backends that cannot prove source attribution (for example the generic
+/// `arboard` fallback) report [`ProvenanceConfidence::Unknown`]. `Unknown`
+/// must never be treated as "proven clean": source-dependent rules cannot be
+/// evaluated against evidence the backend did not supply, so policy degrades
+/// according to the configured unknown-evidence mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceConfidence {
+    /// A native backend supplied verifiable source attribution.
+    Proven,
+    /// The backend cannot prove source attribution. Fail-closed default.
+    #[default]
+    Unknown,
+}
+
+/// OS concealment evidence for one clipboard read.
+///
+/// This is a three-state signal on purpose: the legacy boolean collapsed
+/// "the backend cannot read concealment markers" into `false`, which was then
+/// interpreted as "proven clear". [`ConcealmentSignal::Unknown`] keeps that
+/// uncertainty explicit so policy can degrade deliberately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcealmentSignal {
+    /// The OS marked this clipboard content concealed/transient.
+    Concealed,
+    /// The backend affirmatively observed no concealment marker.
+    Clear,
+    /// The backend cannot read concealment markers. Fail-closed default.
+    #[default]
+    Unknown,
 }
 
 /// Source context captured at the same instant as the clipboard generation.
@@ -375,6 +413,10 @@ pub struct ClipMeta {
     /// Rich source context, when the platform can provide it.
     #[serde(default)]
     pub provenance: CaptureProvenance,
+    /// Confidence that `provenance` is authoritative. Older databases
+    /// deserialize this as `Unknown` (fail closed).
+    #[serde(default)]
+    pub provenance_confidence: ProvenanceConfidence,
     /// Native clipboard generation identity, when available.
     #[serde(default)]
     pub generation: Option<CaptureGeneration>,
@@ -414,6 +456,7 @@ impl ClipMeta {
             source_app,
             kind,
             provenance,
+            provenance_confidence: ProvenanceConfidence::Unknown,
             generation: None,
             lineage: CaptureLineage::default(),
             expires_at: None,
@@ -535,5 +578,40 @@ mod tests {
     fn truncate_adds_ellipsis() {
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("ab", 4), "ab");
+    }
+
+    #[test]
+    fn evidence_signals_default_fail_closed_and_roundtrip_snake_case() {
+        assert_eq!(
+            ProvenanceConfidence::default(),
+            ProvenanceConfidence::Unknown
+        );
+        assert_eq!(ConcealmentSignal::default(), ConcealmentSignal::Unknown);
+        assert_eq!(
+            serde_json::to_string(&ProvenanceConfidence::Proven).unwrap(),
+            r#""proven""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ConcealmentSignal::Concealed).unwrap(),
+            r#""concealed""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ConcealmentSignal>(r#""clear""#).unwrap(),
+            ConcealmentSignal::Clear
+        );
+    }
+
+    #[test]
+    fn clip_meta_from_older_database_fails_closed_on_provenance_confidence() {
+        let meta = ClipMeta::now(ContentKind::Text, 1, None);
+        let json = serde_json::to_value(&meta).unwrap();
+        // Simulate a database row written before the field existed.
+        let mut older = json.clone();
+        older.as_object_mut().unwrap().remove("provenance_confidence");
+        let restored: ClipMeta = serde_json::from_value(older).unwrap();
+        assert_eq!(
+            restored.provenance_confidence,
+            ProvenanceConfidence::Unknown
+        );
     }
 }

@@ -238,7 +238,25 @@ fn expired_sensitive_clip_is_scrubbed_from_database_and_wal() {
     let store = Store::open(&db).unwrap();
     store.insert(&clip).unwrap();
 
+    // The sensitive row never persists the normalized-text correlation token:
+    // neither in the normalized_hash column nor as raw bytes in the files
+    // scanned below.
+    let correlation_token = vbuff_store::normalized_text_fingerprint(canary)
+        .expect("canary text normalizes to a fingerprint");
+    {
+        let inspection = rusqlite::Connection::open(&db).unwrap();
+        let stored: Option<Vec<u8>> = inspection
+            .query_row("SELECT normalized_hash FROM clips", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored.is_none(), "sensitive row kept a normalized_hash");
+    }
+
     assert_eq!(store.purge_expired().unwrap(), 1);
+    // The deletion only marked the WAL dirty; run the deferred scrub so the
+    // canary's pre-delete frames are truncated away before the scan below.
+    assert!(store.scrub_wal_if_dirty().unwrap());
     drop(store);
 
     for path in [db.clone(), dir.path().join("history.db-wal")] {
@@ -251,8 +269,58 @@ fn expired_sensitive_clip_is_scrubbed_from_database_and_wal() {
                 "sensitive canary remained in {}",
                 path.display()
             );
+            assert!(
+                !bytes
+                    .windows(correlation_token.len())
+                    .any(|window| window == correlation_token.as_slice()),
+                "normalized-hash correlation token remained in {}",
+                path.display()
+            );
         }
     }
+}
+
+#[test]
+fn open_scrubs_stale_normalized_hash_from_sensitive_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let clip = make_clip("stale correlation token");
+    {
+        let store = Store::open(&db).unwrap();
+        store.insert(&clip).unwrap();
+    }
+
+    // Simulate a row reclassified sensitive by an older binary whose clawback
+    // left normalized_hash intact.
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "UPDATE clips SET metadata_json = json_set(metadata_json, '$.sensitive', 1)",
+                [],
+            )
+            .unwrap();
+        let stale: Option<Vec<u8>> = connection
+            .query_row("SELECT normalized_hash FROM clips", [], |row| row.get(0))
+            .unwrap();
+        assert!(stale.is_some(), "fixture must start with a stale hash");
+    }
+
+    let reopened = Store::open(&db).unwrap();
+    let inspection = rusqlite::Connection::open(&db).unwrap();
+    let scrubbed: Option<Vec<u8>> = inspection
+        .query_row("SELECT normalized_hash FROM clips", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        scrubbed.is_none(),
+        "open-time scrub must null the stale normalized_hash"
+    );
+    assert!(
+        reopened
+            .near_duplicate_group(clip.id, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -408,6 +476,9 @@ fn encrypted_grace_bin_is_self_contained_and_scrubs_large_cas_plaintext() {
         .unwrap();
     assert_eq!(store.gc_blobs().unwrap(), 1);
     assert!(regular_files(&dir.path().join("blobs")).is_empty());
+    // The grace delete only marked the WAL dirty; run the deferred scrub so
+    // pre-delete frames are truncated away before the plaintext scan below.
+    assert!(store.scrub_wal_if_dirty().unwrap());
 
     for path in [db.clone(), dir.path().join("history.db-wal")] {
         if path.exists() {
@@ -680,4 +751,130 @@ fn failed_current_schema_open_preserves_interrupted_migration_backup() {
     assert!(Store::open(&db).is_err());
     assert!(backup.exists());
     assert!(backup.metadata().unwrap().len() > 100);
+}
+
+fn pending_wal_scrub(db: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM maintenance_state WHERE key = 'pending_wal_scrub'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn wal_scrub_is_deferred_and_survives_a_busy_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    let clip = make_clip("busy wal scrub");
+    store.insert(&clip).unwrap();
+    assert_eq!(pending_wal_scrub(&db), 0);
+
+    // A second connection pins the WAL with an open read transaction.
+    let reader = rusqlite::Connection::open(&db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+        .unwrap();
+
+    // The delete commits without attempting an inline checkpoint...
+    store.delete(clip.id).unwrap();
+    assert_eq!(pending_wal_scrub(&db), 1);
+    // ...and the deferred scrub reports busy instead of failing, keeping the
+    // dirty marker for a later retry.
+    assert!(!store.scrub_wal_if_dirty().unwrap());
+    assert_eq!(pending_wal_scrub(&db), 1);
+
+    // Once the reader is gone, the scrub truncates the WAL and resets.
+    drop(reader);
+    assert!(store.scrub_wal_if_dirty().unwrap());
+    assert_eq!(pending_wal_scrub(&db), 0);
+    assert!(!store.scrub_wal_if_dirty().unwrap());
+}
+
+#[test]
+fn grace_delete_commits_while_a_reader_pins_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    let clip = make_clip("grace under busy wal");
+    store.insert(&clip).unwrap();
+    let key = [7_u8; 32];
+
+    let reader = rusqlite::Connection::open(&db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+        .unwrap();
+
+    // Previously the inline truncate checkpoint could fail this committed
+    // delete with a spurious busy error.
+    let recovery_id = store
+        .delete_with_grace(
+            clip.id,
+            &key,
+            std::time::Duration::from_secs(60),
+            DeletionReason::User,
+        )
+        .unwrap();
+    assert!(!store.scrub_wal_if_dirty().unwrap());
+
+    drop(reader);
+    assert!(store.scrub_wal_if_dirty().unwrap());
+    let entries = store.grace_bin(10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].recovery_id, recovery_id);
+}
+
+#[test]
+fn guard_mode_clip_survives_insert_and_load_with_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let mut clip = make_clip("guarded source privacy");
+    // The capture gate's guard decision: unknown provenance with armed rules
+    // is captured masked, local-only, AI-disabled, and TTL-bounded.
+    clip.meta.sensitive = true;
+    clip.meta.sensitivity_reason = Some(vbuff_types::SensitivityReason::OperatingSystemHint);
+    clip.meta.sync_eligible = false;
+    clip.meta.ai_allowed = false;
+    clip.meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+    clip.meta.provenance_confidence = vbuff_types::ProvenanceConfidence::Unknown;
+
+    store_roundtrip_guard_flags(&db, &clip);
+}
+
+fn store_roundtrip_guard_flags(db: &std::path::Path, clip: &Clip) {
+    {
+        let store = Store::open(db).unwrap();
+        store.insert(clip).unwrap();
+    }
+    let store = Store::open(db).unwrap();
+    let stored = store.list(1).unwrap().pop().unwrap();
+    assert!(stored.meta.sensitive);
+    assert_eq!(
+        stored.meta.sensitivity_reason,
+        Some(vbuff_types::SensitivityReason::OperatingSystemHint)
+    );
+    assert!(!stored.meta.sync_eligible);
+    assert!(!stored.meta.ai_allowed);
+    assert!(stored.meta.expires_at.is_some());
+    assert_eq!(
+        stored.meta.provenance_confidence,
+        vbuff_types::ProvenanceConfidence::Unknown
+    );
+
+    // A proven-confidence re-copy of the same content keeps the guard flags.
+    let mut proven = make_clip("guarded source privacy");
+    proven.meta.provenance_confidence = vbuff_types::ProvenanceConfidence::Proven;
+    store.insert(&proven).unwrap();
+    let stored = store.list(1).unwrap().pop().unwrap();
+    assert!(stored.meta.sensitive);
+    assert!(!stored.meta.sync_eligible);
+    assert_eq!(
+        stored.meta.provenance_confidence,
+        vbuff_types::ProvenanceConfidence::Proven
+    );
 }

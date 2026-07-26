@@ -55,6 +55,7 @@ pub(crate) fn spawn(
             match result {
                 Ok(Some(summary))
                     if summary.fts_optimized
+                        || summary.wal_scrubbed
                         || summary.fingerprints > 0
                         || summary.normalized_fingerprints > 0
                         || summary.embeddings > 0
@@ -75,6 +76,7 @@ pub(crate) fn spawn(
                         expired = summary.expired,
                         blobs_collected = summary.blobs_collected,
                         fts_optimized = summary.fts_optimized,
+                        wal_scrubbed = summary.wal_scrubbed,
                         "idle store maintenance completed"
                     );
                 }

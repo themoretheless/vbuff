@@ -32,11 +32,13 @@ use anyhow::Context as _;
 use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, SharedState};
-use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
+use vbuff_platform::{
+    CapabilityLevel, CapabilitySeverity, GlobalHotkeyBackend, HotkeyBackend, parse_combo,
+};
 use vbuff_store::Store;
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, CapturePauseReason, ClientIntent, SecurityPostureLevel,
-    SecurityPostureSummary,
+    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CapturePauseReason, ClientIntent,
+    SecurityPostureLevel, SecurityPostureSummary,
 };
 
 use config::Config;
@@ -197,6 +199,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let shutdown_history = history.clone();
     let app_services = app::AppServices {
         history,
         shared,
@@ -209,7 +212,9 @@ fn main() -> anyhow::Result<()> {
         automatic_pause_reason: remote_auto_paused.then_some(CapturePauseReason::RemoteControl),
         hotkey_registered: hotkey_id.is_some(),
     };
-    app::run(app_services, hotkey_backend, hotkey_id)
+    let app_result = app::run(app_services, hotkey_backend, hotkey_id);
+    shutdown_history.flush_for_shutdown();
+    app_result
 }
 
 fn summarize_capabilities(posture: &vbuff_platform::SecurityPosture) -> Vec<CapabilityView> {
@@ -225,6 +230,12 @@ fn summarize_capabilities(posture: &vbuff_platform::SecurityPosture) -> Vec<Capa
                 CapabilityLevel::NotApplicable => CapabilityViewLevel::NotApplicable,
             },
             detail: capability.detail.clone(),
+            severity: match capability.severity {
+                CapabilitySeverity::RequiredForCapture => {
+                    CapabilityViewSeverity::RequiredForCapture
+                }
+                CapabilitySeverity::Informational => CapabilityViewSeverity::Informational,
+            },
         })
         .collect()
 }
@@ -247,12 +258,15 @@ fn summarize_security_posture(posture: &vbuff_platform::SecurityPosture) -> Secu
             }
         }
     }
+    // The level is driven by capture-gating (required) capabilities only;
+    // informational gaps stay visible in the counters but never force
+    // Partial or Blocked on their own.
     summary.level = if posture.strict_mode && !posture.strict_allows_capture() {
         SecurityPostureLevel::Blocked
-    } else if summary.degraded > 0 || summary.unavailable > 0 {
-        SecurityPostureLevel::Partial
-    } else {
+    } else if posture.required_capabilities_satisfied() {
         SecurityPostureLevel::Protected
+    } else {
+        SecurityPostureLevel::Partial
     };
     summary
 }
@@ -289,5 +303,30 @@ fn privacy_posture_input(
         sync_enabled: false,
         denied_source_count,
         retention_days: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posture_summary_blocks_only_when_strict_required_capabilities_fail() {
+        let blocked =
+            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(true, true, false));
+        assert_eq!(blocked.level, SecurityPostureLevel::Blocked);
+
+        let non_strict =
+            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(false, true, false));
+        assert_eq!(non_strict.level, SecurityPostureLevel::Partial);
+    }
+
+    #[test]
+    fn posture_summary_protected_is_reachable() {
+        let summary =
+            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(true, true, true));
+        assert_eq!(summary.level, SecurityPostureLevel::Protected);
+        // Informational gaps are still counted globally.
+        assert!(summary.degraded > 0 || summary.unavailable > 0);
     }
 }

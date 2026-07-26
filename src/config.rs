@@ -44,6 +44,10 @@ pub struct Config {
     pub detect_secrets: bool,
     /// Retention window for structurally detected secrets.
     pub secret_ttl_seconds: u64,
+    /// Degradation mode when the clipboard backend cannot prove capture
+    /// evidence: `"guard"` (capture as sensitive), `"skip"` (refuse), or
+    /// `"allow"` (legacy fail-open). Only bites when source rules are armed.
+    pub unknown_evidence_policy: String,
     /// Full-payload threshold after which capture sheds to a text preview.
     pub capture_soft_limit_bytes: usize,
     /// Absolute per-capture admission cap.
@@ -96,6 +100,7 @@ impl fmt::Debug for Config {
             .field("skip_whitespace_only", &self.skip_whitespace_only)
             .field("detect_secrets", &self.detect_secrets)
             .field("secret_ttl_seconds", &self.secret_ttl_seconds)
+            .field("unknown_evidence_policy", &self.unknown_evidence_policy)
             .field("capture_soft_limit_bytes", &self.capture_soft_limit_bytes)
             .field("capture_hard_limit_bytes", &self.capture_hard_limit_bytes)
             .field("capture_preview_bytes", &self.capture_preview_bytes)
@@ -131,6 +136,7 @@ impl Default for Config {
             skip_whitespace_only: true,
             detect_secrets: true,
             secret_ttl_seconds: 10 * 60,
+            unknown_evidence_policy: "guard".into(),
             capture_soft_limit_bytes: 16 * 1024 * 1024,
             capture_hard_limit_bytes: 128 * 1024 * 1024,
             capture_preview_bytes: 256 * 1024,
@@ -448,6 +454,13 @@ impl Config {
             );
         }
         anyhow::ensure!(self.source_rules.len() <= 1_024, "too many source rules");
+        anyhow::ensure!(
+            matches!(
+                self.unknown_evidence_policy.as_str(),
+                "guard" | "skip" | "allow"
+            ),
+            "invalid unknown evidence policy"
+        );
         anyhow::ensure!(
             matches!(self.ui_density.as_str(), "auto" | "compact" | "comfortable"),
             "invalid UI density"
@@ -777,6 +790,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "skip_whitespace_only",
         "detect_secrets",
         "secret_ttl_seconds",
+        "unknown_evidence_policy",
         "capture_soft_limit_bytes",
         "capture_hard_limit_bytes",
         "capture_preview_bytes",
@@ -915,7 +929,32 @@ mod tests {
         assert_eq!(cfg.hotkey, back.hotkey);
         assert_eq!(cfg.max_history, back.max_history);
         assert_eq!(cfg.launch_at_login, back.launch_at_login);
+        assert_eq!(cfg.unknown_evidence_policy, back.unknown_evidence_policy);
         assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unknown_evidence_policy_defaults_to_guard_and_validates() {
+        // A config written before the key existed stays fail closed.
+        let legacy = "schema_version = 2\nhotkey = \"Ctrl+Shift+V\"\n";
+        let parsed = parse_runtime_config(legacy).unwrap();
+        assert_eq!(parsed.unknown_evidence_policy, "guard");
+        parsed.validate().unwrap();
+
+        for mode in ["guard", "skip", "allow"] {
+            let text = format!("schema_version = 2\nunknown_evidence_policy = \"{mode}\"\n");
+            let parsed = parse_runtime_config(&text).unwrap();
+            assert_eq!(parsed.unknown_evidence_policy, mode);
+            parsed.validate().unwrap();
+        }
+
+        let invalid = "schema_version = 2\nunknown_evidence_policy = \"yolo\"\n";
+        let parsed = parse_runtime_config(invalid).unwrap();
+        assert!(parsed.validate().is_err());
+
+        // Unknown keys are still rejected alongside the new one.
+        let typo = "schema_version = 2\nunknown_evidence_polici = \"skip\"\n";
+        assert!(parse_runtime_config(typo).is_err());
     }
 
     #[test]

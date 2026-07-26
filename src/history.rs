@@ -27,6 +27,7 @@ pub(crate) struct MaintenanceSummary {
     pub expired: usize,
     pub blobs_collected: usize,
     pub fts_optimized: bool,
+    pub wal_scrubbed: bool,
 }
 
 /// Cloneable history handle shared by the capture and UI threads.
@@ -268,6 +269,7 @@ impl History {
             let audit = store.audit_content_hashes(32)?;
             let fts_optimized = background_work && store.maintain_search_index(256)?;
             let blobs_collected = store.gc_blobs()?;
+            let wal_scrubbed = store.scrub_wal_if_dirty()?;
             let changed_visible_rows = volatile_expired > 0
                 || expired > 0
                 || clawback.reclassified > 0
@@ -289,6 +291,7 @@ impl History {
                     expired,
                     blobs_collected,
                     fts_optimized,
+                    wal_scrubbed,
                 },
                 refreshed_clips,
                 digest,
@@ -309,6 +312,25 @@ impl History {
         state.memory_only_clips = memory_only_clips;
         state.health_digest = digest;
         Ok(Some(summary))
+    }
+
+    /// Best-effort WAL scrub for process shutdown.
+    ///
+    /// Never fails the exit path: a poisoned mutex or a real SQLite error is
+    /// logged with `tracing::warn` and swallowed. A scrub skipped here leaves
+    /// the dirty marker in place, and the next launch's idle maintenance
+    /// retries it.
+    pub(crate) fn flush_for_shutdown(&self) {
+        match self.store.lock() {
+            Ok(store) => match store.scrub_wal_if_dirty() {
+                Ok(true) => tracing::debug!("shutdown WAL scrub truncated the log"),
+                Ok(false) => {}
+                Err(error) => tracing::warn!("shutdown WAL scrub failed: {error}"),
+            },
+            Err(_) => {
+                tracing::warn!("shutdown WAL scrub skipped: history store mutex poisoned")
+            }
+        }
     }
 
     pub(crate) fn refresh_for_memory(&self, limit: usize) -> anyhow::Result<bool> {
@@ -480,6 +502,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.expired, 1);
+        // The purge marked the WAL dirty, and maintain_idle ran the deferred
+        // scrub in the same pass.
+        assert!(summary.wal_scrubbed);
         assert!(shared.lock().unwrap().clips.is_empty());
     }
 

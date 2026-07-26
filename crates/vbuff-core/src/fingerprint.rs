@@ -46,8 +46,8 @@ pub const fn fingerprint_bands(hash: u64) -> [u16; 4] {
 
 /// Compute a 9x8 difference hash directly from RGBA8 source pixels.
 pub fn dhash_rgba(bytes: &[u8], width: usize, height: usize) -> Option<u64> {
-    let required = width.checked_mul(height)?.checked_mul(4)?;
-    if width == 0 || height == 0 || bytes.len() < required {
+    let required = vbuff_types::rgba_required_len(width, height)?;
+    if bytes.len() < required {
         return None;
     }
     let mut samples = [[0_u16; 9]; 8];

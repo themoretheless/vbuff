@@ -17,7 +17,8 @@ use vbuff_core::workflow::plain_text_clone;
 use vbuff_gui::{DeliveryCapabilities, PopupApp, SharedState};
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, PastePermissionLevel};
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, CapturePauseReason, ClientIntent, NoticeLevel,
+    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CapturePauseReason, ClientIntent,
+    NoticeLevel,
 };
 
 use crate::autostart;
@@ -198,6 +199,7 @@ impl Runtime {
                     "summon shortcut is unavailable; use the visible window, tray, or relaunch"
                         .into()
                 },
+                severity: CapabilityViewSeverity::Informational,
             });
         }
 
@@ -214,7 +216,23 @@ impl Runtime {
                     PastePermissionLevel::CopyOnly => CapabilityViewLevel::Unavailable,
                 },
                 detail: permission.detail.into(),
+                severity: CapabilityViewSeverity::Informational,
             });
+        }
+
+        // Builds without the tray feature have no tray attempt later, so
+        // publish the capability (and the matching warning) once up front.
+        #[cfg(not(feature = "tray"))]
+        {
+            Self::publish_tray_capability(
+                &shared,
+                CapabilityViewLevel::Unavailable,
+                "tray icon is unavailable in this build; summon with the hotkey or by relaunching, exit from the popup menu",
+            );
+            diagnostics.notice(
+                NoticeLevel::Warning,
+                "Tray icon unavailable; vbuff keeps running — summon with the hotkey or by relaunching, exit from the popup menu",
+            );
         }
 
         let mut popup = PopupApp::new(Arc::clone(&shared));
@@ -254,13 +272,26 @@ impl Runtime {
             *target = Some(ctx.clone());
         }
         self.ensure_tray();
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
-            if self.can_hide_to_resident_surface() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.paste.cancel_target();
-                self.popup.request_hide(&ctx);
-            } else {
-                self.quit_requested = true;
+        if ctx.input(|input| input.viewport().close_requested()) {
+            match close_disposition(self.quit_requested) {
+                CloseDisposition::CancelAndHide => {
+                    // Hide never terminates the resident process: OS close
+                    // requests (Esc, close button, focus loss) only hide the
+                    // popup, so capture keeps running and the window can be
+                    // summoned again via the global hotkey or a relaunch.
+                    // Without this CancelClose the process would die
+                    // indistinguishably from a hide whenever no tray icon is
+                    // available.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    // Hiding abandons the confirmed paste target: the window
+                    // that was focused before the popup opened is no longer
+                    // the one a later paste would reach.
+                    self.paste.cancel_target();
+                    self.popup.request_hide(&ctx);
+                }
+                // Only an explicit Quit sets quit_requested; it is the sole
+                // path allowed past CancelClose.
+                CloseDisposition::AllowClose => {}
             }
         }
         ctx.request_repaint_after(SUPERVISORY_REPAINT_INTERVAL);
@@ -312,6 +343,11 @@ impl Runtime {
                     "Linux resident surface selected"
                 );
                 self.tray = Some(tray);
+                Self::publish_tray_capability(
+                    &self.shared,
+                    CapabilityViewLevel::Active,
+                    "tray icon is available",
+                );
             }
             Err(error) => {
                 #[cfg(target_os = "linux")]
@@ -321,6 +357,15 @@ impl Runtime {
                 );
                 #[cfg(not(target_os = "linux"))]
                 tracing::warn!("tray icon unavailable: {error}");
+                Self::publish_tray_capability(
+                    &self.shared,
+                    CapabilityViewLevel::Unavailable,
+                    "tray icon is unavailable; summon with the hotkey or by relaunching, exit from the popup menu",
+                );
+                self.notice(
+                    NoticeLevel::Warning,
+                    "Tray icon unavailable; vbuff keeps running — summon with the hotkey or by relaunching, exit from the popup menu",
+                );
             }
         }
     }
@@ -328,23 +373,23 @@ impl Runtime {
     #[cfg(not(feature = "tray"))]
     fn ensure_tray(&mut self) {}
 
-    #[cfg(feature = "tray")]
-    fn can_hide_to_resident_surface(&self) -> bool {
-        self.tray.is_some()
-    }
-
-    #[cfg(not(feature = "tray"))]
-    fn can_hide_to_resident_surface(&self) -> bool {
-        false
-    }
-
-    fn hide_or_quit(&mut self, ctx: &egui::Context) {
-        self.paste.cancel_target();
-        if self.can_hide_to_resident_surface() {
-            self.popup.request_hide(ctx);
-        } else {
-            self.quit_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    /// Publish the tray-icon capability exactly once, replacing any prior
+    /// entry so repeated calls never duplicate the feature row.
+    fn publish_tray_capability(
+        shared: &SharedState,
+        level: CapabilityViewLevel,
+        detail: impl Into<String>,
+    ) {
+        if let Ok(mut state) = shared.lock() {
+            state
+                .capabilities
+                .retain(|capability| capability.feature != "tray_icon");
+            state.capabilities.push(CapabilityView {
+                feature: "tray_icon".into(),
+                level,
+                detail: detail.into(),
+                severity: CapabilityViewSeverity::Informational,
+            });
         }
     }
 
@@ -550,7 +595,14 @@ impl Runtime {
                     tracing::warn!("saving hotkey coachmark state failed: {error}");
                 }
             }
-            AppCommand::Hide => self.hide_or_quit(ctx),
+            // Hide only ever hides the popup; the process exits solely via
+            // an explicit Quit. The confirmed paste target is abandoned with
+            // it, because the window focused before the popup opened is no
+            // longer the one a later paste would reach.
+            AppCommand::Hide => {
+                self.paste.cancel_target();
+                self.popup.request_hide(ctx);
+            }
             AppCommand::Quit => {
                 self.paste.cancel_target();
                 self.quit_requested = true;
@@ -599,14 +651,12 @@ impl Runtime {
             Ok(outcome) => {
                 if outcome == PasteOutcome::CopiedOnly {
                     self.announce("Copied. Paste manually.");
-                    self.clear_notice();
-                    self.hide_or_quit(ctx);
                     tracing::info!("clip copied; automatic paste is unavailable");
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    self.clear_notice();
-                    self.popup.request_hide(ctx);
                 }
+                // Both outcomes only hide the popup (request_hide issues the
+                // visibility command itself); hiding never ends the process.
+                self.clear_notice();
+                self.popup.request_hide(ctx);
                 ctx.request_repaint_after(PASTE_REPAINT_INTERVAL);
             }
             Err(error) => {
@@ -769,9 +819,35 @@ fn edited_text_requires_sensitive_write(text: &str, inherited: bool) -> bool {
     inherited || vbuff_core::capture::text_requires_sensitive_handling(text)
 }
 
+/// What the event loop does with an OS close request on the popup viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseDisposition {
+    /// Cancel the OS close and hide the popup instead; the resident process
+    /// keeps running.
+    CancelAndHide,
+    /// Allow the close to proceed; only an explicit Quit reaches this.
+    AllowClose,
+}
+
+/// Close-request policy: hiding never terminates the resident process, so the
+/// decision depends only on whether an explicit Quit was requested — never on
+/// whether a tray icon (or any other resident surface) exists.
+fn close_disposition(quit_requested: bool) -> CloseDisposition {
+    if quit_requested {
+        CloseDisposition::AllowClose
+    } else {
+        CloseDisposition::CancelAndHide
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ShowOrigin, edited_text_requires_sensitive_write};
+    use super::{
+        CloseDisposition, Runtime, ShowOrigin, close_disposition,
+        edited_text_requires_sensitive_write,
+    };
+    use vbuff_gui::SharedState;
+    use vbuff_types::CapabilityViewLevel;
 
     #[test]
     fn only_global_hotkey_summons_may_capture_a_paste_target() {
@@ -788,5 +864,30 @@ mod tests {
         ));
         assert!(edited_text_requires_sensitive_write("123456", false));
         assert!(!edited_text_requires_sensitive_write("ordinary", false));
+    }
+
+    #[test]
+    fn tray_capability_is_published_exactly_once() {
+        let shared = SharedState::default();
+        Runtime::publish_tray_capability(&shared, CapabilityViewLevel::Unavailable, "first");
+        Runtime::publish_tray_capability(&shared, CapabilityViewLevel::Active, "second");
+        let state = shared.lock().expect("shared state lock");
+        let entries: Vec<_> = state
+            .capabilities
+            .iter()
+            .filter(|capability| capability.feature == "tray_icon")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, CapabilityViewLevel::Active);
+        assert_eq!(entries[0].detail, "second");
+    }
+
+    #[test]
+    fn close_disposition_never_depends_on_a_resident_surface() {
+        // Hiding never ends the process: without an explicit Quit every close
+        // request is cancelled into a hide, regardless of tray availability
+        // (the policy function takes no tray input at all).
+        assert_eq!(close_disposition(false), CloseDisposition::CancelAndHide);
+        assert_eq!(close_disposition(true), CloseDisposition::AllowClose);
     }
 }

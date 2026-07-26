@@ -5,9 +5,10 @@ use vbuff_core::content_hash_from_flavors;
 use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, PopupApp};
 use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, Clip, ClipId, ClipMeta,
-    ClipboardHealthDigest, ContentKind, Flavor, PrivacyDecisionLevel, PrivacyEventSummary,
-    PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary, SloMetricState,
+    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CaptureBudgetAlert, CaptureHealth,
+    Clip, ClipId, ClipMeta, ClipboardHealthDigest, ContentKind, Flavor, PrivacyDecisionLevel,
+    PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary,
+    SloMetricState,
 };
 
 #[test]
@@ -28,8 +29,15 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
             ] {
                 let name = format!("popup_{theme_name}_{dpi_name}_{}", surface.name());
                 let state = Arc::new(Mutex::new(snapshot_state(surface)));
+                // The trust surface splits capability gaps into two stacked
+                // sections; give it a taller window so both fit in the golden.
+                let size = if surface == Surface::Trust {
+                    egui::vec2(560.0, 980.0)
+                } else {
+                    egui::vec2(560.0, 620.0)
+                };
                 let mut harness = Harness::builder()
-                    .with_size(egui::vec2(560.0, 620.0))
+                    .with_size(size)
                     .with_pixels_per_point(pixels_per_point)
                     .with_theme(theme)
                     .wgpu()
@@ -157,7 +165,7 @@ fn snapshot_state(surface: Surface) -> AppState {
     }
     state.security_posture = SecurityPostureSummary {
         level: SecurityPostureLevel::Partial,
-        active: 3,
+        active: 1,
         degraded: 2,
         unavailable: 1,
         strict_mode: false,
@@ -176,16 +184,25 @@ fn snapshot_state(surface: Surface) -> AppState {
             feature: "core_dumps".into(),
             level: CapabilityViewLevel::Active,
             detail: "process core-dump limit is zero".into(),
+            severity: CapabilityViewSeverity::RequiredForCapture,
+        },
+        CapabilityView {
+            feature: "ptrace".into(),
+            level: CapabilityViewLevel::Degraded,
+            detail: "platform-specific anti-ptrace policy is not active".into(),
+            severity: CapabilityViewSeverity::RequiredForCapture,
         },
         CapabilityView {
             feature: "foreground_identity".into(),
             level: CapabilityViewLevel::Degraded,
             detail: "generic backend has no authoritative foreground-app probe".into(),
+            severity: CapabilityViewSeverity::Informational,
         },
         CapabilityView {
             feature: "encryption_at_rest".into(),
             level: CapabilityViewLevel::Unavailable,
             detail: "bundled SQLite is not SQLCipher".into(),
+            severity: CapabilityViewSeverity::Informational,
         },
     ];
     state.privacy_ledger = PrivacyLedgerSummary {

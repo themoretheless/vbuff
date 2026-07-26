@@ -1080,7 +1080,7 @@ impl PopupApp {
                             };
                             let search_width = (ui.available_width() - clear_width).max(160.0);
                             let edit = egui::TextEdit::singleline(&mut self.query)
-                                .id_source(history_search_id())
+                                .id(history_search_id())
                                 .hint_text(hint)
                                 .frame(egui::Frame::NONE);
                             let response =
@@ -3025,6 +3025,7 @@ fn render_capture_status(
         let color = match health {
             CaptureHealth::Starting => ui.visuals().weak_text_color(),
             CaptureHealth::Watching => design::success(ui),
+            CaptureHealth::DegradedSourcePrivacy => design::warning(ui),
             CaptureHealth::ClipboardUnavailable
             | CaptureHealth::ClipboardReadError
             | CaptureHealth::StorageError
@@ -3529,5 +3530,41 @@ mod tests {
         let actions = app.take_actions();
         assert_eq!(actions, vec![UiAction::RestoreClip(Box::new(clip))]);
         assert!(!format!("{actions:?}").contains("private deleted value"));
+    }
+
+    #[test]
+    fn history_search_text_edit_owns_the_focus_gate_id() {
+        // Contract behind the popup keyboard gates: the search box must own
+        // exactly `history_search_id()`. `.id_source(...)` would only salt the
+        // auto-generated id (`ui.id.with(...)`), so `memory.focused()` would
+        // never equal the gate id and the history shortcuts would stay dead
+        // whenever the search box holds focus (always, right after show()).
+        let ctx = egui::Context::default();
+        let mut query = String::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut query).id(history_search_id()));
+                assert_eq!(response.id, history_search_id());
+                response.request_focus();
+            });
+        });
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(history_search_id())
+        );
+    }
+
+    #[test]
+    fn salted_auto_id_never_matches_the_focus_gate_id() {
+        // Pin the difference between `.id(...)` and `.id_source(...)`: a salted
+        // auto id mixes the salt into `ui.id`, so it can never be equal to the
+        // bare gate id the keyboard handlers compare against.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_ne!(ui.id().with(history_search_id()), history_search_id());
+            });
+        });
     }
 }

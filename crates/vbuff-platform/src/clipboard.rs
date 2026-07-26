@@ -1,14 +1,22 @@
 //! Cross-platform clipboard backend built on `arboard`.
 //!
 //! `arboard` reads text and image flavors. It cannot enumerate every MIME
-//! flavor or read concealed-type markers (that is the job of the future native
-//! backends), but it is enough for the MVP: capture text and images, and write
-//! them back for paste.
+//! flavor, read concealed-type markers, or prove source attribution (that is
+//! the job of the future native backends), but it is enough for the MVP:
+//! capture text and images, and write them back for paste.
+//!
+//! Degradation contract: reads therefore report
+//! `concealment: ConcealmentSignal::Unknown` and
+//! `provenance_confidence: ProvenanceConfidence::Unknown` (via
+//! `CapturedClipboard::default()`), and the inherited
+//! `ClipboardBackend::evidence()` reports `Unknown` for both signals. The
+//! capture policy — not this adapter — decides how to degrade on that
+//! uncertainty; this backend never claims evidence it cannot supply.
 
 use std::borrow::Cow;
 
 use arboard::{Clipboard, ImageData};
-use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime};
+use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime, rgba_required_len};
 
 use crate::traits::{CapturedClipboard, ClipboardBackend};
 use crate::{PlatformError, Result};
@@ -109,12 +117,7 @@ impl ClipboardBackend for ArboardClipboard {
 }
 
 fn rgba_dimensions_match(width: usize, height: usize, byte_len: usize) -> bool {
-    width > 0
-        && height > 0
-        && width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            == Some(byte_len)
+    rgba_required_len(width, height) == Some(byte_len)
 }
 
 #[cfg(test)]
