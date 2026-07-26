@@ -28,7 +28,7 @@ pub use integration::{
     Osc52Decision, Osc52Observation, Osc52Policy, Osc52Target, RemotePasteLease,
     RemotePasteRequest, RemoteReplayWindow, SelectedLinkMetadata, ShareDraft, ShareDraftState,
     SignedWebhookEvent, SnippetBridgeCursor, SnippetMirrorAction, SnippetMirrorOperation,
-    SnippetMirrorRecord, TargetedSendRequest, VimRegisterAction, VimRegisterRequest, WebhookEvent,
-    WebhookEventKind, WebhookReplayWindow, WebhookSigner, adapt_text_for_editor,
-    plan_snippet_mirror, rank_launcher_candidates,
+    SnippetMirrorRecord, SnippetSyncManifest, SnippetSyncedState, TargetedSendRequest,
+    VimRegisterAction, VimRegisterRequest, WebhookEvent, WebhookEventKind, WebhookReplayWindow,
+    WebhookSigner, adapt_text_for_editor, plan_snippet_mirror, rank_launcher_candidates,
 };

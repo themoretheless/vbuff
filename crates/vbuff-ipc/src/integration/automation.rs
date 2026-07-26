@@ -12,7 +12,8 @@ pub use remote::{RemotePasteLease, RemotePasteRequest, RemoteReplayWindow};
 pub use share::{ShareDraft, ShareDraftState};
 pub use snippets::{
     SnippetBridgeCursor, SnippetMirrorAction, SnippetMirrorOperation, SnippetMirrorRecord,
-    VimRegisterAction, VimRegisterRequest, plan_snippet_mirror,
+    SnippetSyncManifest, SnippetSyncedState, VimRegisterAction, VimRegisterRequest,
+    plan_snippet_mirror,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +132,8 @@ fn valid_label(value: &str, maximum_bytes: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -289,6 +292,15 @@ mod tests {
 
     #[test]
     fn snippet_mirror_and_vim_register_are_bounded_and_content_free() {
+        // Target matches the base, so the source edit is a safe upsert.
+        let base = SnippetSyncManifest {
+            entries: BTreeMap::from([(
+                "deploy".to_string(),
+                SnippetSyncedState::Present {
+                    content_hash: [2; 32],
+                },
+            )]),
+        };
         let plan = plan_snippet_mirror(
             &[SnippetMirrorRecord {
                 key: "deploy".into(),
@@ -300,6 +312,7 @@ mod tests {
                 content_hash: [2; 32],
                 revision: 1,
             }],
+            Some(&base),
         )
         .unwrap();
         assert_eq!(plan[0].action, SnippetMirrorAction::UpsertTarget);
@@ -328,5 +341,303 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    fn snippet_record(key: &str, hash_byte: u8, revision: u64) -> SnippetMirrorRecord {
+        assert!(hash_byte != 0, "zero content hash is invalid");
+        SnippetMirrorRecord {
+            key: key.into(),
+            content_hash: [hash_byte; 32],
+            revision,
+        }
+    }
+
+    fn snippet_manifest(entries: &[(&str, SnippetSyncedState)]) -> SnippetSyncManifest {
+        SnippetSyncManifest {
+            entries: entries
+                .iter()
+                .map(|(key, state)| ((*key).to_string(), state.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bug9a_diverged_edits_conflict_even_when_source_revision_is_higher() {
+        let source = [snippet_record("deploy", 1, 5)];
+        let target = [snippet_record("deploy", 2, 1)];
+        // Both sides moved away from the base: the higher source revision must
+        // not win, because the counters are independent, not causal.
+        let base = snippet_manifest(&[(
+            "deploy",
+            SnippetSyncedState::Present {
+                content_hash: [9; 32],
+            },
+        )]);
+        let plan = plan_snippet_mirror(&source, &target, Some(&base)).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+        assert_eq!(plan[0].source_revision, 5);
+        assert_eq!(plan[0].target_revision, 1);
+        // Without a base there is no proof of an unchanged target either.
+        let plan = plan_snippet_mirror(&source, &target, None).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+    }
+
+    #[test]
+    fn bug9b_target_only_record_conflicts_instead_of_silent_delete() {
+        let target = [snippet_record("local-only", 3, 7)];
+        // No base at all.
+        let plan = plan_snippet_mirror(&[], &target, None).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+        // Trusted base that never saw the key.
+        let plan = plan_snippet_mirror(&[], &target, Some(&SnippetSyncManifest::default())).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+        // Tombstoned in the base but present on target: still no safe delete.
+        let base = snippet_manifest(&[("local-only", SnippetSyncedState::Deleted)]);
+        let plan = plan_snippet_mirror(&[], &target, Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+    }
+
+    #[test]
+    fn delete_requires_tombstone_proof_and_unchanged_target() {
+        let target = [snippet_record("old", 4, 3)];
+        // Target holds exactly what the base recorded: the one auto-delete.
+        let base = snippet_manifest(&[(
+            "old",
+            SnippetSyncedState::Present {
+                content_hash: [4; 32],
+            },
+        )]);
+        let plan = plan_snippet_mirror(&[], &target, Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::DeleteTarget);
+        // Target moved away from the base: conflict, not deletion.
+        let base = snippet_manifest(&[(
+            "old",
+            SnippetSyncedState::Present {
+                content_hash: [9; 32],
+            },
+        )]);
+        let plan = plan_snippet_mirror(&[], &target, Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+    }
+
+    #[test]
+    fn upsert_requires_target_unchanged_relative_to_base() {
+        let source = [snippet_record("deploy", 1, 5)];
+        let target = [snippet_record("deploy", 2, 1)];
+        // target == base: safe upsert of the source edit.
+        let base = snippet_manifest(&[(
+            "deploy",
+            SnippetSyncedState::Present {
+                content_hash: [2; 32],
+            },
+        )]);
+        let plan = plan_snippet_mirror(&source, &target, Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::UpsertTarget);
+        // source == base: target edited, reverse sync is deliberately not
+        // planned, so this is a conflict.
+        let base = snippet_manifest(&[(
+            "deploy",
+            SnippetSyncedState::Present {
+                content_hash: [1; 32],
+            },
+        )]);
+        let plan = plan_snippet_mirror(&source, &target, Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+        // Source-only brand-new key: nothing to overwrite on target.
+        let plan = plan_snippet_mirror(&source, &[], None).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::UpsertTarget);
+        // Source-only against a base-Present key: edit-vs-delete conflict.
+        let plan = plan_snippet_mirror(&source, &[], Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+    }
+
+    #[test]
+    fn re_add_after_tombstone_is_upsert() {
+        let base = snippet_manifest(&[("deploy", SnippetSyncedState::Deleted)]);
+        let source = [snippet_record("deploy", 1, 1)];
+        let plan = plan_snippet_mirror(&source, &[], Some(&base)).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::UpsertTarget);
+    }
+
+    #[test]
+    fn untrusted_manifest_degrades_everything_to_conflicts() {
+        let manifest = snippet_manifest(&[(
+            "deploy",
+            SnippetSyncedState::Present {
+                content_hash: [2; 32],
+            },
+        )]);
+        let mut cursor = SnippetBridgeCursor {
+            adapter: "espanso".into(),
+            source_revision: 0,
+            target_revision: 0,
+            last_manifest_hash: manifest.compute_hash(),
+            manifest,
+        };
+        assert!(cursor.trusted_manifest().is_some());
+        // Tampered hash: fail-closed to "no base", so every changed or
+        // target-only key conflicts instead of being upserted or deleted.
+        cursor.last_manifest_hash = [0xAB; 32];
+        assert!(cursor.trusted_manifest().is_none());
+        let source = [snippet_record("deploy", 1, 5)];
+        let target = [snippet_record("deploy", 2, 1)];
+        let plan = plan_snippet_mirror(&source, &target, cursor.trusted_manifest()).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+        let plan = plan_snippet_mirror(&[], &target, cursor.trusted_manifest()).unwrap();
+        assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
+    }
+
+    #[test]
+    fn legacy_cursor_without_manifest_deserializes_and_is_distrusted() {
+        let legacy = serde_json::json!({
+            "adapter": "espanso",
+            "source_revision": 1,
+            "target_revision": 2,
+            "last_manifest_hash": vec![7_u8; 32],
+        });
+        let cursor: SnippetBridgeCursor = serde_json::from_value(legacy).unwrap();
+        assert!(cursor.manifest.entries.is_empty());
+        assert!(cursor.trusted_manifest().is_none());
+    }
+
+    #[test]
+    fn manifest_hash_is_deterministic_and_validate_is_bounded() {
+        let first = snippet_manifest(&[
+            (
+                "alpha",
+                SnippetSyncedState::Present {
+                    content_hash: [1; 32],
+                },
+            ),
+            ("beta", SnippetSyncedState::Deleted),
+        ]);
+        // Insertion order must not matter: the BTreeMap canonicalizes it.
+        let second = snippet_manifest(&[
+            ("beta", SnippetSyncedState::Deleted),
+            (
+                "alpha",
+                SnippetSyncedState::Present {
+                    content_hash: [1; 32],
+                },
+            ),
+        ]);
+        assert_eq!(first.compute_hash(), first.compute_hash());
+        assert_eq!(first.compute_hash(), second.compute_hash());
+        let different = snippet_manifest(&[(
+            "alpha",
+            SnippetSyncedState::Present {
+                content_hash: [2; 32],
+            },
+        )]);
+        assert_ne!(first.compute_hash(), different.compute_hash());
+        assert!(first.validate().is_ok());
+        // Same key rules as snippet_map: control characters are rejected.
+        let bad_key = snippet_manifest(&[("bad\nkey", SnippetSyncedState::Deleted)]);
+        assert!(bad_key.validate().is_err());
+        // Zero content hash is invalid in Present, same as in records.
+        let zero_hash = snippet_manifest(&[(
+            "alpha",
+            SnippetSyncedState::Present {
+                content_hash: [0; 32],
+            },
+        )]);
+        assert!(zero_hash.validate().is_err());
+        let oversized = SnippetSyncManifest {
+            entries: (0..10_001)
+                .map(|index| (format!("key-{index}"), SnippetSyncedState::Deleted))
+                .collect(),
+        };
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn applied_contract_updates_manifest_and_caller_rehashes_cursor() {
+        let base = snippet_manifest(&[
+            (
+                "deploy",
+                SnippetSyncedState::Present {
+                    content_hash: [2; 32],
+                },
+            ),
+            (
+                "old",
+                SnippetSyncedState::Present {
+                    content_hash: [4; 32],
+                },
+            ),
+            (
+                "conflict",
+                SnippetSyncedState::Present {
+                    content_hash: [8; 32],
+                },
+            ),
+        ]);
+        let source = [snippet_record("deploy", 1, 5), snippet_record("conflict", 6, 9)];
+        let target = [
+            snippet_record("deploy", 2, 1),
+            snippet_record("old", 4, 3),
+            snippet_record("conflict", 7, 2),
+        ];
+        let plan = plan_snippet_mirror(&source, &target, Some(&base)).unwrap();
+        let next = base.applied(&plan, &source, &target).unwrap();
+        // UpsertTarget records the source hash.
+        assert_eq!(
+            next.entries.get("deploy"),
+            Some(&SnippetSyncedState::Present {
+                content_hash: [1; 32]
+            })
+        );
+        // DeleteTarget records a tombstone.
+        assert_eq!(next.entries.get("old"), Some(&SnippetSyncedState::Deleted));
+        // Conflict leaves the entry unchanged.
+        assert_eq!(
+            next.entries.get("conflict"),
+            Some(&SnippetSyncedState::Present {
+                content_hash: [8; 32]
+            })
+        );
+        assert!(next.validate().is_ok());
+        // The caller recomputes last_manifest_hash; the helper never does.
+        let mut cursor = SnippetBridgeCursor {
+            adapter: "espanso".into(),
+            source_revision: 5,
+            target_revision: 3,
+            last_manifest_hash: base.compute_hash(),
+            manifest: base.clone(),
+        };
+        assert!(cursor.trusted_manifest().is_some());
+        cursor.manifest = next;
+        assert!(cursor.trusted_manifest().is_none());
+        cursor.last_manifest_hash = cursor.manifest.compute_hash();
+        assert!(cursor.trusted_manifest().is_some());
+        // Operations referencing unknown keys are rejected fail-closed.
+        let stray = SnippetMirrorOperation {
+            key_hash: [0xFF; 32],
+            action: SnippetMirrorAction::UpsertTarget,
+            source_revision: 1,
+            target_revision: 0,
+        };
+        assert!(base.applied(&[stray], &source, &target).is_err());
+    }
+
+    #[test]
+    fn new_manifest_types_redact_content_in_debug() {
+        let state = SnippetSyncedState::Present {
+            content_hash: [1; 32],
+        };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("1, 1"));
+        let manifest = snippet_manifest(&[("deploy", state)]);
+        assert!(!format!("{manifest:?}").contains("deploy"));
+        let cursor = SnippetBridgeCursor {
+            adapter: "espanso".into(),
+            source_revision: 0,
+            target_revision: 0,
+            last_manifest_hash: manifest.compute_hash(),
+            manifest,
+        };
+        assert!(!format!("{cursor:?}").contains("deploy"));
     }
 }
