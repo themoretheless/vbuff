@@ -13,8 +13,8 @@ pub use access::{ClipAccessContext, ClipAccessFilter, McpReadPolicy, McpSessionL
 pub use automation::{
     AutomationCommand, AutomationSurface, RemotePasteLease, RemotePasteRequest, RemoteReplayWindow,
     ShareDraft, ShareDraftState, SnippetBridgeCursor, SnippetMirrorAction, SnippetMirrorOperation,
-    SnippetMirrorRecord, TargetedSendRequest, VimRegisterAction, VimRegisterRequest,
-    plan_snippet_mirror,
+    SnippetMirrorRecord, SnippetSyncManifest, SnippetSyncedState, TargetedSendRequest,
+    VimRegisterAction, VimRegisterRequest, plan_snippet_mirror,
 };
 pub use browser::{
     BrowserIngress, BrowserIngressDecision, BrowserPrivacyPolicy, BrowserSourceReport,
