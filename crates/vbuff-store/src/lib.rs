@@ -31,6 +31,7 @@ use vbuff_types::{
 };
 
 mod cas;
+mod data_lifecycle;
 mod error;
 mod image_fingerprint;
 mod lifecycle;
@@ -38,6 +39,13 @@ mod migration;
 mod search;
 mod serde_clip;
 
+pub use data_lifecycle::{
+    ArchiveVisibility, AttachmentManifest, BackupFreshness, BlobIntegrityReport, ClipAnnotations,
+    CollectionRecord, CollectionRetentionPolicy, CollectionRetentionPreview, CompactionForecast,
+    ExportSchemaVersion, FlavorManifest, FlavorStorage, GarbageCollectionPreview,
+    ImportQuarantineEntry, PartialRestoreReport, ResidencyTransition, RestoreSelection,
+    SensitiveDataResidency, export_clips_json,
+};
 pub use error::StoreError;
 pub use lifecycle::{
     DeletionReason, GraceBinEntry, MergeLedgerEntry, RetentionReport, RetentionRule,
@@ -50,8 +58,11 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// Schema frozen by the original v1 data-contract fixture.
 pub const DATA_CONTRACT_V1_SCHEMA_VERSION: i64 = 5;
 
+/// Schema frozen by the v2 lifecycle data-contract fixture.
+pub const DATA_CONTRACT_V2_SCHEMA_VERSION: i64 = 6;
+
 /// The current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StoreOpenProfile {
@@ -173,6 +184,7 @@ pub struct Store {
     cas: Option<cas::CasStore>,
     dedup_filter: RefCell<BloomFilter>,
     search_planner: RefCell<search::SearchPlanner>,
+    blob_scrub_cursor: RefCell<Option<(String, i64)>>,
 }
 
 impl Store {
@@ -262,6 +274,7 @@ impl Store {
             cas: None,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
         Ok((
             store,
@@ -294,6 +307,7 @@ impl Store {
             cas,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
         store.migrate()?;
         store.conn.execute_batch(
@@ -535,6 +549,72 @@ impl Store {
                 CHECK(max_items IS NULL OR max_items >= 0)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS collection_policies (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                max_age_days INTEGER,
+                max_items INTEGER,
+                max_bytes INTEGER,
+                CHECK(max_age_days IS NOT NULL OR max_items IS NOT NULL OR max_bytes IS NOT NULL),
+                CHECK(max_age_days IS NULL OR max_age_days BETWEEN 1 AND 3650),
+                CHECK(max_items IS NULL OR max_items BETWEEN 0 AND 1000000),
+                CHECK(max_bytes IS NULL OR max_bytes > 0)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS clip_annotations (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+                collection_id TEXT REFERENCES collection_policies(id) ON DELETE SET NULL,
+                preferred_mime TEXT,
+                legal_hold INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold IN (0, 1))
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_archive
+                ON clip_annotations(archived, clip_id);
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_collection
+                ON clip_annotations(collection_id, clip_id)
+                WHERE collection_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_clip_annotations_hold
+                ON clip_annotations(legal_hold, clip_id)
+                WHERE legal_hold = 1;
+
+            CREATE TABLE IF NOT EXISTS clip_residency (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                ever_on_disk INTEGER NOT NULL DEFAULT 1 CHECK(ever_on_disk IN (0, 1)),
+                ever_synced INTEGER NOT NULL DEFAULT 0 CHECK(ever_synced IN (0, 1)),
+                ever_exported INTEGER NOT NULL DEFAULT 0 CHECK(ever_exported IN (0, 1))
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS blob_quarantine (
+                hash TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                quarantined_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY(hash, kind)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS backup_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                verified_at INTEGER NOT NULL,
+                checksum TEXT NOT NULL CHECK(length(checksum) = 64)
+            );
+
+            CREATE TABLE IF NOT EXISTS import_quarantine (
+                import_id TEXT PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                clip_id TEXT NOT NULL,
+                staged_at INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+                sensitive INTEGER NOT NULL CHECK(sensitive IN (0, 1)),
+                payload_json TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_import_quarantine_staged
+                ON import_quarantine(staged_at, import_id);
+
+            CREATE TRIGGER IF NOT EXISTS clips_lifecycle_ai AFTER INSERT ON clips BEGIN
+                INSERT OR IGNORE INTO clip_annotations(clip_id) VALUES (new.id);
+                INSERT OR IGNORE INTO clip_residency(clip_id, ever_on_disk) VALUES (new.id, 1);
+            END;
+
             CREATE INDEX IF NOT EXISTS idx_clips_simhash ON clips(simhash);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b0 ON clips(simhash_b0);
             CREATE INDEX IF NOT EXISTS idx_clips_simhash_b1 ON clips(simhash_b1);
@@ -623,6 +703,14 @@ impl Store {
                     SET refcount = refcount + excluded.refcount;
             END;
             "#,
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO clip_annotations(clip_id) SELECT id FROM clips",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO clip_residency(clip_id, ever_on_disk) SELECT id, 1 FROM clips",
+            [],
         )?;
         for rule in lifecycle::default_retention_rules() {
             let (kind, sensitive) = rule.scope.database_values();
@@ -867,10 +955,16 @@ impl Store {
         // A re-copy can tighten privacy, but never silently downgrade a row
         // previously classified as sensitive.
         let mut effective_meta = clip.meta.clone();
+        if effective_meta.sensitivity_reason.is_some() {
+            effective_meta.sensitive = true;
+        }
         if let Some((_, stored)) = &existing
             && stored.sensitive
         {
             effective_meta.sensitive = true;
+            if effective_meta.sensitivity_reason.is_none() {
+                effective_meta.sensitivity_reason = stored.sensitivity_reason;
+            }
             if !clip.meta.sensitive {
                 effective_meta.expires_at = stored.expires_at;
             }
@@ -998,7 +1092,7 @@ impl Store {
         }
 
         let mut stored_flavors = clip.flavors.clone();
-        if !clip.meta.sensitive
+        if !effective_meta.sensitive
             && let Some(cas) = &self.cas
         {
             cas.spill_flavors(&mut stored_flavors, clip.meta.kind)?;
@@ -1069,24 +1163,7 @@ impl Store {
 
     /// List the most recent clips (pinned first, then by recency), up to `limit`.
     pub fn list(&self, limit: usize) -> Result<Vec<Clip>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
-            FROM clips
-            WHERE expires_at IS NULL OR expires_at > ?1
-               OR EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-               )
-            ORDER BY pinned DESC, updated_at DESC, seq DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = stmt.query_map(params![now_millis(), limit as i64], row_to_clip)?;
-        let mut clips = collect_clips(rows)?;
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.list_with_archive(ArchiveVisibility::Active, limit)
     }
 
     /// Load the most recent clips (alias used at startup to hydrate the GUI).
@@ -1113,11 +1190,12 @@ impl Store {
         }
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
-            FROM clips
-            WHERE normalized_hash = ?1
-            ORDER BY updated_at DESC, seq DESC
+            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
+                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            FROM clips c
+            JOIN clip_annotations a ON a.clip_id = c.id
+            WHERE c.normalized_hash = ?1 AND a.archived = 0
+            ORDER BY c.updated_at DESC, c.seq DESC
             LIMIT ?2
             "#,
         )?;
@@ -1166,7 +1244,9 @@ impl Store {
                    COALESCE(MAX(l.merged_at), c.updated_at) AS last_reused_at
             FROM clips AS c
             JOIN dedup_merge_ledger AS l ON l.clip_id = c.id
+            JOIN clip_annotations AS a ON a.clip_id = c.id
             WHERE c.pinned = 0
+              AND a.archived = 0
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
             GROUP BY c.id
             HAVING COUNT(l.event_seq) + 1 >= ?1
@@ -1380,10 +1460,24 @@ impl Store {
             let id = ClipId::parse(&id)
                 .map_err(|_| StoreError::Corrupt("bad ulid in retention query".into()))?;
             if grace_window.is_zero() {
-                report.hard_deleted += self
-                    .conn
-                    .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
-                deleted_any = true;
+                let changed = self.conn.execute(
+                    r#"
+                    DELETE FROM clips
+                    WHERE id = ?1 AND pinned = 0 AND favorite = 0
+                      AND EXISTS (
+                        SELECT 1 FROM clip_annotations AS annotations
+                        WHERE annotations.clip_id = clips.id
+                          AND annotations.legal_hold = 0
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM session_protected AS protected
+                        WHERE protected.clip_id = clips.id
+                      )
+                    "#,
+                    [id.to_string_repr()],
+                )?;
+                report.hard_deleted += changed;
+                deleted_any |= changed > 0;
             } else if let Some(key) = grace_key {
                 self.delete_with_grace_inner(
                     id,
@@ -1434,11 +1528,13 @@ impl Store {
             SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
                    c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
             FROM clips c
+            JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ? OR EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = c.id
-                  ))
+              ))
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
+              AND a.archived = 0
             "#,
         );
         let mut values = vec![Value::Integer(now_millis())];
@@ -1548,20 +1644,22 @@ impl Store {
         // column so one changed bit per band cannot become a false negative.
         let band_filter = if max_distance < 4 {
             format!(
-                "AND ({column}_b0 = ? OR {column}_b1 = ? OR {column}_b2 = ? OR {column}_b3 = ?)"
+                "AND (c.{column}_b0 = ? OR c.{column}_b1 = ? OR c.{column}_b2 = ? OR c.{column}_b3 = ?)"
             )
         } else {
             String::new()
         };
         let sql = format!(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite, {column}
-            FROM clips
-            WHERE {column} IS NOT NULL
-              AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
+            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
+                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.{column}
+            FROM clips c
+            JOIN clip_annotations a ON a.clip_id = c.id
+            WHERE c.{column} IS NOT NULL
+              AND a.archived = 0
+              AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
               {band_filter}
-            ORDER BY updated_at DESC, seq DESC
+            ORDER BY c.updated_at DESC, c.seq DESC
             "#
         );
         let mut statement = self.conn.prepare(&sql)?;
@@ -2095,6 +2193,7 @@ impl Store {
         window: Duration,
         reason: DeletionReason,
     ) -> Result<String> {
+        self.ensure_not_legal_hold(id)?;
         self.purge_grace_bin()?;
         self.delete_with_grace_inner(id, key, window, reason, true)
     }
@@ -2113,6 +2212,8 @@ impl Store {
                 "grace-bin window must be between 1 ms and 7 days".into(),
             ));
         }
+        let require_retention_guards = reason != DeletionReason::User;
+        ensure_delete_eligible(&self.conn, id, require_retention_guards)?;
         let mut clip = self
             .load_clip_by_id(id)?
             .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))?;
@@ -2143,10 +2244,36 @@ impl Store {
                 ciphertext,
             ],
         )?;
-        let deleted =
-            transaction.execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+        let delete_sql = if require_retention_guards {
+            r#"
+            DELETE FROM clips
+            WHERE id = ?1 AND pinned = 0 AND favorite = 0
+              AND EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id
+                  AND annotations.legal_hold = 0
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM temp.session_protected AS protected
+                WHERE protected.clip_id = clips.id
+              )
+            "#
+        } else {
+            r#"
+            DELETE FROM clips
+            WHERE id = ?1 AND EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id
+                  AND annotations.legal_hold = 0
+            )
+            "#
+        };
+        let deleted = transaction.execute(delete_sql, [id.to_string_repr()])?;
         if deleted != 1 {
-            return Err(StoreError::ClipNotFound(id.to_string_repr()));
+            ensure_delete_eligible(&transaction, id, require_retention_guards)?;
+            return Err(StoreError::Maintenance(
+                "clip deletion eligibility changed".into(),
+            ));
         }
         transaction.execute(
             "DELETE FROM temp.session_protected WHERE clip_id = ?1",
@@ -2302,6 +2429,10 @@ impl Store {
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
                   )
+                  AND EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
+                  )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
@@ -2331,6 +2462,10 @@ impl Store {
                   AND NOT EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
                   )
                   AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
@@ -2379,9 +2514,25 @@ impl Store {
                     )?,
                 ),
                 StoreMutation::Delete { id } => {
+                    ensure_delete_eligible(&transaction, id, false)?;
                     deleted = true;
-                    let changed = transaction
-                        .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+                    let changed = transaction.execute(
+                        r#"
+                        DELETE FROM clips
+                        WHERE id = ?1 AND EXISTS (
+                            SELECT 1 FROM clip_annotations AS annotations
+                            WHERE annotations.clip_id = clips.id
+                              AND annotations.legal_hold = 0
+                        )
+                        "#,
+                        [id.to_string_repr()],
+                    )?;
+                    if changed != 1 {
+                        ensure_delete_eligible(&transaction, id, false)?;
+                        return Err(StoreError::Maintenance(
+                            "clip deletion eligibility changed".into(),
+                        ));
+                    }
                     transaction.execute(
                         "DELETE FROM temp.session_protected WHERE clip_id = ?1",
                         [id.to_string_repr()],
@@ -2402,10 +2553,24 @@ impl Store {
 
     /// Delete a single clip by id.
     pub fn delete(&self, id: ClipId) -> Result<()> {
+        self.ensure_not_legal_hold(id)?;
         let deleted = self.conn.execute(
-            "DELETE FROM clips WHERE id = ?1",
+            r#"
+            DELETE FROM clips
+            WHERE id = ?1 AND EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id
+                  AND annotations.legal_hold = 0
+            )
+            "#,
             params![id.to_string_repr()],
         )?;
+        if deleted != 1 {
+            ensure_delete_eligible(&self.conn, id, false)?;
+            return Err(StoreError::Maintenance(
+                "clip deletion eligibility changed".into(),
+            ));
+        }
         self.conn.execute(
             "DELETE FROM session_protected WHERE clip_id = ?1",
             params![id.to_string_repr()],
@@ -2416,12 +2581,16 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every non-pinned, non-session-protected clip.
+    /// Delete every non-pinned, non-held, non-session-protected clip.
     pub fn clear(&self) -> Result<()> {
         let deleted = self.conn.execute(
             r#"
             DELETE FROM clips
             WHERE pinned = 0
+              AND EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM session_protected AS protected
                 WHERE protected.clip_id = clips.id
@@ -2435,10 +2604,22 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every clip, including pinned ones.
+    /// Delete every non-held clip, including pinned and session-protected ones.
     pub fn clear_all(&self) -> Result<()> {
-        let deleted = self.conn.execute("DELETE FROM clips", [])?;
-        self.conn.execute("DELETE FROM session_protected", [])?;
+        let deleted = self.conn.execute(
+            r#"
+            DELETE FROM clips
+            WHERE EXISTS (
+                SELECT 1 FROM clip_annotations AS annotations
+                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
+            )
+            "#,
+            [],
+        )?;
+        self.conn.execute(
+            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
+            [],
+        )?;
         if deleted > 0 {
             self.scrub_deleted_pages()?;
         }
@@ -2506,7 +2687,7 @@ impl Store {
         Ok(metrics)
     }
 
-    /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
+    /// Enforce a count cap, deleting oldest non-pinned/non-favorite/non-held clips first.
     ///
     /// Returns the number of clips evicted.
     pub fn enforce_cap(&self, max_history: usize) -> Result<usize> {
@@ -2520,6 +2701,10 @@ impl Store {
             DELETE FROM clips WHERE id IN (
                 SELECT id FROM clips
                 WHERE pinned = 0 AND favorite = 0
+                  AND EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
+                  )
                   AND NOT EXISTS (
                     SELECT 1 FROM session_protected AS protected
                     WHERE protected.clip_id = clips.id
@@ -2714,6 +2899,7 @@ struct StoredMetadata {
     lineage: CaptureLineage,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     sensitive: bool,
+    sensitivity_reason: Option<vbuff_types::SensitivityReason>,
     sync_eligible: Option<bool>,
     ai_allowed: bool,
 }
@@ -2726,6 +2912,7 @@ impl From<&ClipMeta> for StoredMetadata {
             lineage: meta.lineage.clone(),
             expires_at: meta.expires_at,
             sensitive: meta.sensitive,
+            sensitivity_reason: meta.sensitivity_reason,
             sync_eligible: Some(meta.sync_eligible),
             ai_allowed: meta.ai_allowed,
         }
@@ -2739,6 +2926,7 @@ impl StoredMetadata {
         meta.lineage = self.lineage;
         meta.expires_at = self.expires_at;
         meta.sensitive = self.sensitive;
+        meta.sensitivity_reason = self.sensitivity_reason;
         meta.sync_eligible = self.sync_eligible.unwrap_or(true);
         meta.ai_allowed = self.ai_allowed;
     }
@@ -2756,6 +2944,52 @@ fn datetime_from_millis(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
 fn duration_millis_i64(duration: Duration) -> Result<i64> {
     i64::try_from(duration.as_millis())
         .map_err(|_| StoreError::Maintenance("duration exceeds SQLite range".into()))
+}
+
+fn ensure_delete_eligible(
+    connection: &Connection,
+    id: ClipId,
+    require_retention_guards: bool,
+) -> Result<()> {
+    let state = connection
+        .query_row(
+            r#"
+            SELECT c.pinned, c.favorite, a.legal_hold,
+                   EXISTS(
+                       SELECT 1 FROM temp.session_protected AS protected
+                       WHERE protected.clip_id = c.id
+                   )
+            FROM clips AS c
+            LEFT JOIN clip_annotations AS a ON a.clip_id = c.id
+            WHERE c.id = ?1
+            "#,
+            [id.to_string_repr()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((pinned, favorite, held, session_protected)) = state else {
+        return Err(StoreError::ClipNotFound(id.to_string_repr()));
+    };
+    let held =
+        held.ok_or_else(|| StoreError::Corrupt("clip annotation row is missing".into()))? != 0;
+    if held {
+        return Err(StoreError::Maintenance(
+            "clip is under legal hold; release it before deletion".into(),
+        ));
+    }
+    if require_retention_guards && (pinned || favorite || session_protected) {
+        return Err(StoreError::Maintenance(
+            "clip became protected before retention deletion".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn elapsed_ms(duration: Duration) -> u64 {
@@ -2895,6 +3129,7 @@ mod tests {
     use vbuff_core::content_hash_from_flavors;
     use vbuff_types::{
         Body, CaptureGeneration, CaptureLineage, CaptureProvenance, ClipMeta, ContentKind, Flavor,
+        SensitivityReason,
     };
 
     fn make_clip(text: &str) -> Clip {
@@ -2999,6 +3234,7 @@ mod tests {
 
         let mut sensitive = make_clip("upgrade privacy needle");
         sensitive.meta.sensitive = true;
+        sensitive.meta.sensitivity_reason = Some(SensitivityReason::OneTimePassword);
         sensitive.meta.ai_allowed = true;
         sensitive.meta.sync_eligible = true;
         sensitive.meta.expires_at = Some(chrono::Utc::now() + Duration::minutes(10));
@@ -3014,6 +3250,10 @@ mod tests {
         assert_eq!(store.insert(&ordinary_again).unwrap(), original_id);
         let stored = store.list(1).unwrap().pop().unwrap();
         assert!(stored.meta.sensitive);
+        assert_eq!(
+            stored.meta.sensitivity_reason,
+            Some(SensitivityReason::OneTimePassword)
+        );
         assert!(!stored.meta.sync_eligible);
         assert!(!stored.meta.ai_allowed);
         assert!(store.search("upgrade", 10).unwrap().is_empty());
@@ -3021,6 +3261,20 @@ mod tests {
             query_count(&store.conn, "SELECT COUNT(*) FROM clip_embeddings").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn sensitivity_reason_cannot_be_stored_as_searchable_non_sensitive_content() {
+        let store = Store::open_in_memory().unwrap();
+        let mut inconsistent = make_clip("reason must fail closed");
+        inconsistent.meta.sensitivity_reason = Some(SensitivityReason::CaptureRule);
+        store.insert(&inconsistent).unwrap();
+
+        let stored = store.list(1).unwrap().pop().unwrap();
+        assert!(stored.meta.sensitive);
+        assert!(!stored.meta.sync_eligible);
+        assert!(!stored.meta.ai_allowed);
+        assert!(store.search("reason", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -3232,6 +3486,7 @@ mod tests {
             cas: None,
             dedup_filter: RefCell::new(BloomFilter::with_capacity(1, 10)),
             search_planner: RefCell::new(search::SearchPlanner::default()),
+            blob_scrub_cursor: RefCell::new(None),
         };
 
         assert!(store.migrate().is_err());

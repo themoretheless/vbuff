@@ -6,6 +6,8 @@
 
 use vbuff_types::Clip;
 
+use crate::recall::{QueryParseError, RecallSearchContext, parse_natural_query, search_recall};
+
 /// A scored search hit.
 #[derive(Clone, Debug)]
 pub struct SearchResult<'a> {
@@ -21,6 +23,22 @@ pub struct SearchResult<'a> {
 /// A non-empty query keeps only clips whose searchable text contains the query
 /// (case-insensitively) and ranks by match quality.
 pub fn search<'a>(clips: &'a [Clip], query: &str) -> Vec<SearchResult<'a>> {
+    match parse_natural_query(query, chrono::Utc::now()) {
+        Ok(parsed) => search_recall(clips, &parsed, RecallSearchContext::default())
+            .into_iter()
+            .map(|result| SearchResult {
+                clip: result.clip,
+                score: result.score,
+            })
+            .collect(),
+        Err(QueryParseError::TooLarge) => Vec::new(),
+        Err(QueryParseError::InvalidSyntax | QueryParseError::InvalidFilter) => {
+            legacy_search(clips, query)
+        }
+    }
+}
+
+fn legacy_search<'a>(clips: &'a [Clip], query: &str) -> Vec<SearchResult<'a>> {
     let q = query.trim().to_lowercase();
 
     let mut results: Vec<SearchResult<'a>> = if q.is_empty() {
@@ -78,7 +96,9 @@ fn score_clip(clip: &Clip, q: &str) -> Option<i64> {
 /// The text projection used for searching a clip.
 fn searchable_text(clip: &Clip) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = clip.primary_text() {
+    if !clip.meta.sensitive
+        && let Some(t) = clip.primary_text()
+    {
         parts.push(t.to_string());
     }
     if let Some(app) = &clip.meta.source_app {
@@ -153,5 +173,16 @@ mod tests {
         let clips = vec![text_clip("apple", false)];
         let res = search(&clips, "banana");
         assert!(res.is_empty());
+    }
+
+    #[test]
+    fn malformed_queries_cannot_search_sensitive_payloads() {
+        let mut sensitive = text_clip("app:a app:b", false);
+        sensitive.meta.sensitive = true;
+        assert!(search(&[sensitive], "app:a app:b").is_empty());
+
+        let ordinary = text_clip("app:a app:b", false);
+        assert_eq!(search(&[ordinary], "app:a app:b").len(), 1);
+        assert!(search(&[], &"x".repeat(4 * 1_024 + 1)).is_empty());
     }
 }

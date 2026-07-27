@@ -397,6 +397,7 @@ fn run_worker(
                 sync_eligible: false,
                 ai_allowed: false,
                 expires_after: None,
+                sensitivity_reason: Some(vbuff_types::SensitivityReason::CaptureRule),
             }
         } else {
             policy.decide(policy_input)
@@ -408,6 +409,7 @@ fn run_worker(
             sync_eligible,
             ai_allowed,
             expires_after,
+            sensitivity_reason,
         } = decision
         else {
             let CaptureDecision::Skip(reason) = decision else {
@@ -524,6 +526,7 @@ fn run_worker(
             sync_eligible,
             ai_allowed,
             expires_after,
+            sensitivity_reason,
         );
         let fields = RedactedClipFields::from(&clip);
         let span = tracing::info_span!(
@@ -850,6 +853,7 @@ fn build_clip(
     sync_eligible: bool,
     ai_allowed: bool,
     expires_after: Option<Duration>,
+    sensitivity_reason: Option<vbuff_types::SensitivityReason>,
 ) -> Clip {
     let kind = detect_kind(&captured.flavors);
     let byte_size = captured
@@ -864,6 +868,7 @@ fn build_clip(
     meta.generation = captured.generation;
     meta.lineage = captured.lineage;
     meta.sensitive = sensitive;
+    meta.sensitivity_reason = sensitivity_reason;
     meta.sync_eligible = sync_eligible;
     meta.ai_allowed = ai_allowed;
     meta.expires_at = expires_after
@@ -986,12 +991,17 @@ mod tests {
             false,
             false,
             Some(Duration::from_secs(90)),
+            Some(vbuff_types::SensitivityReason::OneTimePassword),
         );
 
         assert_eq!(clip.meta.byte_size, 5);
         assert_eq!(clip.meta.source_app.as_deref(), Some("editor.app"));
         assert_eq!(clip.meta.provenance.app_id.as_deref(), Some("editor.app"));
         assert!(clip.meta.sensitive);
+        assert_eq!(
+            clip.meta.sensitivity_reason,
+            Some(vbuff_types::SensitivityReason::OneTimePassword)
+        );
         assert!(!clip.meta.sync_eligible);
         assert!(clip.meta.expires_at.is_some());
         assert_eq!(clip.content_hash, hash);

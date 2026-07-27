@@ -27,10 +27,12 @@ pub mod intelligence;
 pub mod observability;
 pub mod onboarding;
 pub mod privacy;
+pub mod recall;
 pub mod reliability;
 pub mod secret;
 pub mod security_audit;
 pub mod slo;
+pub mod trust;
 pub mod workflow;
 
 pub use classify::detect_kind;

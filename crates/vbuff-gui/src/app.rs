@@ -17,11 +17,15 @@ use egui::{Color32, Key, RichText, TextureHandle, ViewportCommand};
 use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
 use vbuff_core::feedback::FeedbackEnvironment;
 use vbuff_core::onboarding::DefaultProfile;
+use vbuff_core::recall::{
+    MatchExplanation, RecallSearchContext, complete_query, parse_natural_query, search_recall,
+};
+use vbuff_core::search;
+use vbuff_core::trust::{EphemeralCountdown, PrivacyScore, PrivacyScoreLevel};
 use vbuff_core::workflow::{
     TextTransform, TransformOverlay, clean_link, expiry_label, recent_source_apps,
     stale_pin_candidates,
 };
-use vbuff_core::{SearchResult, search};
 use vbuff_types::{
     Body, CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth,
     CapturePauseReason, Clip, ClipId, ClipboardHealthDigest, CommandNotice, ContentKind,
@@ -91,6 +95,7 @@ struct UndoSlot {
 struct FilteredClip {
     id: ClipId,
     score: i64,
+    match_explanation: Option<MatchExplanation>,
     duplicate_delta: Option<NearDuplicateDelta>,
     hidden_variants: usize,
     variant_of: Option<ClipId>,
@@ -297,19 +302,36 @@ impl PopupApp {
 
     /// Build the current filtered view of clips.
     fn filtered(&self, clips: &[Clip]) -> Vec<FilteredClip> {
-        let results: Vec<SearchResult<'_>> = search(clips, &self.query)
+        let results = parse_natural_query(&self.query, Utc::now()).map_or_else(
+            |_| {
+                search(clips, &self.query)
+                    .into_iter()
+                    .map(|result| (result.clip, result.score, None))
+                    .collect::<Vec<_>>()
+            },
+            |query| {
+                search_recall(clips, &query, RecallSearchContext::default())
+                    .into_iter()
+                    .map(|result| {
+                        let explanation = preferred_match_explanation(&result.explanations);
+                        (result.clip, result.score, explanation)
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let results = results
             .into_iter()
-            .filter(|result| self.history_scope.matches(result.clip))
-            .collect();
+            .filter(|(clip, _, _)| self.history_scope.matches(clip))
+            .collect::<Vec<_>>();
         let mut filtered: Vec<FilteredClip> = Vec::with_capacity(results.len());
         let mut root: Option<(ClipId, vbuff_types::ContentKind, String)> = None;
-        for result in results {
-            let text = (!result.clip.meta.sensitive)
-                .then(|| result.clip.primary_text())
+        for (clip, score, match_explanation) in results {
+            let text = (!clip.meta.sensitive)
+                .then(|| clip.primary_text())
                 .flatten()
                 .map(str::to_owned);
             let duplicate = root.as_ref().and_then(|(root_id, kind, root_text)| {
-                (result.clip.meta.kind == *kind)
+                (clip.meta.kind == *kind)
                     .then_some(text.as_deref())
                     .flatten()
                     .and_then(|text| NearDuplicateDelta::between(text, root_text))
@@ -323,8 +345,9 @@ impl PopupApp {
                         root_hit.duplicate_delta.get_or_insert(delta);
                     }
                     filtered.push(FilteredClip {
-                        id: result.clip.id,
-                        score: result.score,
+                        id: clip.id,
+                        score,
+                        match_explanation,
                         duplicate_delta: Some(delta),
                         hidden_variants: 0,
                         variant_of: Some(root_id),
@@ -338,13 +361,14 @@ impl PopupApp {
                 continue;
             }
             filtered.push(FilteredClip {
-                id: result.clip.id,
-                score: result.score,
+                id: clip.id,
+                score,
+                match_explanation,
                 duplicate_delta: None,
                 hidden_variants: 0,
                 variant_of: None,
             });
-            root = text.map(|text| (result.clip.id, result.clip.meta.kind, text));
+            root = text.map(|text| (clip.id, clip.meta.kind, text));
         }
         filtered
     }
@@ -381,6 +405,7 @@ impl eframe::App for PopupApp {
             security_posture,
             capabilities,
             privacy_ledger,
+            privacy_score,
             slo_status,
             recoverable_skip,
             notice,
@@ -414,6 +439,7 @@ impl eframe::App for PopupApp {
                 s.security_posture,
                 s.capabilities.clone(),
                 s.privacy_ledger.clone(),
+                s.privacy_score.clone(),
                 s.slo_status.clone(),
                 recoverable_skip,
                 s.notice.clone(),
@@ -630,6 +656,9 @@ impl eframe::App for PopupApp {
                 );
             }
             self.render_surface_header(ui, paused, &clips);
+            if self.surface == PopupSurface::History {
+                self.render_query_completions(ui);
+            }
 
             if show_hotkey_coachmark && let Some(hotkey) = hotkey_label.as_deref() {
                 self.render_hotkey_coachmark(ui, hotkey);
@@ -756,6 +785,7 @@ impl eframe::App for PopupApp {
                     security_posture,
                     &capabilities,
                     &privacy_ledger,
+                    privacy_score.as_ref(),
                     &slo_status,
                 ),
                 PopupSurface::Settings => {
@@ -900,6 +930,32 @@ impl PopupApp {
                 .changed()
             {
                 ui.close();
+            }
+        });
+    }
+
+    fn render_query_completions(&mut self, ui: &mut egui::Ui) {
+        if self.query.trim().is_empty()
+            || self
+                .query
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return;
+        }
+        let completions = complete_query(&self.query);
+        if completions.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Complete").small().weak());
+            for completion in completions {
+                if ui.small_button(&completion).clicked() {
+                    replace_last_query_token(&mut self.query, &completion);
+                    self.selected = 0;
+                    self.request_focus_next_frame = true;
+                }
             }
         });
     }
@@ -1425,6 +1481,7 @@ impl PopupApp {
             let selected = [FilteredClip {
                 id,
                 score: 0,
+                match_explanation: None,
                 duplicate_delta: None,
                 hidden_variants: 0,
                 variant_of: None,
@@ -1501,6 +1558,32 @@ impl PopupApp {
                                 .push_back(UiAction::InstallStarterPack(StarterPack::Writing));
                         }
                     });
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("No clips satisfy the current search and filters")
+                            .small()
+                            .weak(),
+                    );
+                    let broadened = broaden_query(&self.query);
+                    let command = if broadened != self.query {
+                        "Remove query filters"
+                    } else if self.history_scope != HistoryScope::All {
+                        "Search all kinds"
+                    } else {
+                        "Clear search"
+                    };
+                    if ui.button(command).clicked() {
+                        if broadened != self.query {
+                            self.query = broadened;
+                        } else if self.history_scope != HistoryScope::All {
+                            self.history_scope = HistoryScope::All;
+                        } else {
+                            self.query.clear();
+                        }
+                        self.selected = 0;
+                        self.request_focus_next_frame = true;
+                    }
                 }
             },
         );
@@ -1767,6 +1850,7 @@ impl PopupApp {
         posture: SecurityPostureSummary,
         capabilities: &[CapabilityView],
         ledger: &PrivacyLedgerSummary,
+        privacy_score: Option<&PrivacyScore>,
         slo: &SloStatusSummary,
     ) {
         let posture_color = security_color(posture.level);
@@ -1790,6 +1874,60 @@ impl PopupApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.label(RichText::new("Local privacy score").strong());
+                if let Some(score) = privacy_score {
+                    let color = privacy_score_color(score.level);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} / 100", score.value))
+                                .size(20.0)
+                                .strong()
+                                .color(color),
+                        );
+                        ui.label(
+                            RichText::new(privacy_score_label(score.level))
+                                .small()
+                                .color(color),
+                        );
+                    });
+                    let factors_per_row = if ui.available_width() >= 470.0 { 2 } else { 1 };
+                    egui::Grid::new("privacy_score_factors")
+                        .num_columns(factors_per_row * 2)
+                        .striped(true)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for (index, factor) in score.factors.iter().enumerate() {
+                                ui.label(RichText::new(factor.key.replace('_', " ")).small());
+                                let color = match factor.points.cmp(&0) {
+                                    std::cmp::Ordering::Less => Color32::from_rgb(194, 64, 72),
+                                    std::cmp::Ordering::Equal => Color32::from_rgb(112, 120, 132),
+                                    std::cmp::Ordering::Greater => Color32::from_rgb(44, 156, 103),
+                                };
+                                ui.label(
+                                    RichText::new(format!("{:+}", factor.points))
+                                        .small()
+                                        .monospace()
+                                        .color(color),
+                                );
+                                if (index + 1) % factors_per_row == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                            if score.factors.len() % factors_per_row != 0 {
+                                for _ in
+                                    0..(factors_per_row - score.factors.len() % factors_per_row)
+                                {
+                                    ui.label("");
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                } else {
+                    ui.label(RichText::new("Privacy inputs unavailable").weak());
+                }
+
+                ui.add_space(12.0);
                 ui.label(RichText::new("Release SLOs").strong());
                 egui::Grid::new("trust_slo_grid")
                     .num_columns(3)
@@ -1946,7 +2084,7 @@ impl PopupApp {
         let peeking = self.is_peeking(clip.id);
         if clip.meta.sensitive && !peeking {
             ui.add_space(24.0);
-            ui.label(RichText::new("Sensitive content").strong());
+            ui.label(RichText::new(masked_preview_label(clip)).strong());
             if design::icon_button(ui, Icon::Eye, "Peek", false).clicked() {
                 self.peek_sensitive = Some((clip.id, Instant::now() + Duration::from_secs(2)));
             }
@@ -2212,8 +2350,23 @@ impl PopupApp {
                             }
                             if session_protected {
                                 meta.push("Protected this session".into());
-                            } else if clip.meta.expires_at.is_some() {
-                                meta.push(expiry_label(clip, Utc::now(), None));
+                            } else if let Some(expires_at) = clip.meta.expires_at {
+                                let now = Utc::now();
+                                let countdown = EphemeralCountdown::between(now, expires_at);
+                                match countdown {
+                                    EphemeralCountdown::Remaining { seconds }
+                                        if seconds <= 60 * 60 =>
+                                    {
+                                        meta.push(format!("expires in {}", countdown.label()));
+                                        ctx.request_repaint_after(Duration::from_secs(1));
+                                    }
+                                    EphemeralCountdown::Expired => {
+                                        meta.push(countdown.label());
+                                    }
+                                    EphemeralCountdown::Remaining { .. } => {
+                                        meta.push(expiry_label(clip, now, None));
+                                    }
+                                }
                             }
                             if let Some(delta) = hit.duplicate_delta {
                                 meta.push(format!(
@@ -2225,6 +2378,11 @@ impl PopupApp {
                             }
                             if hit.variant_of.is_some() {
                                 meta.push("Variant".into());
+                            }
+                            if !self.query.trim().is_empty()
+                                && let Some(explanation) = hit.match_explanation
+                            {
+                                meta.push(match_explanation_label(explanation).into());
                             }
                             meta.push(relative_time(clip.meta.created_at, Utc::now()));
                             ui.add(
@@ -2562,6 +2720,75 @@ fn privacy_color(level: PrivacyDecisionLevel) -> Color32 {
     }
 }
 
+const fn privacy_score_label(level: PrivacyScoreLevel) -> &'static str {
+    match level {
+        PrivacyScoreLevel::Strong => "Strong",
+        PrivacyScoreLevel::Balanced => "Balanced",
+        PrivacyScoreLevel::NeedsAttention => "Needs attention",
+    }
+}
+
+const fn privacy_score_color(level: PrivacyScoreLevel) -> Color32 {
+    match level {
+        PrivacyScoreLevel::Strong => Color32::from_rgb(44, 156, 103),
+        PrivacyScoreLevel::Balanced => Color32::from_rgb(210, 144, 32),
+        PrivacyScoreLevel::NeedsAttention => Color32::from_rgb(194, 64, 72),
+    }
+}
+
+fn preferred_match_explanation(explanations: &[MatchExplanation]) -> Option<MatchExplanation> {
+    [
+        MatchExplanation::QueryPinned,
+        MatchExplanation::PinnedAlias,
+        MatchExplanation::TypoCorrection,
+        MatchExplanation::Text,
+        MatchExplanation::SourceApplication,
+        MatchExplanation::Kind,
+        MatchExplanation::Tag,
+        MatchExplanation::Device,
+        MatchExplanation::Time,
+        MatchExplanation::DestinationAffinity,
+    ]
+    .into_iter()
+    .find(|candidate| explanations.contains(candidate))
+}
+
+const fn match_explanation_label(explanation: MatchExplanation) -> &'static str {
+    match explanation {
+        MatchExplanation::Text => "Text match",
+        MatchExplanation::SourceApplication => "Source match",
+        MatchExplanation::Kind => "Type match",
+        MatchExplanation::Tag => "Tag match",
+        MatchExplanation::Device => "Device match",
+        MatchExplanation::Time => "Time match",
+        MatchExplanation::PinnedAlias => "Alias match",
+        MatchExplanation::TypoCorrection => "Typo match",
+        MatchExplanation::DestinationAffinity => "App affinity",
+        MatchExplanation::QueryPinned => "Pinned here",
+    }
+}
+
+fn replace_last_query_token(query: &mut String, completion: &str) {
+    let start = query
+        .char_indices()
+        .next_back()
+        .and_then(|_| {
+            query
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| ch.is_whitespace())
+                .map(|(index, ch)| index + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    query.replace_range(start.., completion);
+}
+
+fn broaden_query(query: &str) -> String {
+    parse_natural_query(query, Utc::now())
+        .map(|parsed| parsed.text)
+        .unwrap_or_default()
+}
+
 fn render_slo_row(ui: &mut egui::Ui, label: &str, state: SloMetricState, budget: &str) {
     let color = match state {
         SloMetricState::Met => Color32::from_rgb(44, 156, 103),
@@ -2581,10 +2808,17 @@ fn row_preview(clip: &Clip) -> String {
 
 fn row_preview_with_peek(clip: &Clip, peeking: bool) -> String {
     if clip.meta.sensitive && !peeking {
-        "Sensitive content".to_owned()
+        masked_preview_label(clip).to_owned()
     } else {
         clip.preview(80)
     }
+}
+
+fn masked_preview_label(clip: &Clip) -> &'static str {
+    clip.meta.sensitivity_reason.map_or(
+        "Sensitive content",
+        vbuff_types::SensitivityReason::watermark,
+    )
 }
 
 fn bounded_preview(value: &str, max_bytes: usize) -> String {
@@ -2940,9 +3174,27 @@ mod tests {
     }
 
     #[test]
+    fn query_completion_replaces_only_the_last_token() {
+        let mut query = "release notes ki".to_owned();
+        replace_last_query_token(&mut query, "kind:");
+        assert_eq!(query, "release notes kind:");
+
+        let mut unicode_query = "привет ap".to_owned();
+        replace_last_query_token(&mut unicode_query, "app:");
+        assert_eq!(unicode_query, "привет app:");
+    }
+
+    #[test]
+    fn broadening_keeps_free_text_and_removes_structured_filters() {
+        assert_eq!(broaden_query("release app:browser kind:url"), "release");
+        assert_eq!(broaden_query("unclosed \"quote"), "");
+    }
+
+    #[test]
     fn sensitive_rows_never_render_clip_text() {
         let mut meta = vbuff_types::ClipMeta::now(vbuff_types::ContentKind::Text, 6, None);
         meta.sensitive = true;
+        meta.sensitivity_reason = Some(vbuff_types::SensitivityReason::OneTimePassword);
         let clip = Clip {
             id: ClipId::new(),
             flavors: vec![vbuff_types::Flavor::inline(
@@ -2955,7 +3207,7 @@ mod tests {
             favorite: false,
         };
 
-        assert_eq!(row_preview(&clip), "Sensitive content");
+        assert_eq!(row_preview(&clip), "Masked: one-time code");
         assert!(!row_preview(&clip).contains("123456"));
     }
 

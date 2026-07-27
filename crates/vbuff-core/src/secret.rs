@@ -7,6 +7,8 @@ pub enum SecretKind {
     AccessToken,
     JsonWebToken,
     PaymentCard,
+    OneTimePassword,
+    RecoveryCode,
     HighEntropy,
 }
 
@@ -16,6 +18,8 @@ pub struct SecretFinding {
     pub confidence: f32,
 }
 
+pub const SECRET_CAPTURE_CONFIDENCE: f32 = 0.9;
+
 pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
@@ -24,6 +28,12 @@ pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
             confidence: 1.0,
         });
     }
+
+    let lower = text.to_ascii_lowercase();
+    let otp_context = ["otp", "one-time", "verification code", "security code"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let recovery_context = lower.contains("recovery") || lower.contains("backup code");
 
     for token in text.split(|ch: char| ch.is_ascii_whitespace() || ",;()[]{}<>\"'".contains(ch)) {
         if is_cloud_credential(token) {
@@ -39,11 +49,49 @@ pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
         if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
             push_once(&mut findings, SecretKind::PaymentCard, 0.9);
         }
+        if otp_context
+            && (6..=8).contains(&token.len())
+            && token.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            push_once(&mut findings, SecretKind::OneTimePassword, 0.96);
+        }
+        if recovery_context && is_recovery_code(token) {
+            push_once(&mut findings, SecretKind::RecoveryCode, 0.94);
+        }
         if probable_high_entropy(token) {
             push_once(&mut findings, SecretKind::HighEntropy, 0.72);
         }
     }
     findings
+}
+
+pub fn is_probable_otp(text: &str) -> bool {
+    let trimmed = text.trim();
+    if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let has_marker = ["code", "otp", "verification", "verify", "passcode"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    has_marker
+        && lower
+            .split(|ch: char| !ch.is_ascii_digit())
+            .any(|part| (4..=8).contains(&part.len()))
+}
+
+fn is_recovery_code(token: &str) -> bool {
+    let compact_len = token
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    (8..=64).contains(&compact_len)
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && token.bytes().any(|byte| byte.is_ascii_digit())
+        && token.bytes().any(|byte| byte.is_ascii_alphabetic())
 }
 
 fn push_once(findings: &mut Vec<SecretFinding>, kind: SecretKind, confidence: f32) {
@@ -170,5 +218,25 @@ mod tests {
     #[test]
     fn ordinary_prose_is_not_high_entropy() {
         assert!(detect_secrets("this is ordinary clipboard prose").is_empty());
+    }
+
+    #[test]
+    fn otp_and_recovery_codes_require_context() {
+        assert!(is_probable_otp("123456"));
+        assert!(
+            detect_secrets("verification code 123456")
+                .iter()
+                .any(|finding| finding.kind == SecretKind::OneTimePassword)
+        );
+        assert!(
+            detect_secrets("recovery code ABCD-1234-EFGH")
+                .iter()
+                .any(|finding| finding.kind == SecretKind::RecoveryCode)
+        );
+        assert!(
+            !detect_secrets("invoice 123456")
+                .iter()
+                .any(|finding| finding.kind == SecretKind::OneTimePassword)
+        );
     }
 }

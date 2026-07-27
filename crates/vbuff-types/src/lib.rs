@@ -133,6 +133,47 @@ impl ContentKind {
     }
 }
 
+/// Non-secret explanation for why a clip is masked and restricted.
+///
+/// The enum deliberately carries no matched bytes or detector details that
+/// could reveal the clipboard payload through metadata, logs, or exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitivityReason {
+    SourceApplication,
+    CaptureRule,
+    Entropy,
+    OperatingSystemHint,
+    PrivateKey,
+    CloudCredential,
+    AccessToken,
+    JsonWebToken,
+    PaymentCard,
+    OneTimePassword,
+    RecoveryCode,
+    PossibleSecret,
+}
+
+impl SensitivityReason {
+    /// Payload-free label suitable for a masked preview.
+    pub const fn watermark(self) -> &'static str {
+        match self {
+            Self::SourceApplication => "Masked: source policy",
+            Self::CaptureRule => "Masked: capture rule",
+            Self::Entropy => "Masked: high entropy",
+            Self::OperatingSystemHint => "Masked: system privacy hint",
+            Self::PrivateKey => "Masked: private key",
+            Self::CloudCredential => "Masked: cloud credential",
+            Self::AccessToken => "Masked: access token",
+            Self::JsonWebToken => "Masked: signed token",
+            Self::PaymentCard => "Masked: payment card",
+            Self::OneTimePassword => "Masked: one-time code",
+            Self::RecoveryCode => "Masked: recovery code",
+            Self::PossibleSecret => "Masked: possible secret",
+        }
+    }
+}
+
 /// Screen-space rectangle associated with the copied selection, when known.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionRect {
@@ -338,6 +379,9 @@ pub struct ClipMeta {
     /// Sensitive clips receive masked presentation and stricter retention.
     #[serde(default)]
     pub sensitive: bool,
+    /// Payload-free explanation shown while sensitive content is masked.
+    #[serde(default)]
+    pub sensitivity_reason: Option<SensitivityReason>,
     /// False means the clip must never enter a sync envelope.
     #[serde(default = "default_true")]
     pub sync_eligible: bool,
@@ -364,6 +408,7 @@ impl ClipMeta {
             lineage: CaptureLineage::default(),
             expires_at: None,
             sensitive: false,
+            sensitivity_reason: None,
             sync_eligible: true,
             ai_allowed: false,
         }

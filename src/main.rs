@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use vbuff_core::capture::SelfWriteLedger;
+use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, SharedState};
 use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
@@ -117,6 +118,10 @@ fn main() -> anyhow::Result<()> {
     initial_state.default_profile = config.default_profile;
     initial_state.security_posture = summarize_security_posture(&security_posture);
     initial_state.capabilities = summarize_capabilities(&security_posture);
+    initial_state.privacy_score = Some(PrivacyScore::calculate(privacy_posture_input(
+        &config,
+        &security_posture,
+    )));
     let shared: SharedState = Arc::new(Mutex::new(initial_state));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
     let diagnostics = Diagnostics::new(Arc::clone(&shared));
@@ -218,4 +223,32 @@ fn summarize_security_posture(posture: &vbuff_platform::SecurityPosture) -> Secu
         SecurityPostureLevel::Protected
     };
     summary
+}
+
+fn privacy_posture_input(
+    config: &Config,
+    posture: &vbuff_platform::SecurityPosture,
+) -> PrivacyPostureInput {
+    let encryption_at_rest = posture.capabilities.iter().any(|capability| {
+        capability.feature == "encryption_at_rest" && capability.level == CapabilityLevel::Active
+    });
+    let denied_rules = config
+        .source_rules
+        .iter()
+        .filter(|rule| matches!(rule.action, config::SourceRuleAction::Skip))
+        .count();
+    let denied_source_count = config
+        .excluded_apps
+        .len()
+        .saturating_add(denied_rules)
+        .min(u32::MAX as usize) as u32;
+    PrivacyPostureInput {
+        encryption_at_rest,
+        strict_local_only: false,
+        sensitive_memory_only: false,
+        telemetry_enabled: false,
+        sync_enabled: false,
+        denied_source_count,
+        retention_days: None,
+    }
 }

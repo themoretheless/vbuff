@@ -2,8 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use egui_kittest::kittest::Queryable as _;
 use egui_kittest::{Harness, SnapshotOptions};
 use vbuff_core::content_hash_from_flavors;
+use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, PopupApp};
 use vbuff_types::{
     CapabilityView, CapabilityViewLevel, CaptureBudgetAlert, CaptureHealth, Clip, ClipId, ClipMeta,
@@ -11,8 +13,13 @@ use vbuff_types::{
     PrivacyLedgerSummary, SecurityPostureLevel, SecurityPostureSummary, SloMetricState,
 };
 
+static GUI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let snapshots = SnapshotOptions::new()
         .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
     for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
@@ -57,6 +64,36 @@ fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
             }
         }
     }
+}
+
+#[test]
+fn action_icon_exposes_an_accessible_working_menu() {
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let state = Arc::new(Mutex::new(snapshot_state(Surface::Populated)));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(560.0, 620.0))
+        .build_eframe(|_| PopupApp::new(state));
+
+    harness.get_by_label("Actions").click();
+    harness.run();
+    for label in [
+        "Command palette",
+        "Settings",
+        "Trust and privacy",
+        "Pause capture",
+        "Large preview",
+    ] {
+        assert!(
+            harness.query_all_by_label(label).next().is_some(),
+            "missing {label}"
+        );
+    }
+
+    harness.get_by_label("Settings").click();
+    harness.run();
+    assert!(harness.query_by_label("Clipboard history").is_some());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +204,15 @@ fn snapshot_state(surface: Surface) -> AppState {
             },
         ],
     };
+    state.privacy_score = Some(PrivacyScore::calculate(PrivacyPostureInput {
+        encryption_at_rest: false,
+        strict_local_only: false,
+        sensitive_memory_only: false,
+        telemetry_enabled: false,
+        sync_enabled: false,
+        denied_source_count: 2,
+        retention_days: Some(30),
+    }));
     state
 }
 

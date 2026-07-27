@@ -17,8 +17,8 @@ pub use automation::{
     plan_snippet_mirror,
 };
 pub use browser::{
-    BrowserIngress, BrowserIngressDecision, BrowserSourceReport, CleanLinkRequest,
-    SelectedLinkMetadata,
+    BrowserIngress, BrowserIngressDecision, BrowserPrivacyPolicy, BrowserSourceReport,
+    BrowserStorageDisposition, CleanLinkRequest, SelectedLinkMetadata,
 };
 pub use editor::{
     EditorCaptureMetadata, EditorPasteContext, EditorTargetKind, adapt_text_for_editor,

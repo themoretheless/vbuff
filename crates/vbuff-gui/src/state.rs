@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vbuff_core::onboarding::DefaultProfile;
+use vbuff_core::trust::PrivacyScore;
 use vbuff_types::{
     CapabilityView, CaptureBudgetAlert, CaptureHealth, CapturePauseReason, CaptureSessionStats,
     Clip, ClipId, ClipboardHealthDigest, CommandNotice, NoticeLevel, PrivacyLedgerSummary,
@@ -42,6 +43,8 @@ pub struct AppState {
     pub capabilities: Vec<CapabilityView>,
     /// Content-free, hash-chained capture decisions.
     pub privacy_ledger: PrivacyLedgerSummary,
+    /// Content-free score derived from the effective local privacy settings.
+    pub privacy_score: Option<PrivacyScore>,
     /// Release SLO status; unavailable measurements remain unknown.
     pub slo_status: SloStatusSummary,
     /// A recent privacy skip may be explicitly re-read from the live clipboard.

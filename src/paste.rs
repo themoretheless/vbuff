@@ -9,7 +9,7 @@ use vbuff_core::content_hash_from_flavors;
 use vbuff_core::intelligence::{PasteGuardDecision, PasteGuardFingerprint};
 use vbuff_platform::{
     ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, EnigoPaste,
-    PasteBackend,
+    PasteBackend, PastePermissionSelfCheck,
 };
 use vbuff_types::{CaptureLineage, ClipId, Flavor};
 
@@ -29,20 +29,39 @@ pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = EnigoPaste> {
     pending_at: Option<Instant>,
     pending_guard: Option<PasteGuardFingerprint>,
     self_writes: Arc<Mutex<SelfWriteLedger>>,
+    permission_check: PastePermissionSelfCheck,
 }
 
 impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
     pub(crate) fn system(self_writes: Arc<Mutex<SelfWriteLedger>>) -> Self {
+        let session = vbuff_platform::lifecycle::SessionContext::detect();
         let clipboard = ArboardClipboard::new().map_err(|error| {
             tracing::warn!("clipboard writer unavailable: {error}");
             error
         });
-        let paste = EnigoPaste::new().map_err(|error| {
-            tracing::warn!("paste backend unavailable; selections will only be copied: {error}");
-            error
-        });
+        let automatic_paste_allowed = session.input_injection_allowed
+            && session.display_server != vbuff_platform::lifecycle::DisplayServer::Wayland;
+        let paste = automatic_paste_allowed
+            .then(|| {
+                EnigoPaste::new().map_err(|error| {
+                    tracing::warn!(
+                        "paste backend unavailable; selections will only be copied: {error}"
+                    );
+                    error
+                })
+            })
+            .transpose()
+            .ok()
+            .flatten();
+        if !automatic_paste_allowed {
+            tracing::info!(
+                display_server = ?session.display_server,
+                remote = session.remote,
+                "automatic paste disabled because input injection is not proven"
+            );
+        }
 
-        Self::with_backends_and_ledger(clipboard.ok(), paste.ok(), self_writes)
+        Self::with_backends_and_ledger_for_session(clipboard.ok(), paste, self_writes, &session)
     }
 }
 
@@ -56,18 +75,35 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         )
     }
 
+    #[cfg(test)]
     fn with_backends_and_ledger(
         clipboard: Option<C>,
         paste: Option<P>,
         self_writes: Arc<Mutex<SelfWriteLedger>>,
     ) -> Self {
+        let session = vbuff_platform::lifecycle::SessionContext::detect();
+        Self::with_backends_and_ledger_for_session(clipboard, paste, self_writes, &session)
+    }
+
+    fn with_backends_and_ledger_for_session(
+        clipboard: Option<C>,
+        paste: Option<P>,
+        self_writes: Arc<Mutex<SelfWriteLedger>>,
+        session: &vbuff_platform::lifecycle::SessionContext,
+    ) -> Self {
+        let permission_check = PastePermissionSelfCheck::evaluate_session(session, paste.is_some());
         Self {
             clipboard,
             paste,
             pending_at: None,
             pending_guard: None,
             self_writes,
+            permission_check,
         }
+    }
+
+    pub(crate) const fn permission_check(&self) -> PastePermissionSelfCheck {
+        self.permission_check
     }
 
     /// Write a clip without injecting a paste keystroke.

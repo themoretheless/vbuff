@@ -15,8 +15,10 @@ use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::onboarding::DefaultProfile;
 use vbuff_core::workflow::plain_text_clone;
 use vbuff_gui::{PopupApp, SharedState};
-use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend};
-use vbuff_types::{CapturePauseReason, ClientIntent, NoticeLevel};
+use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, PastePermissionLevel};
+use vbuff_types::{
+    CapabilityView, CapabilityViewLevel, CapturePauseReason, ClientIntent, NoticeLevel,
+};
 
 #[cfg(feature = "tray")]
 use crate::autostart;
@@ -165,6 +167,22 @@ impl Runtime {
             state.show_hotkey_coachmark = !config.hotkey_coachmark_seen;
         }
 
+        let paste = PasteCoordinator::system(self_writes);
+        let permission = paste.permission_check();
+        if let Ok(mut state) = shared.lock() {
+            state
+                .capabilities
+                .retain(|capability| capability.feature != "paste_permission");
+            state.capabilities.push(CapabilityView {
+                feature: "paste_permission".into(),
+                level: match permission.level {
+                    PastePermissionLevel::Automatic => CapabilityViewLevel::Active,
+                    PastePermissionLevel::CopyOnly => CapabilityViewLevel::Unavailable,
+                },
+                detail: permission.detail.into(),
+            });
+        }
+
         Self {
             history,
             popup: PopupApp::new(Arc::clone(&shared)),
@@ -177,7 +195,7 @@ impl Runtime {
             strict_capture_blocked,
             automatic_pause_reason,
             config,
-            paste: PasteCoordinator::system(self_writes),
+            paste,
             #[cfg(feature = "tray")]
             tray: None,
             #[cfg(feature = "tray")]
@@ -232,8 +250,23 @@ impl Runtime {
         }
         self.tray_attempted = true;
         match Tray::new() {
-            Ok(tray) => self.tray = Some(tray),
-            Err(error) => tracing::warn!("tray icon unavailable: {error}"),
+            Ok(tray) => {
+                #[cfg(target_os = "linux")]
+                tracing::info!(
+                    fallback = ?vbuff_platform::LinuxTrayFallback::choose(true, false),
+                    "Linux resident surface selected"
+                );
+                self.tray = Some(tray);
+            }
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                tracing::warn!(
+                    fallback = ?vbuff_platform::LinuxTrayFallback::choose(false, false),
+                    "tray icon unavailable: {error}; launching vbuff again opens the resident popup"
+                );
+                #[cfg(not(target_os = "linux"))]
+                tracing::warn!("tray icon unavailable: {error}");
+            }
         }
     }
 
@@ -248,9 +281,11 @@ impl Runtime {
         if let Ok(state) = self.shared.lock() {
             tray.sync_state(
                 state.paused,
+                state.pause_reason,
                 state.capture_health,
                 state.clips.len(),
                 self.config.launch_at_login,
+                Instant::now(),
             );
         }
         let mut commands = Vec::new();
@@ -459,7 +494,14 @@ impl Runtime {
         let now = Instant::now();
         if let Some(result) = self.paste.poll(now) {
             match result {
-                Ok(()) => self.announce("Paste complete"),
+                Ok(()) => {
+                    self.announce("Paste complete");
+                    #[cfg(feature = "tray")]
+                    if let Some(tray) = &self.tray {
+                        tray.acknowledge_paste(now);
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(700));
+                }
                 Err(error) => {
                     self.notice(
                         NoticeLevel::Error,

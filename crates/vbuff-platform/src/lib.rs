@@ -14,6 +14,7 @@
 pub mod capabilities;
 pub mod cf_html;
 mod clipboard;
+pub mod desktop;
 mod error;
 pub mod format_map;
 pub mod geometry;
@@ -37,6 +38,10 @@ pub use traits::{
 
 pub use capabilities::{CapabilityLevel, FeatureCapability, SecurityPosture};
 pub use cf_html::{CfHtml, CfHtmlError, parse_cf_html};
+pub use desktop::{
+    DesktopShell, LinuxTrayFallback, PastePermissionLevel, PastePermissionSelfCheck,
+    QuickMenuLabels, ResidentStatus, current_desktop_shell,
+};
 pub use format_map::{FormatFamily, FormatKey, canonical_format};
 pub use keymap::{CanonicalAction, KeyBinding, KeymapTarget, canonical_keymap};
 pub use paste_fidelity::{PasteConformanceIssue, PasteConformanceReport, PasteTrace};

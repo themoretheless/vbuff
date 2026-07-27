@@ -69,7 +69,10 @@ fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
     }
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.doctor().unwrap().schema_version, 6);
+    assert_eq!(
+        store.doctor().unwrap().schema_version,
+        vbuff_store::SCHEMA_VERSION
+    );
     assert_eq!(
         store.list(1).unwrap()[0].primary_text(),
         clip.primary_text()
@@ -77,6 +80,87 @@ fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
     assert_eq!(store.retention_rules().unwrap().len(), 10);
     assert_eq!(store.backfill_normalized_fingerprints(10).unwrap(), 0);
     assert_eq!(store.near_duplicate_group(clip.id, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn migrates_schema_six_to_seven_and_backfills_lifecycle_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let mut clip = make_clip("schema six lifecycle migration");
+    clip.pinned = true;
+    clip.favorite = true;
+    {
+        let store = Store::open(&db).unwrap();
+        store.insert(&clip).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                DROP TRIGGER clips_lifecycle_ai;
+                DROP TABLE clip_annotations;
+                DROP TABLE clip_residency;
+                DROP TABLE collection_policies;
+                DROP TABLE blob_quarantine;
+                DROP TABLE backup_state;
+                DROP TABLE import_quarantine;
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(
+        store.doctor().unwrap().schema_version,
+        vbuff_store::SCHEMA_VERSION
+    );
+    let restored = store.list(1).unwrap().pop().unwrap();
+    assert_eq!(restored.id, clip.id);
+    assert_eq!(restored.content_hash, clip.content_hash);
+    assert_eq!(restored.flavors, clip.flavors);
+    assert_eq!(
+        restored.meta.created_at.timestamp_millis(),
+        clip.meta.created_at.timestamp_millis()
+    );
+    assert_eq!(restored.meta.source_app, clip.meta.source_app);
+    assert_eq!(restored.pinned, clip.pinned);
+    assert_eq!(restored.favorite, clip.favorite);
+    assert_eq!(store.annotations(clip.id).unwrap(), Default::default());
+    assert_eq!(
+        store.residency(clip.id).unwrap(),
+        vbuff_store::SensitiveDataResidency {
+            ever_on_disk: true,
+            ever_synced: false,
+            ever_exported: false,
+        }
+    );
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let lifecycle_tables: i64 = connection
+        .query_row(
+            r#"
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name IN (
+                'collection_policies', 'clip_annotations', 'clip_residency',
+                'blob_quarantine', 'backup_state', 'import_quarantine'
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_tables, 6);
+    let lifecycle_trigger: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'clips_lifecycle_ai'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_trigger, 1);
 }
 
 #[test]
@@ -227,6 +311,79 @@ fn large_bodies_use_sharded_refcounted_cas_and_hydrate_on_read() {
     store.delete(clip.id).unwrap();
     assert_eq!(store.gc_blobs().unwrap(), 1);
     assert!(regular_files(&dir.path().join("blobs")).is_empty());
+}
+
+#[test]
+fn gc_dry_run_and_blob_scrubber_report_before_mutating() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+
+    let orphan_hash = blake3::hash(b"orphan preview").to_hex().to_string();
+    let orphan = dir
+        .path()
+        .join("blobs")
+        .join("text")
+        .join(&orphan_hash[0..2])
+        .join(&orphan_hash[2..4])
+        .join(&orphan_hash);
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"orphan preview").unwrap();
+    let preview = store.gc_dry_run().unwrap();
+    assert_eq!(preview.blob_count, 1);
+    assert_eq!(preview.reclaimable_bytes, 14);
+    assert!(orphan.exists());
+    assert_eq!(store.gc_blobs().unwrap(), 1);
+
+    let live = large_clip(ContentKind::Image, "image/png", vec![83_u8; 300 * 300 * 4]);
+    store.insert(&live).unwrap();
+    let live_path = regular_files(&dir.path().join("blobs"))
+        .into_iter()
+        .find(|path| !path.to_string_lossy().contains("quarantine"))
+        .unwrap();
+    std::fs::write(&live_path, b"damaged").unwrap();
+    let report = store.scrub_blobs(16).unwrap();
+    assert_eq!(report.checked, 1);
+    assert_eq!(report.quarantined, 1);
+    assert!(!live_path.exists());
+}
+
+#[test]
+fn blob_scrubber_cursor_advances_past_a_healthy_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let store = Store::open(&db).unwrap();
+    store
+        .insert(&large_clip(
+            ContentKind::Image,
+            "image/png",
+            vec![11_u8; 300 * 300 * 4],
+        ))
+        .unwrap();
+    store
+        .insert(&large_clip(
+            ContentKind::Image,
+            "image/png",
+            vec![12_u8; 300 * 300 * 4],
+        ))
+        .unwrap();
+
+    let mut files = regular_files(&dir.path().join("blobs"));
+    files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    assert_eq!(files.len(), 2);
+    std::fs::write(&files[1], b"damaged second blob").unwrap();
+
+    let first = store.scrub_blobs(1).unwrap();
+    assert_eq!(first.checked, 1);
+    assert_eq!(first.healthy, 1);
+    assert_eq!(first.remaining, 1);
+    assert!(files[0].exists());
+
+    let second = store.scrub_blobs(1).unwrap();
+    assert_eq!(second.checked, 1);
+    assert_eq!(second.quarantined, 1);
+    assert_eq!(second.remaining, 0);
+    assert!(!files[1].exists());
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -41,6 +42,38 @@ pub enum BrowserIngressDecision {
     SkipInvalidOrigin,
     SkipInvalidSize,
     SkipOversize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserStorageDisposition {
+    NeverStore,
+    StoreNormally,
+    StoreEphemeral { ttl: Duration },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowserPrivacyPolicy {
+    private_window_ttl: Option<Duration>,
+}
+
+impl BrowserPrivacyPolicy {
+    pub fn new(private_window_ttl: Option<Duration>) -> Option<Self> {
+        private_window_ttl
+            .is_none_or(|ttl| !ttl.is_zero() && ttl <= Duration::from_secs(10 * 60))
+            .then_some(Self { private_window_ttl })
+    }
+
+    pub fn disposition(self, private_tab: Option<bool>) -> BrowserStorageDisposition {
+        match private_tab {
+            Some(false) => BrowserStorageDisposition::StoreNormally,
+            Some(true) => self
+                .private_window_ttl
+                .map_or(BrowserStorageDisposition::NeverStore, |ttl| {
+                    BrowserStorageDisposition::StoreEphemeral { ttl }
+                }),
+            None => BrowserStorageDisposition::NeverStore,
+        }
+    }
 }
 
 impl BrowserIngress {
@@ -239,5 +272,31 @@ mod tests {
             .execute()
             .is_err()
         );
+    }
+
+    #[test]
+    fn private_window_bridge_is_never_store_by_default() {
+        let policy = BrowserPrivacyPolicy::default();
+        assert_eq!(
+            policy.disposition(Some(true)),
+            BrowserStorageDisposition::NeverStore
+        );
+        assert_eq!(
+            policy.disposition(None),
+            BrowserStorageDisposition::NeverStore
+        );
+        assert_eq!(
+            policy.disposition(Some(false)),
+            BrowserStorageDisposition::StoreNormally
+        );
+
+        let ephemeral = BrowserPrivacyPolicy::new(Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(
+            ephemeral.disposition(Some(true)),
+            BrowserStorageDisposition::StoreEphemeral {
+                ttl: Duration::from_secs(30)
+            }
+        );
+        assert!(BrowserPrivacyPolicy::new(Some(Duration::from_secs(601))).is_none());
     }
 }

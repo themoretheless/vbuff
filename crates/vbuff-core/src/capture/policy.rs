@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use regex::Regex;
 use url::Url;
-use vbuff_types::{CaptureProvenance, Flavor};
+use vbuff_types::{CaptureProvenance, Flavor, SensitivityReason};
 
-use crate::secret::detect_secrets;
+use crate::secret::{SECRET_CAPTURE_CONFIDENCE, detect_secrets, is_probable_otp};
+use crate::trust::{handling_for_secret, sensitivity_reason_for_secret};
 
 /// Clipboard source being evaluated by the capture gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -194,6 +195,7 @@ pub enum CaptureDecision {
         sync_eligible: bool,
         ai_allowed: bool,
         expires_after: Option<Duration>,
+        sensitivity_reason: Option<SensitivityReason>,
     },
     Skip(DropReason),
 }
@@ -284,48 +286,47 @@ impl CapturePolicy {
             .filter(|flavor| flavor.is_realized())
             .filter_map(Flavor::as_text)
             .any(is_probable_otp);
-        let secret = self.detect_secrets
-            && input
+        let secret_finding = self.detect_secrets.then(|| {
+            input
                 .flavors
                 .iter()
                 .filter(|flavor| flavor.is_realized())
                 .filter_map(Flavor::as_text)
-                .any(|value| {
-                    detect_secrets(value)
-                        .iter()
-                        .any(|finding| finding.confidence >= 0.9)
-                });
+                .flat_map(detect_secrets)
+                .filter(|finding| finding.confidence >= SECRET_CAPTURE_CONFIDENCE)
+                .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+        });
+        let secret_kind = secret_finding.flatten().map(|finding| finding.kind);
         let forced_sensitive = action == CaptureAction::CaptureSensitive;
+        let sensitivity_reason = if otp {
+            Some(SensitivityReason::OneTimePassword)
+        } else if let Some(kind) = secret_kind {
+            Some(sensitivity_reason_for_secret(kind))
+        } else if forced_sensitive {
+            Some(SensitivityReason::CaptureRule)
+        } else {
+            None
+        };
         CaptureDecision::Capture {
             action,
-            sensitive: otp || secret || forced_sensitive,
-            sync_eligible: !otp && !secret && !forced_sensitive,
-            ai_allowed: !otp && !secret && !forced_sensitive,
+            sensitive: sensitivity_reason.is_some(),
+            sync_eligible: sensitivity_reason.is_none(),
+            ai_allowed: sensitivity_reason.is_none(),
             expires_after: if otp {
                 Some(self.otp_ttl)
-            } else if secret {
-                Some(self.secret_ttl)
+            } else if let Some(kind) = secret_kind {
+                let handling = handling_for_secret(kind);
+                Some(if matches!(kind, crate::secret::SecretKind::HighEntropy) {
+                    self.secret_ttl
+                } else {
+                    handling.ttl
+                })
             } else {
                 None
             },
+            sensitivity_reason,
         }
     }
-}
-
-fn is_probable_otp(text: &str) -> bool {
-    let trimmed = text.trim();
-    if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return true;
-    }
-
-    let lower = trimmed.to_lowercase();
-    let has_marker = ["code", "otp", "verification", "verify", "passcode"]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    has_marker
-        && lower
-            .split(|ch: char| !ch.is_ascii_digit())
-            .any(|part| (4..=8).contains(&part.len()))
 }
 
 #[cfg(test)]
@@ -357,6 +358,7 @@ mod tests {
                 sync_eligible: false,
                 ai_allowed: false,
                 expires_after: Some(Duration::from_secs(90)),
+                sensitivity_reason: Some(SensitivityReason::OneTimePassword),
             }
         );
     }
@@ -375,9 +377,34 @@ mod tests {
                 sensitive: true,
                 sync_eligible: false,
                 ai_allowed: false,
-                expires_after: Some(Duration::from_secs(10 * 60)),
+                expires_after: Some(Duration::from_secs(5 * 60)),
+                sensitivity_reason: Some(SensitivityReason::AccessToken),
             }
         );
+    }
+
+    #[test]
+    fn secret_kinds_receive_distinct_capture_ttls() {
+        let provenance = CaptureProvenance::default();
+        let card = [Flavor::inline("text/plain", b"4111111111111111".to_vec())];
+        let private_key = [Flavor::inline(
+            "text/plain",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----".to_vec(),
+        )];
+        assert!(matches!(
+            CapturePolicy::default().decide(input(&card, &provenance)),
+            CaptureDecision::Capture {
+                expires_after: Some(ttl),
+                ..
+            } if ttl == Duration::from_secs(10 * 60)
+        ));
+        assert!(matches!(
+            CapturePolicy::default().decide(input(&private_key, &provenance)),
+            CaptureDecision::Capture {
+                expires_after: Some(ttl),
+                ..
+            } if ttl == Duration::from_secs(30)
+        ));
     }
 
     #[test]
@@ -438,6 +465,7 @@ mod tests {
                 sync_eligible: false,
                 ai_allowed: false,
                 expires_after: None,
+                sensitivity_reason: Some(SensitivityReason::CaptureRule),
             }
         );
     }
