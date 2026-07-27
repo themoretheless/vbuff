@@ -108,7 +108,7 @@ The popup can search and manage the local history. Automatic focus restoration a
 
 One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery use a bounded process-only lane instead of SQLite. It holds at most 32 clips, applies hard expiry, never permits pinning or session protection, is rejected by store/import boundaries, and disappears when the process exits. The lane is recallable from History while alive, but it is not durable or crash-recoverable.
 
-Schema 7 and its lifecycle APIs include migration, archive, retention, quarantine, export, and backup-evidence contracts. They do not encrypt the live database and do not create a user backup service. A migration guard may use a temporary owner-only safety copy while applying an upgrade; that artifact is removed only after the upgraded or next-start live store opens fully and passes `quick_check`, so a failed open keeps the rollback bytes. It must not be described as a durable user backup. The native plugin executable protocol uses bounded, big-endian-length-prefixed JSON frames but remains contract-only and disconnected from the resident runtime. No plugin is launched, sandboxed, installed, or granted clipboard access; activation remains release-gated on an OS sandbox, host-side capability enforcement, publisher trust, and conformance evidence.
+Schema 7 and its lifecycle APIs include migration, archive, retention, quarantine, export, and backup-evidence contracts. Lifecycle mutations fail closed when required annotation/residency sidecars are missing; ordinary and auxiliary recall consistently exclude archived or expired rows; derived-index backfills skip expired rows; legal-hold and retention guards are part of the destructive SQL predicates. These contracts do not encrypt the live database and do not create a user backup service. A migration guard may use a temporary owner-only safety copy while applying an upgrade; that artifact is removed only after the upgraded or next-start live store opens fully and passes `quick_check`, so a failed open keeps the rollback bytes. It must not be described as a durable user backup. The native plugin executable protocol uses bounded, big-endian-length-prefixed JSON frames but remains contract-only and disconnected from the resident runtime. No plugin is launched, sandboxed, installed, or granted clipboard access; activation remains release-gated on an OS sandbox, host-side capability enforcement, publisher trust, and conformance evidence.
 
 ---
 
@@ -206,7 +206,7 @@ The 600 proposals, improvements, problems, bugs and "done badly" notes are kept 
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current implementation problems, SOLID/DRY slices, design fixes, review hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Evidence-backed native correctness, text/search, security, local-first sync, verification |
 
-The separately sourced post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/ideas-611-620.md) are follow-up research input, not an expansion of the canonical 1-600 execution goal.
+The separately sourced post-600 candidates [601-610](docs/ideas-601-610.md), [611-620](docs/ideas-611-620.md), and [621-630](docs/ideas-621-630.md) are follow-up research input, not an expansion of the canonical 1-600 execution goal.
 
 ---
 
@@ -348,6 +348,7 @@ The backlog remains research input, not promised scope. Contract-only sync, plug
 - [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed backlog items 501-600: native correctness, international text/search, privacy, sync, and release verification.
 - [docs/ideas-601-610.md](docs/ideas-601-610.md) - ten evidence-backed post-600 candidates kept outside the active 1-600 goal.
 - [docs/ideas-611-620.md](docs/ideas-611-620.md) - ten review-derived state-machine, replay, configuration, and release-evidence candidates, also outside the active goal.
+- [docs/ideas-621-630.md](docs/ideas-621-630.md) - ten review-derived privacy, lifecycle-integrity, destructive-race, export, and recovery candidates, also outside the active goal.
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 verified high-signal repositories plus the scientific papers, standards, and concrete lessons behind items 501-600.
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - competitor anti-patterns and the vbuff decision that prevents each.
 - [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in *this repo's own code* today, each grounded in a file and line, cross-referenced against the claims made in this README, `architecture.md`, and `recommendation.md`.

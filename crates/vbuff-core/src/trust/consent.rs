@@ -102,6 +102,7 @@ pub enum ExternalAction {
     Export,
     Webhook,
     Plugin,
+    AiAction,
     NetworkRequest,
     LocalCapture,
     LocalPaste,
@@ -247,6 +248,7 @@ mod tests {
             ExternalAction::Export,
             ExternalAction::Webhook,
             ExternalAction::Plugin,
+            ExternalAction::AiAction,
             ExternalAction::NetworkRequest,
         ] {
             assert!(!policy.allows(action));

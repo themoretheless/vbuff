@@ -4,7 +4,7 @@ use std::time::Duration;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::secret::{SecretKind, detect_secrets};
+use crate::secret::{SecretKind, detect_secrets, is_probable_otp};
 
 const MAX_RULES: usize = 256;
 const MAX_RULE_ID_BYTES: usize = 96;
@@ -191,8 +191,10 @@ impl CaptureRuleSimulator {
                 CaptureMatcher::Pattern(pattern) => pattern.is_match(input.sample),
             };
             if matched {
-                if rule.action == CaptureRuleAction::CaptureNormally
-                    && let Some(reason) = intrinsic_reason
+                if matches!(
+                    rule.action,
+                    CaptureRuleAction::CaptureNormally | CaptureRuleAction::CaptureEphemeral { .. }
+                ) && let Some(reason) = intrinsic_reason
                 {
                     return Ok(SimulationResult {
                         action: CaptureRuleAction::Mask,
@@ -278,6 +280,9 @@ impl PasteGuard {
 fn intrinsic_sensitivity(input: &SimulationInput<'_>) -> Option<RuleMatchReason> {
     if input.os_sensitive_hint {
         return Some(RuleMatchReason::OperatingSystemHint);
+    }
+    if is_probable_otp(input.sample) {
+        return Some(RuleMatchReason::Secret(SecretKind::OneTimePassword));
     }
     detect_secrets(input.sample)
         .into_iter()
@@ -365,6 +370,28 @@ mod tests {
             otp.reason(),
             RuleMatchReason::Secret(SecretKind::OneTimePassword)
         );
+
+        let ephemeral = CaptureRuleSimulator::new([CaptureRule::for_source(
+            "short-lived",
+            "com.example.chat",
+            CaptureRuleAction::CaptureEphemeral {
+                ttl: Duration::from_secs(60),
+            },
+        )
+        .unwrap()])
+        .unwrap()
+        .simulate(&SimulationInput {
+            source_app: Some("com.example.chat"),
+            sample: "verify 1234",
+            os_sensitive_hint: false,
+        })
+        .unwrap();
+        assert_eq!(ephemeral.action(), CaptureRuleAction::Mask);
+        assert_eq!(
+            ephemeral.reason(),
+            RuleMatchReason::Secret(SecretKind::OneTimePassword)
+        );
+        assert_eq!(ephemeral.rule_id(), None);
     }
 
     #[test]

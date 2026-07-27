@@ -4,7 +4,7 @@ use regex::Regex;
 use url::Url;
 use vbuff_types::{CaptureProvenance, Flavor, SensitivityReason};
 
-use crate::secret::{SecretKind, detect_secrets};
+use crate::secret::{SecretKind, detect_secrets, is_probable_otp};
 use crate::trust::{handling_for_secret, sensitivity_reason_for_secret};
 
 /// Clipboard source being evaluated by the capture gate.
@@ -333,22 +333,6 @@ const fn secret_threshold(kind: SecretKind) -> f32 {
         SecretKind::HighEntropy => 0.7,
         _ => 0.9,
     }
-}
-
-fn is_probable_otp(text: &str) -> bool {
-    let trimmed = text.trim();
-    if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return true;
-    }
-
-    let lower = trimmed.to_lowercase();
-    let has_marker = ["code", "otp", "verification", "verify", "passcode"]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    has_marker
-        && lower
-            .split(|ch: char| !ch.is_ascii_digit())
-            .any(|part| (4..=8).contains(&part.len()))
 }
 
 /// Apply the capture gate's content-only sensitivity rules to edited text.

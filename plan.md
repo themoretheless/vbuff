@@ -68,7 +68,7 @@ Phases follow the spine roadmap exactly: Phase 0 (foundations/scaffolding) -> MV
 
 M0-M5 build the single-process Windows alpha and full-history path; M6 decides whether it deserves a beta. M7-M10 are independently activated post-beta work, not an automatic feature train. M11 is an explicit holding area for demand-gated expansion, not a promise of cross-platform parity or sync. Generic AI actions, OCR, mobile peers, team libraries, shared boards, ambient sync, MCP, and plugin execution are out of the active roadmap.
 
-The expanded 600-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, review backlog items 401-500 live in `docs/ideas-401-500.md`, and evidence-backed ideas 501-600 live in `docs/ideas-501-600.md`. Twenty additional research candidates live separately in `docs/ideas-601-610.md` and `docs/ideas-611-620.md`; they do not extend the active objective. The 100-repository and primary-source evidence catalog lives in `docs/repositories-research-100.md`. The milestone gates below decide when an idea becomes planned work; repository popularity alone never promotes one.
+The expanded 600-idea backlog is reference material, not an implicit scope increase: engineering ideas 1-113 live in `architecture.md`, product/strategy ideas 114-197 live in `recommendation.md`, user-facing/operations ideas 198-300 live in `docs/ideas-top-300.md`, extended ideas 301-400 live in `docs/ideas-301-400.md`, review backlog items 401-500 live in `docs/ideas-401-500.md`, and evidence-backed ideas 501-600 live in `docs/ideas-501-600.md`. Thirty additional research candidates live separately in `docs/ideas-601-610.md`, `docs/ideas-611-620.md`, and `docs/ideas-621-630.md`; they do not extend the active objective. The 100-repository and primary-source evidence catalog lives in `docs/repositories-research-100.md`. The milestone gates below decide when an idea becomes planned work; repository popularity alone never promotes one.
 
 | Range | Canonical backlog source |
 |---|---|
@@ -79,7 +79,7 @@ The expanded 600-idea backlog is reference material, not an implicit scope incre
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) |
 
-Post-600 research candidates: [601-610](docs/ideas-601-610.md) and [611-620](docs/ideas-611-620.md). They are intentionally outside the canonical range table.
+Post-600 research candidates: [601-610](docs/ideas-601-610.md), [611-620](docs/ideas-611-620.md), and [621-630](docs/ideas-621-630.md). They are intentionally outside the canonical range table.
 
 The 2026-07-14 research pass found bundled SQLite 3.50.2 inside the old lockfile, within the WAL-reset bug range documented by SQLite. The baseline now uses `rusqlite 0.40.1` / bundled SQLite 3.53.2 with unneeded default features disabled and an integration test that denies affected engine versions. The deeper concurrent writer/checkpoint reproducer remains backlog item 582 rather than silently expanding M1.
 

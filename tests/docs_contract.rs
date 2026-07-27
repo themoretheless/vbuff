@@ -87,6 +87,23 @@ fn top_docs_share_one_dry_backlog_map() {
 }
 
 #[test]
+fn top_docs_link_every_post_six_hundred_candidate_pass() {
+    for file in TOP_DOCS {
+        let source = read(file);
+        for candidate_file in [
+            "docs/ideas-601-610.md",
+            "docs/ideas-611-620.md",
+            "docs/ideas-621-630.md",
+        ] {
+            assert!(
+                source.contains(candidate_file),
+                "{file} does not link {candidate_file}"
+            );
+        }
+    }
+}
+
+#[test]
 fn top_docs_link_every_complete_implementation_batch() {
     for (ledger_link, expected) in [
         (
@@ -200,6 +217,7 @@ fn research_catalog_has_exact_repository_and_source_ids() {
     for (file, expected) in [
         ("docs/ideas-601-610.md", 601..=610),
         ("docs/ideas-611-620.md", 611..=620),
+        ("docs/ideas-621-630.md", 621..=630),
     ] {
         let candidate_tail = read(file);
         let candidate_lines = candidate_tail
@@ -244,6 +262,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("docs/data-contract-v3.md"));
     assert!(readme.contains("docs/ideas-601-610.md"));
     assert!(readme.contains("docs/ideas-611-620.md"));
+    assert!(readme.contains("docs/ideas-621-630.md"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -281,6 +300,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("Unknown` is a release blocker"));
     assert!(plan.contains("docs/ideas-601-610.md"));
     assert!(plan.contains("docs/ideas-611-620.md"));
+    assert!(plan.contains("docs/ideas-621-630.md"));
     assert!(plan.contains("docs/decision-gates-251-300.md"));
     assert!(plan.contains("docs/decision-gates-301-350.md"));
     assert!(plan.contains("docs/data-contract-v3.md"));
@@ -381,6 +401,8 @@ fn local_markdown_links_resolve() {
         "docs/ideas-401-500.md",
         "docs/ideas-501-600.md",
         "docs/ideas-601-610.md",
+        "docs/ideas-611-620.md",
+        "docs/ideas-621-630.md",
         "docs/repositories-research-100.md",
         "docs/implementation-batch-001-050.md",
         "docs/implementation-batch-051-100.md",

@@ -3,7 +3,7 @@ use std::fmt;
 
 use vbuff_types::{Clip, ClipId};
 
-use crate::secret::detect_secrets;
+use crate::secret::{detect_secrets, is_probable_otp};
 
 const MAX_MACROS: usize = 64;
 const MAX_MACRO_NAME_BYTES: usize = 32;
@@ -422,8 +422,7 @@ fn identity_hash(value: &str, maximum_bytes: usize) -> Option<[u8; 32]> {
 
 fn query_looks_sensitive(query: &str) -> bool {
     let trimmed = query.trim();
-    !detect_secrets(trimmed).is_empty()
-        || ((4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()))
+    !detect_secrets(trimmed).is_empty() || is_probable_otp(trimmed)
 }
 
 #[cfg(test)]
@@ -480,6 +479,7 @@ mod tests {
         let mut history = QueryHistory::new(2);
         assert!(history.remember("urls from browser"));
         assert!(!history.remember("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(!history.remember("verify 1234"));
         assert_eq!(
             history.entries().collect::<Vec<_>>(),
             vec!["urls from browser"]

@@ -285,7 +285,7 @@ Current extraction status:
 6. **Done:** serializable capture-health/notice contracts live below the GUI in `vbuff-types`; the narrow `Diagnostics` publisher carries worker health and redacted command outcomes to popup/tray without coupling capture policy to rendering.
 7. **Done:** the capture worker publishes a monotonic heartbeat; its watchdog surfaces `CaptureHealth::Stalled`, ignores deliberate pause, and allows a later successful read to report recovery.
 8. **Done:** the root process performs bind-or-forward before opening storage or registering a hotkey; an OS-released owner lock serializes recovery, a second launch forwards `ShowPopup`, `Ping` proves liveness, and a stale endpoint is removed and rebound once.
-9. **Done/foundation:** schema v7 owns FTS5 prose/code indexes, structured facets, SimHash/dHash plus normalized text groups, keyset search, Bloom-assisted exact dedup, transactional refcounted CAS, per-kind/collection retention, lifecycle annotations, backup-evidence metadata, import/blob quarantine, versioned export, legal hold, externally keyed grace-record primitives, expiry, content audits, and eligible local embeddings. The live database remains unencrypted. Migration safety copies are temporary and removed after a successful verification; neither they nor backup-evidence metadata constitute a durable backup service.
+9. **Done/foundation:** schema v7 owns FTS5 prose/code indexes, structured facets, SimHash/dHash plus normalized text groups, keyset search, Bloom-assisted exact dedup, transactional refcounted CAS, per-kind/collection retention, lifecycle annotations, backup-evidence metadata, import/blob quarantine, versioned export, legal hold, externally keyed grace-record primitives, expiry, content audits, and eligible local embeddings. Required annotation/residency sidecars fail closed when absent, archive/expiry visibility is shared by ordinary and auxiliary recall, derived-index backfills skip expired rows, and destructive SQL rechecks legal hold plus retention protections atomically. The live database remains unencrypted. Migration safety copies are temporary and removed after a successful verification; neither they nor backup-evidence metadata constitute a durable backup service.
 10. **Done:** hotkey, tray, and second-instance events wake egui directly; a five-second supervisory repaint replaces the former 100 ms resident poll, while the visible popup uses a one-second refresh for expiry and capture state instead of repainting every frame.
 11. **Frozen foundation:** `vbuff-sync` has tested protocol/crypto and focused device-experience modules, but no transport, persistent authenticated identity lifecycle, pairing UI, or runtime integration. It remains inactive until the first native beta passes demand gates; if resumed, one explicit TTL-bound handoff precedes replication.
 12. **Done:** tiered capture supervision, byte-aware backpressure, RSS-aware maintenance, secret detection/clawback, doctor output, process hardening, strict posture, FTS health, and atomic store batches are active in the current root runtime.
@@ -1189,6 +1189,7 @@ Cross-cutting guarantees that back the table: pure behavior runs against the sam
 - [docs/ideas-501-600.md](docs/ideas-501-600.md) - evidence-backed native correctness, Unicode/search, security, local-first sync, and verification ideas 501-600
 - [docs/ideas-601-610.md](docs/ideas-601-610.md) - post-600 evidence-backed candidates outside the active execution goal
 - [docs/ideas-611-620.md](docs/ideas-611-620.md) - second post-600 pass covering invariant-safe state, deterministic evidence, and key lifecycle
+- [docs/ideas-621-630.md](docs/ideas-621-630.md) - third post-600 pass covering monotonic privacy, lifecycle integrity, destructive races, and truthful recovery evidence
 - [docs/repositories-research-100.md](docs/repositories-research-100.md) - 100 high-signal repositories and the primary research/standards evidence catalog
 - [docs/mistakes-top-500.md](docs/mistakes-top-500.md) - 638 competitor anti-patterns and vbuff's fixes
 - [docs/code-audit-top-50.md](docs/code-audit-top-50.md) - top 50 things wrong in the current code, cross-referenced against this document's claims
@@ -1229,7 +1230,7 @@ The backlog is intentionally split instead of duplicated. `architecture.md`, `RE
 | 401-500 | [docs/ideas-401-500.md](docs/ideas-401-500.md) | Current problems, SOLID/DRY refactors, test gaps, designer-grade UX, review hygiene |
 | 501-600 | [docs/ideas-501-600.md](docs/ideas-501-600.md) | Native protocol correctness, international text/search, security, local-first sync, evidence and verification |
 
-The post-600 candidates [601-610](docs/ideas-601-610.md) and [611-620](docs/ideas-611-620.md) remain a separate evidence pool and do not change the canonical 1-600 objective.
+The post-600 candidates [601-610](docs/ideas-601-610.md), [611-620](docs/ideas-611-620.md), and [621-630](docs/ideas-621-630.md) remain a separate evidence pool and do not change the canonical 1-600 objective.
 
 ---
 
