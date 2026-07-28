@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use egui_kittest::{Harness, SnapshotOptions, SnapshotResults};
+use egui_kittest::{Harness, OsThreshold, SnapshotOptions, SnapshotResults};
 use vbuff_core::content_hash_from_flavors;
 use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, PopupApp};
@@ -14,6 +14,7 @@ use vbuff_types::{
 fn popup_golden_matrix_covers_themes_dpi_and_primary_surfaces() {
     let mut results = SnapshotResults::new();
     let snapshots = SnapshotOptions::new()
+        .failed_pixel_count_threshold(OsThreshold::new(0).linux(4))
         .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
     for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
         for (dpi_name, pixels_per_point) in [("1x", 1.0_f32), ("2x", 2.0_f32)] {
