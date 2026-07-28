@@ -6,7 +6,7 @@
 >
 > Sourcing note: [the dated 2026 competitive strategy refresh](docs/competitive-strategy-2026.md) is canonical for positioning and supersedes the old four-corner claim. Competitor mistakes and implementation risks remain grounded in `docs/mistakes-top-500.md`, `docs/pain-points.md`, and the architecture threat/failure tables. Feature catalogs are input evidence, not automatic scope.
 >
-> Execution note: product recommendations describe the **target** unless they explicitly say "current". Items 1-350 are reconciled in the reviewed [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), [batch 201-250](docs/implementation-batch-201-250.md), [batch 251-300](docs/implementation-batch-251-300.md), and [batch 301-350](docs/implementation-batch-301-350.md) ledgers. Stop/go rules live in [decision gates 151-200](docs/decision-gates-151-200.md), [201-250](docs/decision-gates-201-250.md), [251-300](docs/decision-gates-251-300.md), and [301-350](docs/decision-gates-301-350.md); current gaps live in the [public limitation ledger](docs/limitations.md).
+> Execution note: product recommendations describe the **target** unless they explicitly say "current". Items 1-400 are reconciled in the reviewed [batch 001-050](docs/implementation-batch-001-050.md), [batch 051-100](docs/implementation-batch-051-100.md), [batch 101-150](docs/implementation-batch-101-150.md), [batch 151-200](docs/implementation-batch-151-200.md), [batch 201-250](docs/implementation-batch-201-250.md), [batch 251-300](docs/implementation-batch-251-300.md), [batch 301-350](docs/implementation-batch-301-350.md), and [batch 351-400](docs/implementation-batch-351-400.md) ledgers. Stop/go rules live in [decision gates 151-200](docs/decision-gates-151-200.md), [201-250](docs/decision-gates-201-250.md), [251-300](docs/decision-gates-251-300.md), [301-350](docs/decision-gates-301-350.md), and [351-400](docs/decision-gates-351-400.md); current gaps live in the [public limitation ledger](docs/limitations.md).
 
 ## Current implementation snapshot
 
@@ -18,6 +18,8 @@
 - UI preferences persist through the root configuration; reduced motion follows the OS when unset. Unknown configuration keys fail closed instead of silently accepting misspelled security or UI settings.
 - Migration safety copies are temporary and removed only after the upgraded or next-start live store opens fully and passes `quick_check`; a failed open preserves them. Backup-evidence APIs are not a durable rollback or backup service.
 - The native plugin executable protocol has bounded length-prefixed JSON framing but is contract-only. There is no active process host, OS sandbox, installation path, or clipboard grant; all plugin execution remains release-gated.
+- Desktop access/profile/theme, team governance, local RPC/CLI operations, and plugin test/distribution/fetch/supervision types are bounded foundations only. They do not activate native registration, sharing, a daemon/webhook listener, command execution, network fetch, or a plugin process.
+- [Release governance](docs/release-governance.md) defines truthful voting, scorecard, dogfood, release/LTS, security, portability, cutline, and entropy gates. Hosted voting and LTS remain inactive.
 
 ---
 
@@ -294,11 +296,15 @@ Before this dependency-ordered native list, wire the popup to paged DB-backed re
 - `docs/implementation-batch-201-250.md` - workflow, popup design/accessibility, store lifecycle, native/key-provider boundaries, and three review passes
 - `docs/implementation-batch-251-300.md` - everyday runtime UX, device/integration foundations, operations, and three review passes
 - `docs/implementation-batch-301-350.md` - privacy/trust, recall, schema 7 lifecycle, desktop fit, and three review passes
+- `docs/implementation-batch-351-400.md` - desktop policy, team, automation, plugin governance, release policy, and three review passes
 - `docs/decision-gates-151-200.md` - registered kill criteria, owner roles, fallback ladders, and external evidence requirements
 - `docs/decision-gates-201-250.md` - plugin, caret, accessibility, display, and encrypted-recovery activation gates
 - `docs/decision-gates-251-300.md` - native auto-pause, sync/client authority, release evidence, migration, and governance gates
 - `docs/decision-gates-301-350.md` - trust activation, recall persistence, lifecycle mutation, and native desktop evidence gates
+- `docs/decision-gates-351-400.md` - desktop activation, team transport, daemon/CLI, plugin sandbox, and release-operations gates
 - `docs/limitations.md` - versioned current limitations, practical workarounds, and exit evidence
+- `docs/release-governance.md` - roadmap-voting privacy, compatibility, dogfood, release/LTS, portability, cutline, and entropy rules
+- `SECURITY.md` - private vulnerability reporting, response targets, advisory/CVE handling, and disclosure policy
 - `docs/maintainer-handoff.md` - release custody, emergency patch, dependency cadence, sunset, and continuity drill
 - `docs/scope-review.md` - quarterly Promote/Keep/Defer/Cut decisions and cut-line triggers
 - `docs/data-contract-v1.md` - frozen schema/hash/format/IPC fixtures and compatibility process
@@ -336,9 +342,10 @@ Execution follows the user's requested groups of 50. The strategy layer does not
 | 201-250 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-201-250.md); popup/store paths are active while visual pipelines, native caret acquisition, real AT evidence, and durable keystore-backed Undo remain explicit |
 | 251-300 | Reviewed and accepted with explicit per-item status | [Ledger](docs/implementation-batch-251-300.md); everyday popup/store/config paths are active while live sync, external clients, native event adapters, SQLCipher, credentials, and maintainer drills remain explicit |
 | 301-350 | Reviewed implementation/foundation complete | [Ledger](docs/implementation-batch-301-350.md); three iterations and local acceptance checks pass, while native proof, SQLCipher, and plugin-host work remain release gates |
-| 351-600 | Queued | Preserve the canonical priority and evidence links below |
+| 351-400 | Reviewed implementation/foundation complete | [Ledger](docs/implementation-batch-351-400.md); desktop, team, automation, plugin, hosted-service, and release-operation activation gates remain explicit |
+| 401-600 | Queued | Preserve the canonical priority and evidence links below |
 
-The product cut line after the seventh batch is unchanged: finish trustworthy SQLCipher single-machine storage, OS-keystore key delivery, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. Trust, recall, lifecycle, device, and integration contracts reduce later protocol risk; they do not justify turning on a model endpoint, MCP/webhook listener, extension process host, relay, or update fetcher early. The [quarterly scope review](docs/scope-review.md) enforces that boundary.
+The product cut line after the eighth batch is unchanged: finish trustworthy SQLCipher single-machine storage, OS-keystore key delivery, native capture, real compositor evidence, and first-OS dogfood before enabling network replication, third-party code execution, or updater installation. Trust, recall, lifecycle, desktop, team, automation, device, and integration contracts reduce later protocol risk; they do not justify turning on a model endpoint, RPC/webhook listener, extension process host, relay, hosted voting, or update fetcher early. The [quarterly scope review](docs/scope-review.md) enforces that boundary.
 
 ---
 

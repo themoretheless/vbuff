@@ -177,4 +177,46 @@ mod tests {
         .unwrap();
         assert_eq!(placement.physical_origin, PhysicalPoint { x: 401, y: 448 });
     }
+
+    #[test]
+    fn work_area_matrix_handles_negative_origins_docks_and_tiny_displays() {
+        let monitors = [
+            MonitorWorkArea {
+                id: 7,
+                work_area: PhysicalRect {
+                    x: -2_560,
+                    y: 24,
+                    width: 2_560,
+                    height: 1_376,
+                },
+                scale_factor: 1.5,
+            },
+            MonitorWorkArea {
+                id: 8,
+                work_area: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 360,
+                },
+                scale_factor: f32::NAN,
+            },
+        ];
+
+        let left = place_popup(
+            PhysicalPoint { x: -2_500, y: 30 },
+            (560.0, 620.0),
+            &monitors,
+        )
+        .unwrap();
+        assert_eq!(left.monitor_id, 7);
+        assert!(left.physical_origin.x >= -2_560);
+        assert!(left.physical_origin.y >= 24);
+
+        let tiny =
+            place_popup(PhysicalPoint { x: 639, y: 359 }, (820.0, 620.0), &monitors).unwrap();
+        assert_eq!(tiny.monitor_id, 8);
+        assert_eq!(tiny.scale_factor, 1.0);
+        assert_eq!(tiny.physical_origin, PhysicalPoint { x: 0, y: 0 });
+    }
 }

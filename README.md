@@ -121,13 +121,13 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
 | `vbuff-core` | Pure dedup/eviction/classification plus capture, composition, everyday workflow, privacy/AI, embedding, delivery, feedback, and observability policy | Yes (partial) |
 | `vbuff-store` | Bundled SQLite schema v7, FTS5, migrations, sharded CAS, exact/near dedup, lifecycle annotations/quarantine/export contracts, externally keyed recovery primitives, eligible local embeddings, expiry, and audits; SQLCipher/keystore wiring remains a release gate | Yes (partial) |
-| `vbuff-platform` | Current traits, generic `arboard` text-or-image polling/write path, and desktop capability decisions; native per-OS clipboard proof and target-confirmed paste remain target work | Yes (partial) |
+| `vbuff-platform` | Current traits, generic `arboard` text-or-image polling/write path, desktop capability decisions, and disconnected access/profile/theme policy; native per-OS clipboard proof and target-confirmed paste remain target work | Yes (partial) |
 | `vbuff-gui` | Native `eframe` History/Trust/Compose/Settings popup; no browser/WASM target; native assistive-technology evidence remains | Yes (partial) |
 | *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, copy-only selection, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
-| `vbuff-ipc` | Tested handshake, filtered events, scoped tokens, batches, and bounded browser/editor/Vim/automation/MCP/launcher/terminal/webhook contracts; no live daemon dispatch yet | Foundation only |
-| `vbuff-plugin` | Tested native subprocess protocol/consent/typed-plugin contracts, bounded import/export adapters, and four curated recipes; no sandboxed process host or install gallery yet | Foundation only |
-| `vbuff-sync` | Protocol/crypto plus bounded device trust, rehearsal, replay, outbox, retention, travel, handoff, and approval policy; no discovery, transport, persistence, or replication | Foundation only |
+| `vbuff-ipc` | Tested handshake, filtered events, scoped tokens, batches, integrations, and versioned operation/dry-run/rate-limit contracts; no live daemon, CLI, webhook listener, or dispatch yet | Foundation only |
+| `vbuff-plugin` | Tested native subprocess protocol, typed transforms/adapters/recipes, signed action bundles, fetch policy, marketplace metadata, and failure supervision; no sandboxed process host or install gallery yet | Foundation only |
+| `vbuff-sync` | Protocol/crypto plus bounded device and team-governance contracts; no discovery, transport, membership persistence, sharing, or replication | Foundation only |
 | `vbuff-update` | Signed manifests, key rotation, downgrade/replay defense, staged rollout, build attestation, and streaming checksum verification | Foundation + verifier CLI |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
@@ -149,14 +149,14 @@ The repo is intentionally split so you can understand it without loading the who
 8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
 9. **Startup handoff:** read `src/single_instance/mod.rs` for framing/ownership, then `unix.rs` or `windows_fallback.rs` for one transport; this slice owns bind-or-forward, liveness, stale recovery, and cleanup.
 10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
-11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). For device UX, start at the `device_experience.rs` facade and open only `policy.rs`, `outbox.rs`, `travel.rs`, or another focused submodule. It is intentionally not linked into the resident runtime yet.
+11. **Sync foundation:** read `crates/vbuff-sync/src/lib.rs`, then one concern at a time (`clock`, `crdt`, `crypto`, `membership`, `policy`, `merkle`, `ledger`, `capability`, `wire`). For device UX, start at the `device_experience.rs` facade; for team contracts, start at `team/mod.rs`, then open only `approval.rs`, `privacy.rs`, `sharing.rs`, `import.rs`, `audit.rs`, or `policy.rs`. It is intentionally not linked into the resident runtime yet.
 12. **Composition shell:** read `src/app.rs`, then `src/main.rs` last. `app.rs` owns event-driven hotkey/tray/second-instance wakeups; `main.rs` only constructs and starts focused services. A duplicate launch forwards `ShowPopup` to the running instance.
 13. **Reliability and security policy:** read `crates/vbuff-core/src/reliability.rs`, `secret.rs`, and `security_audit.rs`; then read `src/memory_pressure.rs`, `src/maintenance.rs`, and `src/doctor.rs` for the runtime adapters.
-14. **Capability and lifecycle contracts:** read `crates/vbuff-platform/src/capabilities.rs`, `security.rs`, `lifecycle.rs`, `wayland.rs`, and `windows.rs`. These files describe honest fallback decisions; they are not native backend implementations.
-15. **IPC and plugin foundations:** read `crates/vbuff-ipc/src/lib.rs`, then one file in `integration/`; read `crates/vbuff-plugin/src/protocol.rs`, then `manifest.rs`, `recipes.rs`, or `adapter.rs`. Neither crate is connected to an ambient network listener or plugin runtime.
+14. **Capability and desktop policy contracts:** read `crates/vbuff-platform/src/capabilities.rs`, `security.rs`, `lifecycle.rs`, `wayland.rs`, and `windows.rs`; for policy, start at `desktop_policy/mod.rs`, then open only `access.rs`, `hotkey.rs`, `linux.rs`, `profile.rs`, `permission.rs`, or `theme.rs`. These files describe honest fallback and configuration decisions; they are not native backend implementations.
+15. **IPC and plugin foundations:** read `crates/vbuff-ipc/src/lib.rs`, then one file in `integration/` or `operations/`; read `crates/vbuff-plugin/src/protocol.rs`, then `manifest.rs`, one file in `governance/`, `recipes.rs`, or `adapter.rs`. Neither crate is connected to an ambient network listener or plugin runtime.
 16. **Release trust:** read `crates/vbuff-update/src/lib.rs`, then `manifest.rs` and `attestation.rs`; `src/verify.rs` is the narrow offline CLI adapter.
 17. **Delivery evidence:** read `crates/vbuff-core/src/delivery.rs`, `slo.rs`, and [decision-gates-151-200.md](docs/decision-gates-151-200.md); machine/human evidence remains separate from deterministic gate logic.
-18. **Operations and honest claims:** read [limitations.md](docs/limitations.md), [maintainer-handoff.md](docs/maintainer-handoff.md), [scope-review.md](docs/scope-review.md), then `.github/workflows/release-provenance.yml`.
+18. **Operations and honest claims:** read [limitations.md](docs/limitations.md), [release-governance.md](docs/release-governance.md), [SECURITY.md](SECURITY.md), [maintainer-handoff.md](docs/maintainer-handoff.md), [scope-review.md](docs/scope-review.md), then `.github/workflows/release-provenance.yml`.
 
 The SOLID/DRY rule of thumb is simple: data and serializable status/IPC contracts live in `vbuff-types`, pure logic is testable, platform code is behind traits, storage owns SQL, GUI owns presentation, `AppCommand` is the one command vocabulary, single-instance transport stays isolated, and `main.rs` only composes the pieces.
 
@@ -187,7 +187,8 @@ The 600-point review is executed in batches of 50. Each batch gets an item-by-it
 | 201-250 | Implemented/reviewed with power workflows, responsive/a11y UI, schema 6 lifecycle, and native/key-provider gates explicit | [Batch 201-250 ledger](docs/implementation-batch-201-250.md) |
 | 251-300 | Implemented/reviewed with everyday runtime UX, device/integration foundations, and operational evidence boundaries explicit | [Batch 251-300 ledger](docs/implementation-batch-251-300.md) |
 | 301-350 | Implemented/reviewed at runtime, foundation, adapted, or native-required level; release gates remain explicit | [Batch 301-350 ledger](docs/implementation-batch-301-350.md) |
-| 351-600 | Queued in sequential groups of 50 | Canonical range map below |
+| 351-400 | Implemented/reviewed as bounded desktop, team, automation, plugin-governance, and release-policy foundations; activation gates remain explicit | [Batch 351-400 ledger](docs/implementation-batch-351-400.md) |
+| 401-600 | Queued in sequential groups of 50 | Canonical range map below |
 
 "Foundation" is not a synonym for shipped: the `vbuff-sync` algorithms compile and are tested, but the app still has no live sync transport; provenance and generation contracts exist, but `arboard` cannot populate native metadata. The ledger is the source of truth for those distinctions.
 
@@ -328,11 +329,15 @@ The backlog remains research input, not promised scope. Contract-only sync, plug
 - [docs/implementation-batch-201-250.md](docs/implementation-batch-201-250.md) - power-workflow contracts, responsive/accessibility UI, store lifecycle behavior, and three review passes for the fifth batch.
 - [docs/implementation-batch-251-300.md](docs/implementation-batch-251-300.md) - everyday runtime UX, device/integration foundations, operations, and three review passes for the sixth batch.
 - [docs/implementation-batch-301-350.md](docs/implementation-batch-301-350.md) - privacy/trust, recall, schema 7 lifecycle, desktop fit, and three review passes for the seventh batch.
+- [docs/implementation-batch-351-400.md](docs/implementation-batch-351-400.md) - desktop policy, team, automation, plugin governance, release policy, and three review passes for the eighth batch.
 - [docs/decision-gates-151-200.md](docs/decision-gates-151-200.md) - numeric stop/go rules, owner roles, fallback ladders, and external evidence boundaries.
 - [docs/decision-gates-201-250.md](docs/decision-gates-201-250.md) - native caret, assistive-technology, plugin-host, display, and recovery-key gates.
 - [docs/decision-gates-251-300.md](docs/decision-gates-251-300.md) - native auto-pause, live sync/client authority, release evidence, migration, and governance gates.
 - [docs/decision-gates-301-350.md](docs/decision-gates-301-350.md) - trust activation, recall persistence, lifecycle mutation, and native desktop evidence gates.
+- [docs/decision-gates-351-400.md](docs/decision-gates-351-400.md) - desktop activation, team transport, daemon/CLI, plugin sandbox, and release-operations gates.
 - [docs/limitations.md](docs/limitations.md) - versioned current-product limitations, practical workarounds, and exit evidence.
+- [docs/release-governance.md](docs/release-governance.md) - roadmap-voting privacy, compatibility, dogfood, release/LTS, portability, cutline, and entropy rules.
+- [SECURITY.md](SECURITY.md) - private vulnerability reporting, response targets, advisory/CVE handling, and disclosure policy.
 - [docs/maintainer-handoff.md](docs/maintainer-handoff.md) - release custody, emergency patch, dependency cadence, sunset, and handoff drill.
 - [docs/scope-review.md](docs/scope-review.md) - quarterly Promote/Keep/Defer/Cut decisions and the mechanical breadth cut line.
 - [docs/data-contract-v1.md](docs/data-contract-v1.md) - frozen schema/hash/format/IPC fixtures and compatibility procedure.

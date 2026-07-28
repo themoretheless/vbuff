@@ -8,6 +8,7 @@ pub mod dry_run;
 pub mod event;
 pub mod handshake;
 pub mod integration;
+pub mod operations;
 
 pub use api_token::{ApiScope, ApiTokenClaims, ApiTokenError, ApiTokenIssuer};
 pub use batch::{BatchMutation, BatchRequest, BatchResponse};
@@ -31,4 +32,11 @@ pub use integration::{
     SnippetMirrorRecord, TargetedSendRequest, VimRegisterAction, VimRegisterRequest, WebhookEvent,
     WebhookEventKind, WebhookReplayWindow, WebhookSigner, adapt_text_for_editor,
     plan_snippet_mirror, rank_launcher_candidates,
+};
+pub use operations::{
+    BackupCommandPlan, CompletionCandidate, CompletionKind, EventReplayCursor,
+    HeadlessOperationKind, HeadlessOperationPlan, LoopbackWebhookEndpoint, MachineHealthSnapshot,
+    MutationMode, MutationPreview, MutationRequest, OperationContractError, OperationResult,
+    RPC_SCHEMA_VERSION, RateLimitKind, RateLimitPolicy, RpcEnvelope, SanitizedFixtureManifest,
+    ShellCompletionCatalog, TokenRateLimiter,
 };

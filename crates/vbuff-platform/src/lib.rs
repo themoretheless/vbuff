@@ -15,6 +15,7 @@ pub mod capabilities;
 pub mod cf_html;
 mod clipboard;
 pub mod desktop;
+pub mod desktop_policy;
 mod error;
 pub mod format_map;
 pub mod geometry;
@@ -41,6 +42,12 @@ pub use cf_html::{CfHtml, CfHtmlError, parse_cf_html};
 pub use desktop::{
     DesktopShell, LinuxTrayFallback, PastePermissionLevel, PastePermissionSelfCheck,
     QuickMenuLabels, ResidentStatus, current_desktop_shell,
+};
+pub use desktop_policy::{
+    EffectiveDesktopPolicy, HotkeyResolution, LayoutAwareAccelerator, LinuxDesktop,
+    ManagedInstallPolicy, NativeTheme, NativeThemeState, PermissionRepairAction,
+    PermissionRepairKind, PermissionRepairPlan, ProfileLocation, ResidentAccessMode,
+    linux_environment_note, permission_repair_plan, resolve_hotkey_conflict,
 };
 pub use format_map::{FormatFamily, FormatKey, canonical_format};
 pub use keymap::{CanonicalAction, KeyBinding, KeymapTarget, canonical_keymap};
