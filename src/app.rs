@@ -34,6 +34,18 @@ use tray_icon::menu::MenuEvent;
 const SUPERVISORY_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
 const PASTE_REPAINT_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShowOrigin {
+    GlobalHotkey,
+    Unverified,
+}
+
+impl ShowOrigin {
+    const fn may_capture_target(self) -> bool {
+        matches!(self, Self::GlobalHotkey)
+    }
+}
+
 /// Resident services consumed by the eframe event loop.
 pub(crate) struct AppServices {
     pub(crate) history: History,
@@ -208,7 +220,7 @@ impl Runtime {
         let mut popup = PopupApp::new(Arc::clone(&shared));
         popup.set_preferences(config.ui_preferences());
         popup.set_delivery_capabilities(DeliveryCapabilities {
-            automatic_paste: permission.level == PastePermissionLevel::Automatic,
+            automatic_paste: false,
             sensitive_copy: false,
         });
 
@@ -245,6 +257,7 @@ impl Runtime {
         if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
             if self.can_hide_to_resident_surface() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.paste.cancel_target();
                 self.popup.request_hide(&ctx);
             } else {
                 self.quit_requested = true;
@@ -263,7 +276,7 @@ impl Runtime {
             if event.state == global_hotkey::HotKeyState::Pressed
                 && self.hotkey_id == Some(event.id)
             {
-                self.handle(AppCommand::Show, &ctx);
+                self.show_popup(&ctx, ShowOrigin::GlobalHotkey);
             }
         }
 
@@ -326,6 +339,7 @@ impl Runtime {
     }
 
     fn hide_or_quit(&mut self, ctx: &egui::Context) {
+        self.paste.cancel_target();
         if self.can_hide_to_resident_surface() {
             self.popup.request_hide(ctx);
         } else {
@@ -365,11 +379,7 @@ impl Runtime {
 
     fn handle(&mut self, command: AppCommand, ctx: &egui::Context) {
         match command {
-            AppCommand::Show => {
-                if let Ok(mut state) = self.shared.lock() {
-                    state.request_show();
-                }
-            }
+            AppCommand::Show => self.show_popup(ctx, ShowOrigin::Unverified),
             AppCommand::Paste(id) => self.start_paste(id, ctx),
             AppCommand::PasteText { text, sensitive } => {
                 let sensitive = edited_text_requires_sensitive_write(&text, sensitive);
@@ -542,10 +552,28 @@ impl Runtime {
             }
             AppCommand::Hide => self.hide_or_quit(ctx),
             AppCommand::Quit => {
+                self.paste.cancel_target();
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    fn show_popup(&mut self, ctx: &egui::Context, origin: ShowOrigin) {
+        let target_ready = if origin.may_capture_target() {
+            self.paste.prepare_target()
+        } else {
+            self.paste.cancel_target();
+            false
+        };
+        self.popup.set_delivery_capabilities(DeliveryCapabilities {
+            automatic_paste: target_ready,
+            sensitive_copy: false,
+        });
+        if let Ok(mut state) = self.shared.lock() {
+            state.request_show();
+        }
+        ctx.request_repaint();
     }
 
     fn start_paste(&mut self, id: vbuff_types::ClipId, ctx: &egui::Context) {
@@ -743,7 +771,13 @@ fn edited_text_requires_sensitive_write(text: &str, inherited: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::edited_text_requires_sensitive_write;
+    use super::{ShowOrigin, edited_text_requires_sensitive_write};
+
+    #[test]
+    fn only_global_hotkey_summons_may_capture_a_paste_target() {
+        assert!(ShowOrigin::GlobalHotkey.may_capture_target());
+        assert!(!ShowOrigin::Unverified.may_capture_target());
+    }
 
     #[test]
     fn edited_text_preserves_or_redetects_sensitivity() {

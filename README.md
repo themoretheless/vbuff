@@ -2,7 +2,7 @@
 
 **Product direction: right clip, tested format, explicit evidence.**
 
-A native desktop clipboard manager written in Rust. The current executable is an `eframe`/`egui` application only; the web demo, browser UI, and WASM target have been removed. It polls the generic `arboard` backend and can read either text or raw-RGBA image content per observation into a searchable local SQLite history. That SQLite database is not encrypted. Automatic paste is disabled until a native adapter can confirm the destination immediately before injection. Selecting an eligible non-sensitive clip therefore copies it to the OS clipboard for manual paste; sensitive copy is blocked when the backend cannot exclude the write from OS or third-party clipboard history.
+A native desktop clipboard manager written in Rust. The current executable is an `eframe`/`egui` application only; the web demo, browser UI, and WASM target have been removed. It polls the generic `arboard` backend and can read either text or raw-RGBA image content per observation into a searchable local SQLite history. That SQLite database is not encrypted. When summoned by the registered global hotkey on a local macOS or Windows session, vbuff can capture the application active before the popup, hide after selection, restore and re-confirm that application, then inject Cmd/Ctrl+V; every unproven target degrades to copy-only. macOS additionally requires Accessibility permission. Tray/relaunch opening and Linux remain copy-only, and sensitive copy is blocked when the backend cannot exclude the write from OS or third-party clipboard history.
 
 ---
 
@@ -104,7 +104,7 @@ vbuff is designed around one hard rule: **fail closed.** Every uncertainty in "s
 
 vbuff is in active early development. The current product surface is a native `eframe`/`egui` resident application; there is no web UI, browser demo, or WASM build. Generic `arboard` polling observes text or image content, not an atomic native flavor set, and supplies no trustworthy source, concealed, generation, provenance, or OS-history-exclusion evidence. Eligible clips are stored in bundled, **unencrypted** SQLite. `strict_security_mode` may block capture while required protections are unavailable.
 
-The popup can search and manage the local history. Automatic focus restoration and paste injection are disabled until a native target-confirmation adapter exists. An eligible non-sensitive selection is copy-only and must be pasted manually; a sensitive selection is blocked when the OS-history exclusion cannot be proven. Accessibility permission by itself does not enable automatic paste. The shared resident status calls a future successful delivery `PasteSent`; the current generic runtime never emits it.
+The popup can search and manage the local history. On a global-hotkey summon in local macOS and Windows sessions, the runtime captures the previously active application before showing the popup and treats that target as a one-shot capability. After an eligible non-sensitive selection, it stages the clipboard, hides the popup, requests target activation, waits for independent foreground confirmation, verifies the clipboard did not change, and only then injects Cmd/Ctrl+V. Opening from the tray or a repeated launch deliberately stays copy-only because those paths cannot prove that the foreground window is the original editor. A missing permission, unsupported desktop, stale target, failed restoration, or changed clipboard likewise degrades to copy-only or a surfaced failure without injecting. macOS requires Accessibility permission; Linux is currently copy-only. A sensitive selection remains blocked when OS-history exclusion cannot be proven. Native sink-app conformance evidence is still outstanding, so `InjectionSent` must not be described as application acknowledgement.
 
 One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery use a bounded process-only lane instead of SQLite. It holds at most 32 clips, applies hard expiry, never permits pinning or session protection, is rejected by store/import boundaries, and disappears when the process exits. The lane is recallable from History while alive, but it is not durable or crash-recoverable.
 
@@ -114,16 +114,16 @@ Schema 7 and its lifecycle APIs include migration, archive, retention, quarantin
 
 ## Architecture at a glance
 
-vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit-testable on any host without touching the OS. Mock implementations of the four `vbuff-platform` traits are a **target** (not present in the repo yet - [docs/code-audit-top-50.md](docs/code-audit-top-50.md) #34), so today only pure logic is tested; the real clipboard/hotkey/paste code paths have no automated test coverage.
+vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform crates. The cardinal rule: `vbuff-core` contains zero OS-specific code and zero GUI code, so the bulk of the logic is unit-testable on any host without touching the OS. Focused clipboard and confirmed-paste fakes now exercise staging, target restoration, foreground timeout, changed-clipboard blocking, and one-shot target consumption; the reusable four-backend conformance battery and native sink-app tests remain target work.
 
 | Crate | Role | In MVP? |
 |---|---|---|
 | `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
 | `vbuff-core` | Pure dedup/eviction/classification plus capture, composition, everyday workflow, privacy/AI, embedding, delivery, feedback, and observability policy | Yes (partial) |
 | `vbuff-store` | Bundled SQLite schema v7, FTS5, migrations, sharded CAS, exact/near dedup, lifecycle annotations/quarantine/export contracts, externally keyed recovery primitives, eligible local embeddings, expiry, and audits; SQLCipher/keystore wiring remains a release gate | Yes (partial) |
-| `vbuff-platform` | Current traits, generic `arboard` text-or-image polling/write path, desktop capability decisions, and disconnected access/profile/theme policy; native per-OS clipboard proof and target-confirmed paste remain target work | Yes (partial) |
+| `vbuff-platform` | Current traits, generic `arboard` text-or-image polling/write path, macOS/Windows target-confirmed paste adapters, desktop capability decisions, and disconnected access/profile/theme policy; native per-OS clipboard privacy/fidelity proof remains target work | Yes (partial) |
 | `vbuff-gui` | Native `eframe` History/Trust/Compose/Settings popup; no browser/WASM target; native assistive-technology evidence remains | Yes (partial) |
-| *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, commands, copy-only selection, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
+| *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, guarded delivery, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
 | `vbuff-daemon` | Background wiring, IPC server, single-instance guard (as the model splits out) | Later |
 | `vbuff-ipc` | Tested handshake, filtered events, scoped tokens, batches, integrations, and versioned operation/dry-run/rate-limit contracts; no live daemon, CLI, webhook listener, or dispatch yet | Foundation only |
 | `vbuff-plugin` | Tested native subprocess protocol, typed transforms/adapters/recipes, signed action bundles, fetch policy, marketplace metadata, and failure supervision; no sandboxed process host or install gallery yet | Foundation only |
@@ -145,7 +145,7 @@ The repo is intentionally split so you can understand it without loading the who
 4. **Platform ports:** read `crates/vbuff-platform/src/traits.rs` first, then `desktop.rs`, `capabilities.rs`, and `wayland.rs` for truthful shell/fallback decisions; native per-OS backends should hang behind the traits.
 5. **GUI state and rendering:** read `crates/vbuff-gui/src/state.rs`, then `design.rs`, `experience.rs`, `navigation.rs`, `projection.rs`, `media.rs`, `trust_view.rs`, `view.rs`, and finally `app.rs`.
 6. **History boundary:** read `src/history.rs`; it is the only app-layer facade that couples persistent store mutations and the bounded volatile secret lane to refreshed GUI snapshots.
-7. **Resident workflows:** read `crates/vbuff-core/src/capture/` for pure decisions, then `src/capture.rs` for runtime supervision and `src/paste.rs` for guarded clipboard staging. The generic runtime remains copy-only; delayed automatic injection is not active.
+7. **Resident workflows:** read `crates/vbuff-core/src/capture/` for pure decisions, then `src/capture.rs` for runtime supervision, `crates/vbuff-platform/src/confirmed_paste.rs` for native target identity, and `src/paste.rs` for guarded clipboard staging plus restore/confirm/inject sequencing.
 8. **Diagnostics publisher:** read `src/diagnostics.rs`; capture and command handling publish typed status through this narrow boundary instead of depending on GUI internals.
 9. **Startup handoff:** read `src/single_instance/mod.rs` for framing/ownership, then `unix.rs` or `windows_fallback.rs` for one transport; this slice owns bind-or-forward, liveness, stale recovery, and cleanup.
 10. **Shared commands and OS surfaces:** read `src/commands.rs`, then `src/tray.rs` and `src/autostart.rs`.
@@ -260,8 +260,8 @@ The optimized binary is written to `target/release/vbuff`. For day-to-day develo
    - Windows / Linux: **Ctrl + Shift + V**
 3. **Type to filter** the history; matches highlight as you go.
 4. **Navigate** with **Up / Down** (Home / End jump to the ends of the list).
-5. **Press Enter** to copy an eligible non-sensitive selected clip to the OS clipboard, then paste it manually in the destination app.
-6. **Cmd/Ctrl + number (1-9)** quick-picks using the same copy-only rule.
+5. **Press Enter** to deliver the selected eligible non-sensitive clip. On local macOS/Windows with a captured target (and macOS Accessibility permission), vbuff returns to the original application and sends Cmd/Ctrl+V. Otherwise it copies the clip and asks you to paste manually.
+6. **Cmd/Ctrl + number (1-9)** quick-picks using the same target-confirmed delivery rule.
 7. **Pin** an item to keep it at the top and exempt it from eviction; **delete** removes it from history.
 8. Add text clips to **Compose** to edit/reorder a temporary paste stack, name form slots, or merge items as bullets, citations, CSV, or a Markdown table.
 9. Use the **menu-bar / tray icon** to show vbuff, copy the latest clip, clear history, pause/resume capture, toggle start-at-login, or quit.
@@ -279,9 +279,9 @@ vbuff verify --file ./vbuff --sha256 <64-hex-character-release-hash>
 
 For an explicit second-machine setup transfer, `vbuff config handoff export setup.toml` writes the full configuration, including private matchers, with a checksum and owner-only permissions; transfer it through a trusted channel and run `vbuff config handoff apply setup.toml`. Unlike the redacted export, a handoff file is sensitive. Run `vbuff ask --json --limit 10 "meeting link"` for bounded local retrieval over clips whose capture policy explicitly permits AI processing; the current engine is local feature hashing, not a generative model.
 
-The default hotkey is registered at startup. Live rebinding/conflict repair in Settings and cursor-relative popup placement remain target work; today a bind failure degrades visibly and the window manager controls placement. Recall and copy-only selection are keyboard-driven; final paste remains a manual OS/application action.
+The default hotkey is registered at startup. Live rebinding/conflict repair in Settings and cursor-relative popup placement remain target work; today a bind failure degrades visibly and the window manager controls placement. Recall and target-confirmed delivery are keyboard-driven. Linux and any interaction without a verified destination remain manual-paste workflows.
 
-> **Automatic paste is not currently enabled.** macOS Accessibility permission is necessary for future Cmd+V synthesis but is not sufficient: vbuff must also confirm the original destination immediately before injection. Until that native adapter and its evidence exist, every platform remains copy-only. Sensitive copy additionally remains blocked whenever OS-history exclusion cannot be proven.
+> **Automatic paste is capability-gated and hotkey-only.** macOS Accessibility permission is necessary but not sufficient: vbuff must capture the original application on the global-hotkey event, restore it after hiding, and confirm it immediately before Cmd+V. Windows follows the same one-shot target rule. Tray/relaunch opening, any failed proof, all current Linux sessions, and remote/headless sessions degrade to copy-only. Sensitive copy additionally remains blocked whenever OS-history exclusion cannot be proven.
 
 ---
 

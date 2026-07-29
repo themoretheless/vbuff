@@ -8,12 +8,20 @@ use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::content_hash_from_flavors;
 use vbuff_core::intelligence::{PasteGuardDecision, PasteGuardFingerprint};
 use vbuff_platform::{
-    ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, EnigoPaste,
-    PasteBackend, PastePermissionSelfCheck,
+    ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, ConfirmedPaste,
+    ConfirmedPasteBackend, PastePermissionSelfCheck,
 };
 use vbuff_types::{CaptureLineage, ClipId, Flavor};
 
 const PASTE_DELAY: Duration = Duration::from_millis(120);
+const FOCUS_CONFIRM_DELAY: Duration = Duration::from_millis(35);
+const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(350);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingStage {
+    RestoreTarget,
+    ConfirmTarget { deadline: Instant },
+}
 
 /// Result of selecting a clip when paste injection is unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,35 +31,37 @@ pub(crate) enum PasteOutcome {
 }
 
 /// Owns the reusable clipboard writer and paste backend.
-pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = EnigoPaste> {
+pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = ConfirmedPaste> {
     clipboard: Option<C>,
     paste: Option<P>,
     pending_at: Option<Instant>,
+    pending_stage: Option<PendingStage>,
     pending_guard: Option<PasteGuardFingerprint>,
+    target_ready: bool,
     self_writes: Arc<Mutex<SelfWriteLedger>>,
     permission_check: PastePermissionSelfCheck,
 }
 
-impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
+impl PasteCoordinator<ArboardClipboard, ConfirmedPaste> {
     pub(crate) fn system(self_writes: Arc<Mutex<SelfWriteLedger>>) -> Self {
         let session = vbuff_platform::lifecycle::SessionContext::detect();
         let clipboard = ArboardClipboard::new().map_err(|error| {
             tracing::warn!("clipboard writer unavailable: {error}");
             error
         });
-        // Enigo can emit a shortcut, but it cannot prove that focus returned to
-        // the window which was active before vbuff opened. Until a native
-        // target-confirmation adapter is wired, automatic injection fails
-        // closed and selection remains a reliable copy-only workflow.
-        let target_confirmation_available = false;
-        let automatic_paste_allowed = target_confirmation_available
-            && session.input_injection_allowed
-            && session.display_server != vbuff_platform::lifecycle::DisplayServer::Wayland;
-        let paste = automatic_paste_allowed
+        let session_allows_paste = session.input_injection_allowed
+            && !matches!(
+                session.display_server,
+                vbuff_platform::lifecycle::DisplayServer::Wayland
+                    | vbuff_platform::lifecycle::DisplayServer::X11
+                    | vbuff_platform::lifecycle::DisplayServer::Headless
+                    | vbuff_platform::lifecycle::DisplayServer::Unknown
+            );
+        let paste = session_allows_paste
             .then(|| {
-                EnigoPaste::new().map_err(|error| {
+                ConfirmedPaste::new().map_err(|error| {
                     tracing::warn!(
-                        "paste backend unavailable; selections will only be copied: {error}"
+                        "confirmed paste backend unavailable; selections will only be copied: {error}"
                     );
                     error
                 })
@@ -59,11 +69,11 @@ impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
             .transpose()
             .ok()
             .flatten();
-        if !automatic_paste_allowed {
+        if paste.is_none() {
             tracing::info!(
                 display_server = ?session.display_server,
                 remote = session.remote,
-                "automatic paste disabled because the destination window cannot be confirmed"
+                "automatic paste disabled because target confirmation is unavailable"
             );
         }
 
@@ -71,7 +81,7 @@ impl PasteCoordinator<ArboardClipboard, EnigoPaste> {
     }
 }
 
-impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
+impl<C: ClipboardBackend, P: ConfirmedPasteBackend> PasteCoordinator<C, P> {
     #[cfg(test)]
     fn with_backends(clipboard: Option<C>, paste: Option<P>) -> Self {
         Self::with_backends_and_ledger(
@@ -102,7 +112,9 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
             clipboard,
             paste,
             pending_at: None,
+            pending_stage: None,
             pending_guard: None,
+            target_ready: false,
             self_writes,
             permission_check,
         }
@@ -112,13 +124,40 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         self.permission_check
     }
 
+    /// Capture the active application before the popup takes focus.
+    pub(crate) fn prepare_target(&mut self) -> bool {
+        self.cancel_pending();
+        self.target_ready = false;
+        let Some(paste) = self.paste.as_mut() else {
+            return false;
+        };
+        paste.clear_target();
+        match paste.capture_target() {
+            Ok(()) => {
+                self.target_ready = true;
+                true
+            }
+            Err(error) => {
+                tracing::debug!("paste target was not captured: {error}");
+                false
+            }
+        }
+    }
+
+    /// Forget a target when the picker is dismissed without delivery.
+    pub(crate) fn cancel_target(&mut self) {
+        self.target_ready = false;
+        if let Some(paste) = self.paste.as_mut() {
+            paste.clear_target();
+        }
+    }
+
     /// Write a clip without injecting a paste keystroke.
     pub(crate) fn copy(&mut self, flavors: &[Flavor], sensitive: bool) -> anyhow::Result<()> {
         // Any explicit clipboard write supersedes a pending paste. This also
         // guarantees that a failed replacement write cannot leave an older
         // keystroke armed against stale clipboard contents.
-        self.pending_at = None;
-        self.pending_guard = None;
+        self.cancel_pending();
         let clipboard = self
             .clipboard
             .as_mut()
@@ -165,24 +204,34 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
         sensitive: bool,
         now: Instant,
     ) -> anyhow::Result<PasteOutcome> {
-        let guard = self
-            .paste
-            .is_some()
+        let automatic_paste = self.paste.is_some() && std::mem::take(&mut self.target_ready);
+        let guard = match automatic_paste
             .then(|| {
                 PasteGuardFingerprint::from_flavors(flavors)
                     .ok_or_else(|| anyhow!("selected clip cannot be verified before paste"))
             })
-            .transpose()?;
+            .transpose()
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.cancel_target();
+                return Err(error);
+            }
+        };
         let write_started_at = Instant::now();
-        self.copy(flavors, sensitive)?;
+        if let Err(error) = self.copy(flavors, sensitive) {
+            self.cancel_target();
+            return Err(error);
+        }
         let write_duration = Instant::now().saturating_duration_since(write_started_at);
 
         if let Some(guard) = guard {
             self.pending_guard = Some(guard);
+            self.pending_stage = Some(PendingStage::RestoreTarget);
             self.pending_at = Some(now + write_duration + PASTE_DELAY);
             Ok(PasteOutcome::Scheduled)
         } else {
-            self.pending_at = None;
+            self.cancel_target();
             Ok(PasteOutcome::CopiedOnly)
         }
     }
@@ -194,7 +243,58 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
             return None;
         }
 
+        match self.pending_stage? {
+            PendingStage::RestoreTarget => {
+                let restore = self
+                    .paste
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("paste backend unavailable"))
+                    .and_then(|backend| backend.restore_target().context("restoring paste target"));
+                if let Err(error) = restore {
+                    self.cancel_pending();
+                    self.cancel_target();
+                    return Some(Err(error));
+                }
+                self.pending_stage = Some(PendingStage::ConfirmTarget {
+                    deadline: now + FOCUS_CONFIRM_TIMEOUT,
+                });
+                self.pending_at = Some(now + FOCUS_CONFIRM_DELAY);
+                return None;
+            }
+            PendingStage::ConfirmTarget { deadline } => {
+                let foreground = self
+                    .paste
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("paste backend unavailable"))
+                    .and_then(|backend| {
+                        backend
+                            .target_is_foreground()
+                            .context("confirming paste target")
+                    });
+                match foreground {
+                    Ok(true) => {}
+                    Ok(false) if now < deadline => {
+                        self.pending_at = Some(now + FOCUS_CONFIRM_DELAY);
+                        return None;
+                    }
+                    Ok(false) => {
+                        self.cancel_pending();
+                        self.cancel_target();
+                        return Some(Err(anyhow!(
+                            "captured paste target did not become foreground"
+                        )));
+                    }
+                    Err(error) => {
+                        self.cancel_pending();
+                        self.cancel_target();
+                        return Some(Err(error));
+                    }
+                }
+            }
+        }
+
         self.pending_at = None;
+        self.pending_stage = None;
         let expected = self.pending_guard.take();
         let observed = self
             .clipboard
@@ -214,28 +314,38 @@ impl<C: ClipboardBackend, P: PasteBackend> PasteCoordinator<C, P> {
                 expected.compare(observed.as_ref())
             });
         if decision != PasteGuardDecision::Allow {
+            self.cancel_target();
             return Some(Err(anyhow!(
                 "paste guard blocked changed clipboard: {decision:?}"
             )));
         }
-        Some(
-            self.paste
-                .as_mut()
-                .ok_or_else(|| anyhow!("paste backend unavailable"))
-                .and_then(|backend| backend.paste().context("injecting paste keystroke")),
-        )
+        let result = self
+            .paste
+            .as_mut()
+            .ok_or_else(|| anyhow!("paste backend unavailable"))
+            .and_then(|backend| backend.paste().context("injecting paste keystroke"));
+        self.cancel_target();
+        Some(result)
     }
 
     pub(crate) fn wait_duration(&self, now: Instant) -> Option<Duration> {
         self.pending_at
             .map(|due| due.saturating_duration_since(now))
     }
+
+    fn cancel_pending(&mut self) {
+        self.pending_at = None;
+        self.pending_stage = None;
+        self.pending_guard = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vbuff_platform::{CapturedClipboard, PlatformError, Result as PlatformResult};
+    use vbuff_platform::{
+        CapturedClipboard, PasteBackend, PlatformError, Result as PlatformResult,
+    };
 
     struct FakeClipboard {
         fail: bool,
@@ -266,15 +376,46 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakePaste {
         calls: usize,
+        captures: usize,
+        restores: usize,
+        foreground: bool,
+    }
+
+    impl Default for FakePaste {
+        fn default() -> Self {
+            Self {
+                calls: 0,
+                captures: 0,
+                restores: 0,
+                foreground: true,
+            }
+        }
     }
 
     impl PasteBackend for FakePaste {
         fn paste(&mut self) -> PlatformResult<()> {
             self.calls += 1;
             Ok(())
+        }
+    }
+
+    impl ConfirmedPasteBackend for FakePaste {
+        fn clear_target(&mut self) {}
+
+        fn capture_target(&mut self) -> PlatformResult<()> {
+            self.captures += 1;
+            Ok(())
+        }
+
+        fn restore_target(&mut self) -> PlatformResult<()> {
+            self.restores += 1;
+            Ok(())
+        }
+
+        fn target_is_foreground(&mut self) -> PlatformResult<bool> {
+            Ok(self.foreground)
         }
     }
 
@@ -294,8 +435,10 @@ mod tests {
         );
         let now = Instant::now();
 
+        assert!(coordinator.prepare_target());
         coordinator.schedule(&flavors(), false, now).unwrap();
         coordinator.clipboard.as_mut().unwrap().fail = true;
+        assert!(coordinator.prepare_target());
         assert!(coordinator.schedule(&flavors(), false, now).is_err());
         assert_eq!(coordinator.wait_duration(now), None);
         assert!(coordinator.poll(now + PASTE_DELAY).is_none());
@@ -313,14 +456,19 @@ mod tests {
         );
         let now = Instant::now();
 
+        assert!(coordinator.prepare_target());
         assert_eq!(
             coordinator.schedule(&flavors(), false, now).unwrap(),
             PasteOutcome::Scheduled
         );
-        let due = coordinator.pending_at.unwrap();
-        assert!(coordinator.poll(due - PASTE_DELAY / 2).is_none());
-        assert!(coordinator.poll(due).unwrap().is_ok());
-        assert!(coordinator.poll(due).is_none());
+        let restore_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(restore_due - PASTE_DELAY / 2).is_none());
+        assert!(coordinator.poll(restore_due).is_none());
+        let confirm_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(confirm_due).unwrap().is_ok());
+        assert!(coordinator.poll(confirm_due).is_none());
+        assert_eq!(coordinator.paste.as_ref().unwrap().restores, 1);
+        assert_eq!(coordinator.paste.as_ref().unwrap().calls, 1);
     }
 
     #[test]
@@ -343,6 +491,27 @@ mod tests {
     }
 
     #[test]
+    fn backend_without_a_captured_target_degrades_to_copy_only() {
+        let mut coordinator = PasteCoordinator::with_backends(
+            Some(FakeClipboard {
+                fail: false,
+                writes: 0,
+                current: Vec::new(),
+            }),
+            Some(FakePaste::default()),
+        );
+
+        assert_eq!(
+            coordinator
+                .schedule(&flavors(), false, Instant::now())
+                .unwrap(),
+            PasteOutcome::CopiedOnly
+        );
+        assert_eq!(coordinator.clipboard.as_ref().unwrap().writes, 1);
+        assert!(coordinator.pending_at.is_none());
+    }
+
+    #[test]
     fn changed_clipboard_blocks_the_injection_keystroke() {
         let mut coordinator = PasteCoordinator::with_backends(
             Some(FakeClipboard {
@@ -353,15 +522,73 @@ mod tests {
             Some(FakePaste::default()),
         );
         let now = Instant::now();
+        assert!(coordinator.prepare_target());
         coordinator.schedule(&flavors(), false, now).unwrap();
         coordinator.clipboard.as_mut().unwrap().current = vec![Flavor::inline(
             "text/plain",
             b"0x2222222222222222222222222222222222222222".to_vec(),
         )];
 
-        let due = coordinator.pending_at.unwrap();
-        assert!(coordinator.poll(due).unwrap().is_err());
+        let restore_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(restore_due).is_none());
+        let confirm_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(confirm_due).unwrap().is_err());
         assert_eq!(coordinator.paste.as_ref().unwrap().calls, 0);
+    }
+
+    #[test]
+    fn unconfirmed_target_times_out_without_injection() {
+        let mut coordinator = PasteCoordinator::with_backends(
+            Some(FakeClipboard {
+                fail: false,
+                writes: 0,
+                current: Vec::new(),
+            }),
+            Some(FakePaste {
+                foreground: false,
+                ..FakePaste::default()
+            }),
+        );
+        let now = Instant::now();
+        assert!(coordinator.prepare_target());
+        assert_eq!(
+            coordinator.schedule(&flavors(), false, now).unwrap(),
+            PasteOutcome::Scheduled
+        );
+
+        let restore_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(restore_due).is_none());
+        let timeout = restore_due + FOCUS_CONFIRM_DELAY + FOCUS_CONFIRM_TIMEOUT;
+        assert!(coordinator.poll(timeout).unwrap().is_err());
+        assert_eq!(coordinator.paste.as_ref().unwrap().calls, 0);
+        assert!(coordinator.pending_at.is_none());
+    }
+
+    #[test]
+    fn captured_target_is_single_use() {
+        let mut coordinator = PasteCoordinator::with_backends(
+            Some(FakeClipboard {
+                fail: false,
+                writes: 0,
+                current: Vec::new(),
+            }),
+            Some(FakePaste::default()),
+        );
+        let now = Instant::now();
+        assert!(coordinator.prepare_target());
+        coordinator.schedule(&flavors(), false, now).unwrap();
+        let restore_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(restore_due).is_none());
+        let confirm_due = coordinator.pending_at.unwrap();
+        assert!(coordinator.poll(confirm_due).unwrap().is_ok());
+
+        assert_eq!(
+            coordinator
+                .schedule(&flavors(), false, confirm_due)
+                .unwrap(),
+            PasteOutcome::CopiedOnly
+        );
+        assert_eq!(coordinator.paste.as_ref().unwrap().calls, 1);
     }
 
     #[test]
@@ -376,6 +603,7 @@ mod tests {
         );
         let opaque = vec![Flavor::inline("application/octet-stream", vec![0xff, 0xfe])];
 
+        assert!(coordinator.prepare_target());
         assert!(
             coordinator
                 .schedule(&opaque, false, Instant::now())

@@ -12,7 +12,7 @@
 
 - The shipping surface in this repository is native `eframe`/`egui` only. Web/WASM demo and build paths are removed.
 - Clipboard capture is generic `arboard` polling for text or image. Source identity, concealed/private markers, clipboard generation/provenance, atomic flavor enumeration, and OS-history exclusion are unavailable rather than inferred.
-- Automatic paste is disabled until a native adapter confirms the destination immediately before injection. Eligible non-sensitive selections are copy-only; sensitive copy is blocked without proven OS-history exclusion.
+- Global-hotkey summons on local macOS and Windows sessions have a one-shot target-confirmed delivery path: capture before popup focus, hide, restore, re-confirm, verify clipboard, then inject Cmd/Ctrl+V. macOS requires Accessibility permission; tray/relaunch opening, unproven targets, and current Linux sessions are copy-only. Sensitive copy remains blocked without proven OS-history exclusion, and native sink-app conformance evidence is still required.
 - One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery live only in a bounded, hard-expiring process-memory lane. They never enter SQLite/import, cannot be pinned or session-protected, and disappear on exit.
 - The live SQLite database is unencrypted. `strict_security_mode` may block capture while encryption or required native privacy capabilities are unavailable.
 - UI preferences persist through the root configuration; reduced motion follows the OS when unset. Unknown configuration keys fail closed instead of silently accepting misspelled security or UI settings.

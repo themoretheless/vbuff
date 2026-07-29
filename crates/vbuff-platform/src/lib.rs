@@ -14,6 +14,7 @@
 pub mod capabilities;
 pub mod cf_html;
 mod clipboard;
+mod confirmed_paste;
 pub mod desktop;
 pub mod desktop_policy;
 mod error;
@@ -34,7 +35,7 @@ pub mod windows;
 pub use error::PlatformError;
 pub use traits::{
     CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
-    ClipboardWriteReceipt, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
+    ClipboardWriteReceipt, ConfirmedPasteBackend, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
 };
 
 pub use capabilities::{CapabilityLevel, FeatureCapability, SecurityPosture};
@@ -57,6 +58,7 @@ pub use security::{ProcessHardeningReport, harden_current_process};
 pub use tripwire::{ClipboardReadObservation, ScrapeTripwire, TripwireAlert};
 
 pub use clipboard::ArboardClipboard;
+pub use confirmed_paste::ConfirmedPaste;
 pub use hotkey::{GlobalHotkeyBackend, parse_combo};
 pub use paste::EnigoPaste;
 
