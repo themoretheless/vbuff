@@ -4654,6 +4654,39 @@ mod tests {
         );
     }
 
+    /// Reclassification runs unattended on every idle tick and destroys what
+    /// it touches: the searchable text is emptied, every projection nulled,
+    /// facets and embeddings deleted, and a delete timer forced on. Evidence
+    /// that is merely an English word next to some digits must never drive
+    /// it - "error code 1024" and "invoice 4821 paid" are ordinary notes, not
+    /// authenticator codes, and the user cannot get them back.
+    #[test]
+    fn clawback_never_shreds_a_clip_on_lexical_evidence_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let ordinary = [
+            "error code 1024 while opening the project",
+            "discount code SAVE20 valid until 2026",
+            "area code 415 is San Francisco",
+            "verify the invoice 4821 before sending",
+        ];
+        let ids: Vec<_> = ordinary
+            .iter()
+            .map(|text| store.insert(&make_clip(text)).unwrap())
+            .collect();
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(report.reclassified, 0, "ordinary notes were shredded");
+        for (id, text) in ids.iter().zip(ordinary) {
+            assert!(
+                !item_text_of(&store, *id).is_empty(),
+                "{text:?} lost its searchable text"
+            );
+        }
+    }
+
     #[test]
     fn clawback_acts_at_the_reclassification_floor_and_refuses_everything_below_it() {
         let store = Store::open_in_memory().unwrap();

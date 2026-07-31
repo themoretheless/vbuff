@@ -46,9 +46,53 @@ impl SecretFinding {
     /// True when the evidence is strong enough to retroactively downgrade a
     /// clip that is *already stored*. See [`MIN_RECLASSIFY_CONFIDENCE`] for
     /// why this is a separate, stricter question.
+    ///
+    /// Confidence is necessary but not sufficient: the evidence must also be
+    /// structural rather than lexical (see [`SecretKind::is_structural`]).
     #[must_use]
     pub fn justifies_reclassification(self) -> bool {
-        self.confidence >= MIN_RECLASSIFY_CONFIDENCE
+        self.kind.is_structural() && self.confidence >= MIN_RECLASSIFY_CONFIDENCE
+    }
+}
+
+impl SecretKind {
+    /// Whether the evidence for this kind is the *shape of the value itself*
+    /// rather than words that happen to surround it.
+    ///
+    /// A private key header, an `AKIA` prefix, a Luhn-valid card number or a
+    /// JWT's three base64 segments do not occur by accident. A one-time code
+    /// or a recovery code, by contrast, is recognised from an English marker
+    /// near a digit run - and `error code 1024`, `discount code SAVE20` and
+    /// `area code 415` are exactly that shape while being ordinary notes.
+    ///
+    /// Capture may act on either: masking a fresh copy is cheap and the user
+    /// can re-copy. Retroactive reclassification may not, because it empties
+    /// the searchable text of a clip the user has been living with, deletes
+    /// its projections and forces a delete timer, with no undo.
+    /// Whether a finding of this kind with `confidence` may drive retroactive
+    /// reclassification. Test helper for the invariant; production code asks
+    /// [`SecretFinding::justifies_reclassification`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn justifies_reclassification_at(self, confidence: f32) -> bool {
+        SecretFinding {
+            kind: self,
+            confidence,
+        }
+        .justifies_reclassification()
+    }
+
+    #[must_use]
+    pub const fn is_structural(self) -> bool {
+        match self {
+            Self::PrivateKey
+            | Self::CloudCredential
+            | Self::AccessToken
+            | Self::JsonWebToken
+            | Self::PaymentCard
+            | Self::HighEntropy => true,
+            Self::OneTimePassword | Self::RecoveryCode => false,
+        }
     }
 }
 
@@ -642,22 +686,28 @@ mod tests {
         }
     }
 
-    /// Only the entropy detector is meant to sit below the reclassification
-    /// floor. If another kind ever drops under it, a clip would be masked at
-    /// capture time and then quietly skipped by the store scan.
+    /// Exactly two things keep a kind out of retroactive reclassification:
+    /// confidence below the floor (the entropy detector), and evidence that
+    /// is lexical rather than structural (the code detectors, which fire on
+    /// an English marker beside a digit run and so cannot tell "verification
+    /// code 123456" from "error code 1024").
     #[test]
-    fn only_high_entropy_is_below_the_reclassification_floor() {
+    fn reclassification_admits_only_confident_structural_evidence() {
         for kind in ALL_KINDS {
             let finding = detect_secrets(sample_for(kind))
                 .into_iter()
                 .find(|finding| finding.kind == kind)
                 .expect("detector fires on its own sample");
+            let expected = kind.is_structural() && finding.confidence >= MIN_RECLASSIFY_CONFIDENCE;
             assert_eq!(
                 finding.justifies_reclassification(),
-                kind != SecretKind::HighEntropy,
+                expected,
                 "{kind:?} disagrees between capture and reclassification"
             );
         }
+        assert!(!SecretKind::HighEntropy.justifies_reclassification_at(0.72));
+        assert!(!SecretKind::OneTimePassword.justifies_reclassification_at(0.99));
+        assert!(SecretKind::PaymentCard.justifies_reclassification_at(0.90));
     }
 
     #[test]

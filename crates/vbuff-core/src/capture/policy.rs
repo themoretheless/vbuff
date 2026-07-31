@@ -688,11 +688,18 @@ mod tests {
         ));
     }
 
-    /// The gate and the store's clawback scan must reach the same verdict on
-    /// the same text. Bare digit codes were the divergence: masked on the way
-    /// in, invisible to every caller of `detect_secrets` afterwards.
+    /// The gate, the edit path and `detect_secrets` must agree that a code is
+    /// a code. Bare digit runs were the divergence: masked on the way in, and
+    /// invisible to every caller of `detect_secrets` afterwards.
+    ///
+    /// The store's clawback scan is deliberately *not* part of that agreement.
+    /// It abstains on this evidence, because the same rule that recognises
+    /// "your login code is 4821" also recognises "error code 1024", and
+    /// reclassification empties the searchable text of a clip the user has
+    /// been keeping, with no undo. Masking a fresh copy costs a re-copy;
+    /// shredding a stored note costs the note.
     #[test]
-    fn capture_and_stored_reclassification_agree_on_the_same_text() {
+    fn capture_masks_codes_that_reclassification_deliberately_leaves_alone() {
         for sample in ["123456", "4821", "your login code is 4821", "verify 12345"] {
             let captured_sensitive = matches!(
                 decide_text(&CapturePolicy::default(), sample),
@@ -701,15 +708,21 @@ mod tests {
                     ..
                 }
             );
-            let finding = secret::strongest_actionable_secret(sample);
             assert!(captured_sensitive, "gate missed {sample:?}");
             assert!(
-                finding.is_some_and(|finding| finding.justifies_reclassification()),
-                "store scan would skip {sample:?} that the gate masked"
+                secret::strongest_actionable_secret(sample).is_some(),
+                "detector missed {sample:?} the gate masked"
             );
             assert!(
                 text_requires_sensitive_handling(sample),
                 "edit path {sample:?}"
+            );
+            assert!(
+                !secret::detect_secrets(sample)
+                    .iter()
+                    .copied()
+                    .any(secret::SecretFinding::justifies_reclassification),
+                "{sample:?} would be shredded retroactively on lexical evidence"
             );
         }
     }
