@@ -758,15 +758,10 @@ impl Store {
                 ],
             )?;
         }
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             r#"
             UPDATE clips
-            SET preview = '[sensitive]', item_text = '',
-                simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
-                simhash_b2 = NULL, simhash_b3 = NULL,
-                dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                dhash_b2 = NULL, dhash_b3 = NULL,
-                normalized_hash = NULL
+            SET {SENSITIVE_SCRUB_SET}
             WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1;
             DELETE FROM clip_facets
             WHERE clip_id IN (
@@ -778,8 +773,8 @@ impl Store {
                 SELECT content_hash FROM clips
                 WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1
             );
-            "#,
-        )?;
+            "#
+        ))?;
         conn.execute(
             r#"
             UPDATE clips SET item_text = preview
@@ -1013,17 +1008,8 @@ impl Store {
             };
         }
         if effective_meta.sensitive {
-            effective_meta.sync_eligible = false;
-            effective_meta.ai_allowed = false;
-            // Sensitive rows without an explicit TTL still expire: a hard
-            // ceiling keeps persistable secret classes from living in the
-            // plaintext database indefinitely. This covers both the fresh
-            // INSERT and the dedup-bump path below.
-            if effective_meta.expires_at.is_none() {
-                let ceiling = chrono::Duration::from_std(SENSITIVE_TTL_CEILING)
-                    .unwrap_or_else(|_| chrono::Duration::days(1));
-                effective_meta.expires_at = Some(chrono::Utc::now() + ceiling);
-            }
+            // Covers both the fresh INSERT and the dedup-bump path below.
+            tighten_sensitive(&mut effective_meta, None);
         }
         let metadata_json = serde_json::to_string(&StoredMetadata::from(&effective_meta))?;
         let expires_at = effective_meta
@@ -2055,24 +2041,20 @@ impl Store {
                 continue;
             }
             let mut metadata: StoredMetadata = serde_json::from_str(&metadata_json)?;
-            metadata.sensitive = true;
-            metadata.sync_eligible = Some(false);
-            metadata.ai_allowed = false;
-            metadata.expires_at = Some(expires_at);
+            // The clawback TTL is a proposal, not an override: a row that
+            // already expires sooner keeps its shorter lifetime.
+            tighten_sensitive(&mut metadata, Some(expires_at));
+            let row_expiry = metadata.expires_at.unwrap_or(expires_at);
             transaction.execute(
-                r#"
-                UPDATE clips SET metadata_json = ?1, expires_at = ?2,
-                    preview = '[sensitive]', item_text = '',
-                    simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
-                    simhash_b2 = NULL, simhash_b3 = NULL,
-                    dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                    dhash_b2 = NULL, dhash_b3 = NULL,
-                    normalized_hash = NULL
+                &format!(
+                    r#"
+                UPDATE clips SET metadata_json = ?1, expires_at = ?2, {SENSITIVE_SCRUB_SET}
                 WHERE id = ?3
-                "#,
+                "#
+                ),
                 params![
                     serde_json::to_string(&metadata)?,
-                    expires_at.timestamp_millis(),
+                    row_expiry.timestamp_millis(),
                     id
                 ],
             )?;
@@ -2692,12 +2674,19 @@ impl Store {
         Ok(())
     }
 
-    /// Total number of stored clips.
+    /// Total number of stored clips that have not passed their hard expiry.
+    ///
+    /// Read-only by construction: expired rows are filtered by the query
+    /// rather than deleted first, so counting works on a connection opened
+    /// read-only (the doctor path) and never takes a write lock. Deletion of
+    /// expired rows stays with [`Store::purge_expired`], which runs on insert
+    /// and on the idle maintenance tick.
     pub fn count(&self) -> Result<usize> {
-        self.purge_expired()?;
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM clips WHERE expires_at IS NULL OR expires_at > ?1",
+            params![now_millis()],
+            |row| row.get(0),
+        )?;
         Ok(n as usize)
     }
 
@@ -3069,6 +3058,83 @@ impl StoredMetadata {
     }
 }
 
+/// Every column blanked when a row is sensitive: the preview, the searchable
+/// text, and each similarity projection that could correlate the row with
+/// others. Both scrub paths (the sweep at open and the clawback
+/// reclassification) build their SQL from this single list, so a projection
+/// column can never be scrubbed by one path and forgotten by the other.
+pub(crate) const SENSITIVE_SCRUB_SET: &str = "preview = '[sensitive]', item_text = '', \
+     simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL, \
+     simhash_b2 = NULL, simhash_b3 = NULL, \
+     dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL, \
+     dhash_b2 = NULL, dhash_b3 = NULL, \
+     normalized_hash = NULL";
+
+/// A view of a clip's metadata that the sensitive clamp can tighten. Both the
+/// in-memory [`ClipMeta`] and the persisted [`StoredMetadata`] implement it so
+/// every path shares one definition of the invariant.
+pub(crate) trait SensitiveRecord {
+    /// Mark the row sensitive and withdraw it from sync and AI features.
+    fn mark_sensitive(&mut self);
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>);
+}
+
+impl SensitiveRecord for ClipMeta {
+    fn mark_sensitive(&mut self) {
+        self.sensitive = true;
+        self.sync_eligible = false;
+        self.ai_allowed = false;
+    }
+
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at
+    }
+
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>) {
+        self.expires_at = Some(value);
+    }
+}
+
+impl SensitiveRecord for StoredMetadata {
+    fn mark_sensitive(&mut self) {
+        self.sensitive = true;
+        self.sync_eligible = Some(false);
+        self.ai_allowed = false;
+    }
+
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at
+    }
+
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>) {
+        self.expires_at = Some(value);
+    }
+}
+
+/// The privacy invariant of a sensitive row, in one place: it never syncs,
+/// never feeds AI features, and always carries a bounded expiry.
+///
+/// `proposed_expiry` is the lifetime an incoming detection or re-copy
+/// suggests. Expiry merges monotonically, so the shortest bound always wins
+/// and a remaining lifetime can never be stretched or erased; a row left with
+/// no bound at all is capped at [`SENSITIVE_TTL_CEILING`].
+pub(crate) fn tighten_sensitive<T: SensitiveRecord>(
+    record: &mut T,
+    proposed_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    record.mark_sensitive();
+    let merged = match (record.expires_at(), proposed_expiry) {
+        (Some(current), Some(proposed)) => Some(current.min(proposed)),
+        (current, proposed) => current.or(proposed),
+    };
+    record.set_expires_at(merged.unwrap_or_else(|| {
+        chrono::Utc::now()
+            + chrono::Duration::from_std(SENSITIVE_TTL_CEILING)
+                .unwrap_or_else(|_| chrono::Duration::days(1))
+    }));
+}
+
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -3252,6 +3318,63 @@ mod tests {
             pinned: false,
             favorite: false,
         }
+    }
+
+    #[test]
+    fn sensitive_scrub_set_covers_every_correlating_projection() {
+        // Pin test: shrinking the scrub list leaves a projection column that
+        // still correlates a sensitive row with its neighbours. Both scrub
+        // paths build their SQL from this constant, so widening it here is
+        // enough; narrowing it must be a deliberate, visible edit.
+        for column in [
+            "preview = '[sensitive]'",
+            "item_text = ''",
+            "simhash = NULL",
+            "simhash_b0 = NULL",
+            "simhash_b1 = NULL",
+            "simhash_b2 = NULL",
+            "simhash_b3 = NULL",
+            "dhash = NULL",
+            "dhash_b0 = NULL",
+            "dhash_b1 = NULL",
+            "dhash_b2 = NULL",
+            "dhash_b3 = NULL",
+            "normalized_hash = NULL",
+        ] {
+            assert!(
+                SENSITIVE_SCRUB_SET.contains(column),
+                "scrub set lost {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn clawback_never_stretches_an_existing_shorter_ttl() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("token ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        clip.meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(5));
+        let id = store.insert(&clip).unwrap();
+        let before: i64 = store
+            .conn
+            .query_row(
+                "SELECT expires_at FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(report.reclassified, 1);
+        let after: i64 = store
+            .conn
+            .query_row(
+                "SELECT expires_at FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "reclassification stretched the lifetime");
     }
 
     #[test]
@@ -4257,6 +4380,23 @@ mod tests {
         assert_eq!(read_only.doctor().unwrap().clip_rows, 0);
         assert!(!read_only_profile.encryption_enabled);
         assert!(read_only.insert(&make_clip("must fail")).is_err());
+    }
+
+    #[test]
+    fn counting_never_writes_and_still_hides_expired_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("counting.db");
+        let store = Store::open(&path).unwrap();
+        store.insert(&make_clip("live")).unwrap();
+        let mut expired = make_clip("gone");
+        expired.meta.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        store.insert(&expired).unwrap();
+        drop(store);
+
+        let (read_only, _) = Store::open_read_only_profiled(&path).unwrap();
+        // A read-only connection would fail outright if counting still tried
+        // to delete the expired row first.
+        assert_eq!(read_only.count().unwrap(), 1);
     }
 
     #[test]
