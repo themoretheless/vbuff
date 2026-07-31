@@ -3,6 +3,7 @@
 use serde::Serialize;
 use vbuff_types::{SecurityPostureLevel, SecurityPostureSummary};
 
+use crate::lifecycle::{DisplayServer, SessionContext};
 use crate::wayland::{WaylandCapabilities, WaylandFeatureState};
 
 /// The capability vocabulary is owned by `vbuff-types`, which every surface
@@ -45,8 +46,18 @@ pub struct SecurityPosture {
 }
 
 impl SecurityPosture {
-    pub fn detect(strict_mode: bool, core_dumps_blocked: bool, ptrace_blocked: bool) -> Self {
-        let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    /// Derive the posture from the caller's session snapshot.
+    ///
+    /// The session is an argument, not a second detection: the posture the GUI
+    /// badge shows and the session `doctor` prints are then two views of one
+    /// [`SessionContext`], and cannot describe different display servers.
+    pub fn detect(
+        session: &SessionContext,
+        strict_mode: bool,
+        core_dumps_blocked: bool,
+        ptrace_blocked: bool,
+    ) -> Self {
+        let wayland_session = session.display_server == DisplayServer::Wayland;
         let sandbox = detect_sandbox();
         let foreground = if wayland_session {
             capability(
@@ -251,9 +262,74 @@ fn detect_sandbox() -> FeatureCapability {
 mod tests {
     use super::*;
 
+    /// Fixtures name the session explicitly so the assertions describe the
+    /// session under test rather than whatever session the test host happens
+    /// to run in.
+    fn session(display_server: DisplayServer) -> SessionContext {
+        SessionContext {
+            display_server,
+            remote: false,
+            seat: None,
+            input_injection_allowed: !matches!(
+                display_server,
+                DisplayServer::Headless | DisplayServer::Unknown
+            ),
+        }
+    }
+
+    fn detect(
+        strict_mode: bool,
+        core_dumps_blocked: bool,
+        ptrace_blocked: bool,
+    ) -> SecurityPosture {
+        SecurityPosture::detect(
+            &session(DisplayServer::X11),
+            strict_mode,
+            core_dumps_blocked,
+            ptrace_blocked,
+        )
+    }
+
+    /// The posture reads the session it is handed, so a Wayland session gets
+    /// the Wayland capability rows on any host OS - and only then.
+    #[test]
+    fn wayland_capabilities_follow_the_session_argument() {
+        let wayland = SecurityPosture::detect(&session(DisplayServer::Wayland), false, true, true);
+        let features = |posture: &SecurityPosture| {
+            posture
+                .capabilities
+                .iter()
+                .map(|capability| capability.feature.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            features(&wayland)
+                .iter()
+                .any(|f| f == "wayland_paste_injection")
+        );
+        assert_eq!(
+            wayland
+                .capabilities
+                .iter()
+                .find(|capability| capability.feature == "foreground_identity")
+                .map(|capability| capability.level),
+            Some(CapabilityLevel::Unavailable)
+        );
+
+        let x11 = detect(false, true, true);
+        assert!(!features(&x11).iter().any(|f| f.starts_with("wayland_")));
+        assert_eq!(
+            x11.capabilities
+                .iter()
+                .find(|capability| capability.feature == "foreground_identity")
+                .map(|capability| capability.level),
+            Some(CapabilityLevel::Degraded)
+        );
+    }
+
     #[test]
     fn strict_mode_allows_capture_when_required_capabilities_are_active() {
-        let posture = SecurityPosture::detect(true, true, true);
+        let posture = detect(true, true, true);
         assert!(posture.strict_allows_capture());
         assert!(posture.required_capabilities_satisfied());
         assert_eq!(posture.failing_required().count(), 0);
@@ -261,14 +337,14 @@ mod tests {
 
     #[test]
     fn strict_mode_fails_closed_on_failing_required_capability() {
-        let posture = SecurityPosture::detect(true, true, false);
+        let posture = detect(true, true, false);
         assert!(!posture.strict_allows_capture());
         assert!(!posture.required_capabilities_satisfied());
         let failing: Vec<_> = posture.failing_required().collect();
         assert_eq!(failing.len(), 1);
         assert_eq!(failing[0].feature, "ptrace");
 
-        let posture = SecurityPosture::detect(true, false, true);
+        let posture = detect(true, false, true);
         assert!(!posture.strict_allows_capture());
         let failing: Vec<_> = posture.failing_required().collect();
         assert_eq!(failing.len(), 1);
@@ -277,7 +353,7 @@ mod tests {
 
     #[test]
     fn informational_gaps_do_not_block_strict_capture() {
-        let posture = SecurityPosture::detect(true, true, true);
+        let posture = detect(true, true, true);
         let informational_gaps = posture
             .capabilities
             .iter()
@@ -295,25 +371,25 @@ mod tests {
 
     #[test]
     fn non_strict_mode_always_allows_capture() {
-        assert!(SecurityPosture::detect(false, false, false).strict_allows_capture());
-        assert!(!SecurityPosture::detect(false, false, false).required_capabilities_satisfied());
+        assert!(detect(false, false, false).strict_allows_capture());
+        assert!(!detect(false, false, false).required_capabilities_satisfied());
     }
 
     #[test]
     fn posture_level_blocks_only_when_strict_required_capabilities_fail() {
         assert_eq!(
-            SecurityPosture::detect(true, true, false).level(),
+            detect(true, true, false).level(),
             SecurityPostureLevel::Blocked
         );
         assert_eq!(
-            SecurityPosture::detect(false, true, false).level(),
+            detect(false, true, false).level(),
             SecurityPostureLevel::Partial
         );
     }
 
     #[test]
     fn posture_level_protected_is_reachable_and_counters_stay_honest() {
-        let summary = SecurityPosture::detect(true, true, true).summary();
+        let summary = detect(true, true, true).summary();
         assert_eq!(summary.level, SecurityPostureLevel::Protected);
         assert!(summary.strict_mode);
         // Informational gaps never change the verdict, but they are still
@@ -323,7 +399,7 @@ mod tests {
 
     #[test]
     fn summary_counts_every_capability_exactly_once() {
-        let posture = SecurityPosture::detect(false, false, false);
+        let posture = detect(false, false, false);
         let summary = posture.summary();
         assert_eq!(
             usize::from(summary.active + summary.degraded + summary.unavailable),
@@ -333,7 +409,7 @@ mod tests {
 
     #[test]
     fn only_process_hardening_capabilities_are_required() {
-        let posture = SecurityPosture::detect(true, true, true);
+        let posture = detect(true, true, true);
         let required: Vec<&str> = posture
             .capabilities
             .iter()

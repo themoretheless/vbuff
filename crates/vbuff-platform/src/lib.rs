@@ -31,7 +31,7 @@ pub mod windows;
 pub use error::PlatformError;
 pub use traits::{
     CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
-    ClipboardWriteReceipt, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
+    ClipboardWriteReceipt, HotkeyBackend, KeyCombo, Modifier, PasteBackend, WriteOptions,
 };
 
 pub use capabilities::{CapabilityLevel, CapabilitySeverity, FeatureCapability, SecurityPosture};

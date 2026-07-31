@@ -39,7 +39,7 @@ use crate::experience::{
 };
 use crate::navigation::PopupSurface;
 use crate::projection::{FilteredClip, clip_is_expired, filter_clips};
-use crate::state::{SharedState, StarterPack, UiAction};
+use crate::state::{ClipText, RestoredClip, SharedState, StarterPack, UiAction};
 use crate::view::{relative_time, short_app_name};
 
 const QUERY_COMPLETION_ACCEPT_KEYS: [Key; 2] = [Key::Tab, Key::ArrowRight];
@@ -170,6 +170,11 @@ pub struct PopupApp {
     expanded_duplicates: HashSet<ClipId>,
     last_announcement_revision: u64,
     preview_clip_id: Option<ClipId>,
+    /// Content-free session label supplied by the composition layer. The GUI
+    /// deliberately does not probe the environment itself: the platform layer
+    /// owns session detection, and a second reading here is exactly how the
+    /// feedback report and `doctor` would start naming different sessions.
+    session_environment: String,
 }
 
 impl PopupApp {
@@ -214,6 +219,7 @@ impl PopupApp {
             expanded_duplicates: HashSet::new(),
             last_announcement_revision: 0,
             preview_clip_id: None,
+            session_environment: "unknown".into(),
         }
     }
 
@@ -280,6 +286,13 @@ impl PopupApp {
     /// Describe what selecting a row can honestly do on this native backend.
     pub fn set_delivery_capabilities(&mut self, capabilities: DeliveryCapabilities) {
         self.delivery = capabilities;
+    }
+
+    /// Name the session the composition layer detected, for feedback reports.
+    ///
+    /// Must stay content-free: it is copied verbatim into an issue draft.
+    pub fn set_session_environment(&mut self, environment: impl Into<String>) {
+        self.session_environment = environment.into();
     }
 
     /// Open the popup directly on the composition scratchpad.
@@ -2176,7 +2189,7 @@ impl PopupApp {
                                         .clicked()
                                         {
                                             self.actions.push_back(UiAction::PasteText {
-                                                text: text.clone(),
+                                                text: ClipText::new(text.clone()),
                                                 sensitive: false,
                                             });
                                         }
@@ -2259,7 +2272,7 @@ impl PopupApp {
             .clicked()
             {
                 self.actions.push_back(UiAction::PasteText {
-                    text: merged.clone(),
+                    text: ClipText::new(merged.clone()),
                     sensitive: false,
                 });
             }
@@ -2278,7 +2291,7 @@ impl PopupApp {
             version: env!("CARGO_PKG_VERSION").into(),
             os: std::env::consts::OS.into(),
             architecture: std::env::consts::ARCH.into(),
-            session: std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+            session: self.session_environment.clone(),
             capabilities: capabilities
                 .iter()
                 .map(|capability| {
@@ -2414,7 +2427,7 @@ impl PopupApp {
                 .clicked()
             {
                 self.actions.push_back(UiAction::PasteText {
-                    text: output,
+                    text: ClipText::new(output),
                     sensitive: false,
                 });
             }
@@ -2499,7 +2512,7 @@ impl PopupApp {
                         self.actions.push_back(UiAction::Paste(clip.id));
                     } else {
                         self.actions.push_back(UiAction::PasteText {
-                            text: output,
+                            text: ClipText::new(output),
                             sensitive: clip.meta.sensitive,
                         });
                     }
@@ -2569,7 +2582,9 @@ impl PopupApp {
             UndoAction::Stack { item_id, .. } => {
                 let _ = self.paste_stack.remove(item_id);
             }
-            UndoAction::Delete(clip) => self.actions.push_back(UiAction::RestoreClip(clip)),
+            UndoAction::Delete(clip) => self
+                .actions
+                .push_back(UiAction::RestoreClip(RestoredClip::new(clip))),
         }
     }
 
@@ -3528,7 +3543,10 @@ mod tests {
         app.apply_undo();
 
         let actions = app.take_actions();
-        assert_eq!(actions, vec![UiAction::RestoreClip(Box::new(clip))]);
+        assert_eq!(
+            actions,
+            vec![UiAction::RestoreClip(RestoredClip::new(Box::new(clip)))]
+        );
         assert!(!format!("{actions:?}").contains("private deleted value"));
     }
 

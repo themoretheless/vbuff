@@ -713,7 +713,7 @@ fn capture_policy(config: &Config) -> CapturePolicy {
         skip_whitespace_only: config.skip_whitespace_only,
         detect_secrets: config.detect_secrets,
         secret_ttl: Duration::from_secs(config.secret_ttl_seconds.max(1)),
-        unknown_evidence: unknown_evidence_policy(&config.unknown_evidence_policy),
+        unknown_evidence: config.unknown_evidence_policy.into(),
         excluded_apps: config
             .excluded_apps
             .iter()
@@ -721,24 +721,6 @@ fn capture_policy(config: &Config) -> CapturePolicy {
             .cloned()
             .collect(),
         rules,
-    }
-}
-
-/// Map the owner-facing config string to the gate's degradation mode.
-/// `Config::validate` rejects invalid values at load time; this fallback
-/// stays fail-closed (Guard) for any value that bypasses validation.
-fn unknown_evidence_policy(value: &str) -> UnknownEvidencePolicy {
-    match value {
-        "guard" => UnknownEvidencePolicy::Guard,
-        "skip" => UnknownEvidencePolicy::Skip,
-        "allow" => UnknownEvidencePolicy::Allow,
-        other => {
-            tracing::warn!(
-                value = %other,
-                "invalid unknown_evidence_policy; falling back to guard"
-            );
-            UnknownEvidencePolicy::Guard
-        }
     }
 }
 
@@ -902,6 +884,7 @@ fn build_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UnknownEvidenceMode;
     use vbuff_core::capture::SelectionSource;
     use vbuff_types::Flavor;
 
@@ -961,15 +944,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_evidence_policy_maps_from_config_with_guard_fallback() {
-        for (value, expected) in [
-            ("guard", UnknownEvidencePolicy::Guard),
-            ("skip", UnknownEvidencePolicy::Skip),
-            ("allow", UnknownEvidencePolicy::Allow),
-            ("bogus", UnknownEvidencePolicy::Guard),
+    fn unknown_evidence_policy_maps_from_config() {
+        // The out-of-set case that used to need a fail-closed fallback here is
+        // now unrepresentable: `unknown_evidence_policy` is an enum, so a bogus
+        // value is refused while the config file is parsed.
+        for (mode, expected) in [
+            (UnknownEvidenceMode::Guard, UnknownEvidencePolicy::Guard),
+            (UnknownEvidenceMode::Skip, UnknownEvidencePolicy::Skip),
+            (UnknownEvidenceMode::Allow, UnknownEvidencePolicy::Allow),
         ] {
             let config = Config {
-                unknown_evidence_policy: value.into(),
+                unknown_evidence_policy: mode,
                 ..Default::default()
             };
             assert_eq!(capture_policy(&config).unknown_evidence, expected);

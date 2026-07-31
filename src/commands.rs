@@ -1,151 +1,36 @@
 //! Commands shared by the popup, tray, hotkey, and app wiring.
 
-use std::fmt;
-
-use vbuff_core::onboarding::DefaultProfile;
-use vbuff_gui::{StarterPack, UiAction, UiPreferences};
-use vbuff_types::{Clip, ClipId};
+use vbuff_gui::UiAction;
 
 /// One vocabulary for every user-facing command surface.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The popup's own vocabulary is [`UiAction`], carried here verbatim rather
+/// than mirrored variant by variant: the shell only *adds* entries the GUI
+/// cannot produce (a hotkey/tray summon and the tray-only items). Containment
+/// is what keeps the redaction contract single-sourced — `Debug` is derived on
+/// both types, and the only impls that redact live on the content-carrying
+/// newtypes (`vbuff_gui::ClipText`, `vbuff_gui::RestoredClip`), so there is no
+/// second impl here to forget when a variant is added.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppCommand {
+    /// Anything the popup itself can ask for.
+    Ui(UiAction),
+    /// Summon and focus the popup (hotkey, tray, or a duplicate launch).
     Show,
-    Paste(ClipId),
-    PasteText {
-        text: String,
-        sensitive: bool,
-    },
+    /// Copy the most recent clip without opening the popup.
     #[cfg(feature = "tray")]
     CopyLatest,
-    SetPinned(ClipId, bool),
-    SetSessionProtected(ClipId, bool),
-    CreatePlainTextClone(ClipId),
-    Delete(ClipId),
-    RestoreClip(Box<Clip>),
+    /// Ask the popup to raise its clear-history confirmation.
     #[cfg(feature = "tray")]
     RequestClearHistory,
-    ClearHistory,
-    TogglePause,
-    RecoverSkipped,
-    InstallStarterPack(StarterPack),
-    ApplyDefaultProfile(DefaultProfile),
-    SetLaunchAtLogin(bool),
-    SetUiPreferences {
-        preferences: UiPreferences,
-        reduced_motion_changed: bool,
-    },
-    DismissHealthAlert,
-    DismissSizeBudgetAlert,
+    /// Flip launch-at-login from the tray menu.
     #[cfg(feature = "tray")]
     ToggleAutostart,
-    DismissNotice,
-    DismissHotkeyCoachmark,
-    Hide,
-    Quit,
-}
-
-impl fmt::Debug for AppCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Show => formatter.write_str("Show"),
-            Self::Paste(id) => formatter.debug_tuple("Paste").field(id).finish(),
-            Self::PasteText { text, sensitive } => formatter
-                .debug_struct("PasteText")
-                .field("text", &format_args!("[redacted; {} bytes]", text.len()))
-                .field("sensitive", sensitive)
-                .finish(),
-            #[cfg(feature = "tray")]
-            Self::CopyLatest => formatter.write_str("CopyLatest"),
-            Self::SetPinned(id, pinned) => formatter
-                .debug_tuple("SetPinned")
-                .field(id)
-                .field(pinned)
-                .finish(),
-            Self::SetSessionProtected(id, protected) => formatter
-                .debug_tuple("SetSessionProtected")
-                .field(id)
-                .field(protected)
-                .finish(),
-            Self::CreatePlainTextClone(id) => formatter
-                .debug_tuple("CreatePlainTextClone")
-                .field(id)
-                .finish(),
-            Self::Delete(id) => formatter.debug_tuple("Delete").field(id).finish(),
-            Self::RestoreClip(clip) => formatter
-                .debug_struct("RestoreClip")
-                .field("id", &clip.id)
-                .field("kind", &clip.meta.kind)
-                .field("bytes", &clip.meta.byte_size)
-                .finish(),
-            #[cfg(feature = "tray")]
-            Self::RequestClearHistory => formatter.write_str("RequestClearHistory"),
-            Self::ClearHistory => formatter.write_str("ClearHistory"),
-            Self::TogglePause => formatter.write_str("TogglePause"),
-            Self::RecoverSkipped => formatter.write_str("RecoverSkipped"),
-            Self::InstallStarterPack(pack) => formatter
-                .debug_tuple("InstallStarterPack")
-                .field(pack)
-                .finish(),
-            Self::ApplyDefaultProfile(profile) => formatter
-                .debug_tuple("ApplyDefaultProfile")
-                .field(profile)
-                .finish(),
-            Self::SetLaunchAtLogin(enabled) => formatter
-                .debug_tuple("SetLaunchAtLogin")
-                .field(enabled)
-                .finish(),
-            Self::SetUiPreferences {
-                preferences,
-                reduced_motion_changed,
-            } => formatter
-                .debug_struct("SetUiPreferences")
-                .field("preferences", preferences)
-                .field("reduced_motion_changed", reduced_motion_changed)
-                .finish(),
-            Self::DismissHealthAlert => formatter.write_str("DismissHealthAlert"),
-            Self::DismissSizeBudgetAlert => formatter.write_str("DismissSizeBudgetAlert"),
-            #[cfg(feature = "tray")]
-            Self::ToggleAutostart => formatter.write_str("ToggleAutostart"),
-            Self::DismissNotice => formatter.write_str("DismissNotice"),
-            Self::DismissHotkeyCoachmark => formatter.write_str("DismissHotkeyCoachmark"),
-            Self::Hide => formatter.write_str("Hide"),
-            Self::Quit => formatter.write_str("Quit"),
-        }
-    }
 }
 
 impl From<UiAction> for AppCommand {
     fn from(action: UiAction) -> Self {
-        match action {
-            UiAction::Paste(id) => Self::Paste(id),
-            UiAction::PasteText { text, sensitive } => Self::PasteText { text, sensitive },
-            UiAction::SetPinned(id, pinned) => Self::SetPinned(id, pinned),
-            UiAction::SetSessionProtected(id, protected) => {
-                Self::SetSessionProtected(id, protected)
-            }
-            UiAction::CreatePlainTextClone(id) => Self::CreatePlainTextClone(id),
-            UiAction::Delete(id) => Self::Delete(id),
-            UiAction::RestoreClip(clip) => Self::RestoreClip(clip),
-            UiAction::ClearHistory => Self::ClearHistory,
-            UiAction::TogglePause => Self::TogglePause,
-            UiAction::RecoverSkipped => Self::RecoverSkipped,
-            UiAction::InstallStarterPack(pack) => Self::InstallStarterPack(pack),
-            UiAction::ApplyDefaultProfile(profile) => Self::ApplyDefaultProfile(profile),
-            UiAction::SetLaunchAtLogin(enabled) => Self::SetLaunchAtLogin(enabled),
-            UiAction::SetUiPreferences {
-                preferences,
-                reduced_motion_changed,
-            } => Self::SetUiPreferences {
-                preferences,
-                reduced_motion_changed,
-            },
-            UiAction::DismissHealthAlert => Self::DismissHealthAlert,
-            UiAction::DismissSizeBudgetAlert => Self::DismissSizeBudgetAlert,
-            UiAction::DismissNotice => Self::DismissNotice,
-            UiAction::DismissHotkeyCoachmark => Self::DismissHotkeyCoachmark,
-            UiAction::Hide => Self::Hide,
-            UiAction::Quit => Self::Quit,
-        }
+        Self::Ui(action)
     }
 }
 
@@ -154,35 +39,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gui_clear_maps_to_shared_clear_history_command() {
+    fn gui_actions_reach_the_wiring_unchanged() {
         assert_eq!(
             AppCommand::from(UiAction::ClearHistory),
-            AppCommand::ClearHistory
+            AppCommand::Ui(UiAction::ClearHistory)
         );
-    }
-
-    #[test]
-    fn notice_dismissal_stays_a_high_level_command() {
         assert_eq!(
             AppCommand::from(UiAction::DismissNotice),
-            AppCommand::DismissNotice
+            AppCommand::Ui(UiAction::DismissNotice)
         );
-    }
-
-    #[test]
-    fn skipped_capture_recovery_stays_a_high_level_command() {
         assert_eq!(
             AppCommand::from(UiAction::RecoverSkipped),
-            AppCommand::RecoverSkipped
+            AppCommand::Ui(UiAction::RecoverSkipped)
         );
     }
 
     #[test]
     fn composed_text_is_redacted_from_command_debug() {
         let command = AppCommand::from(UiAction::PasteText {
-            text: "private draft".into(),
+            text: vbuff_gui::ClipText::new("private draft"),
             sensitive: true,
         });
+
         assert!(!format!("{command:?}").contains("private draft"));
         assert!(format!("{command:?}").contains("sensitive: true"));
     }
@@ -201,8 +79,23 @@ mod tests {
             pinned: false,
             favorite: false,
         };
-        let command = AppCommand::from(UiAction::RestoreClip(Box::new(clip)));
+        let command = AppCommand::from(UiAction::RestoreClip(vbuff_gui::RestoredClip::new(
+            Box::new(clip),
+        )));
 
         assert!(!format!("{command:?}").contains("private restored value"));
+    }
+
+    /// The shell-only variants exist precisely because the GUI cannot produce
+    /// them; if one ever becomes expressible as a [`UiAction`] it belongs in
+    /// the GUI crate instead of here.
+    #[test]
+    fn shell_only_commands_stay_outside_the_gui_vocabulary() {
+        assert_ne!(AppCommand::Show, AppCommand::from(UiAction::Hide));
+        #[cfg(feature = "tray")]
+        assert_ne!(
+            AppCommand::RequestClearHistory,
+            AppCommand::from(UiAction::ClearHistory)
+        );
     }
 }

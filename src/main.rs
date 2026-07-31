@@ -85,13 +85,18 @@ fn main() -> anyhow::Result<()> {
         };
 
     let config = Config::load_or_create().context("loading config")?;
+    // One session snapshot for the whole resident process. Everything that
+    // needs to know what kind of session this is - capability posture, paste
+    // permission, the GUI feedback report - is handed this value instead of
+    // detecting again, so those surfaces cannot describe different sessions.
+    let session_context = vbuff_platform::lifecycle::SessionContext::current();
     let security_posture = vbuff_platform::SecurityPosture::detect(
+        session_context,
         config.strict_security_mode,
         process_hardening.core_dumps_blocked,
         process_hardening.ptrace_blocked,
     );
     let strict_capture_blocked = !security_posture.strict_allows_capture();
-    let session_context = vbuff_platform::lifecycle::SessionContext::detect();
     let remote_auto_paused = config.auto_pause_remote && session_context.remote;
     tracing::info!(?config.hotkey, config.poll_interval_ms, "vbuff starting");
     if let Err(error) = autostart::set_enabled(config.launch_at_login) {
@@ -203,6 +208,7 @@ fn main() -> anyhow::Result<()> {
         paused,
         config,
         self_writes,
+        session: session_context,
         strict_capture_blocked,
         automatic_pause_reason: remote_auto_paused.then_some(CapturePauseReason::RemoteControl),
         hotkey_registered: hotkey_id.is_some(),
