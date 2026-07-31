@@ -368,7 +368,9 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(CapturePauseReason::RemoteControl))
+            Some(AutoPauseTransition::Pause(
+                CapturePauseReason::RemoteControl
+            ))
         );
         assert_eq!(
             controller.observe(AutoPauseSignals::default(), false),

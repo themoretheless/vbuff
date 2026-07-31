@@ -31,8 +31,6 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// Maximum number of clips to retain (count cap).
     pub max_history: usize,
-    /// Paste modifier: `"cmd"` or `"ctrl"`. Empty/auto = OS default.
-    pub paste_modifier: String,
     /// Source apps to exclude from capture (matched as a substring of the
     /// source-app identifier). Stub-honored in the MVP.
     pub excluded_apps: Vec<String>,
@@ -94,7 +92,6 @@ impl fmt::Debug for Config {
             .field("hotkey", &self.hotkey)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("max_history", &self.max_history)
-            .field("paste_modifier", &self.paste_modifier)
             .field("excluded_app_count", &self.excluded_apps.len())
             .field("source_rule_count", &self.source_rules.len())
             .field("skip_whitespace_only", &self.skip_whitespace_only)
@@ -130,7 +127,6 @@ impl Default for Config {
             hotkey: default_hotkey().to_string(),
             poll_interval_ms: 300,
             max_history: 500,
-            paste_modifier: String::new(),
             excluded_apps: Vec::new(),
             source_rules: Vec::new(),
             skip_whitespace_only: true,
@@ -199,6 +195,10 @@ pub struct ShareableConfig {
     pub hotkey: String,
     pub poll_interval_ms: u64,
     pub max_history: usize,
+    /// Inert legacy field. Paste injection resolves its modifier from the
+    /// platform, never from configuration, so this value is neither applied
+    /// nor produced; it stays on the wire only so schema-2 exports written by
+    /// older builds keep importing (`deny_unknown_fields`).
     pub paste_modifier: String,
     pub skip_whitespace_only: bool,
     pub detect_secrets: bool,
@@ -336,7 +336,7 @@ impl Config {
             hotkey: self.hotkey.clone(),
             poll_interval_ms: self.poll_interval_ms,
             max_history: self.max_history,
-            paste_modifier: self.paste_modifier.clone(),
+            paste_modifier: String::new(),
             skip_whitespace_only: self.skip_whitespace_only,
             detect_secrets: self.detect_secrets,
             secret_ttl_seconds: self.secret_ttl_seconds,
@@ -359,7 +359,6 @@ impl Config {
         self.hotkey = shared.hotkey;
         self.poll_interval_ms = shared.poll_interval_ms;
         self.max_history = shared.max_history;
-        self.paste_modifier = shared.paste_modifier;
         self.skip_whitespace_only = shared.skip_whitespace_only;
         self.detect_secrets = shared.detect_secrets;
         self.secret_ttl_seconds = shared.secret_ttl_seconds;
@@ -526,6 +525,8 @@ impl ShareableConfig {
                 && self.memory_hard_limit_mb <= 1024 * 1024,
             "invalid memory limits"
         );
+        // Inert, but still vetted: a schema-2 export carrying garbage here is
+        // malformed regardless of the fact that nothing consumes the value.
         anyhow::ensure!(
             matches!(self.paste_modifier.as_str(), "" | "auto" | "cmd" | "ctrl"),
             "invalid paste modifier"
@@ -784,7 +785,6 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "hotkey",
         "poll_interval_ms",
         "max_history",
-        "paste_modifier",
         "excluded_apps",
         "source_rules",
         "skip_whitespace_only",
@@ -810,6 +810,11 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "ui_motion_inspector",
         "ui_show_health_digest",
     ];
+    // Keys older builds wrote that no longer map to anything. They are still
+    // accepted so an existing config.toml keeps loading, and they disappear
+    // the next time the file is rewritten. `paste_modifier` never reached the
+    // paste path: injection resolves its modifier from the platform.
+    const RETIRED_CONFIG_KEYS: &[&str] = &["paste_modifier"];
     const SOURCE_RULE_KEYS: &[&str] = &["app_contains", "title_regex", "url_host_suffix", "action"];
 
     let table = value
@@ -817,7 +822,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("config must be a TOML table"))?;
     for key in table.keys() {
         anyhow::ensure!(
-            CONFIG_KEYS.contains(&key.as_str()),
+            CONFIG_KEYS.contains(&key.as_str()) || RETIRED_CONFIG_KEYS.contains(&key.as_str()),
             "unknown config key `{key}`"
         );
     }
@@ -931,6 +936,21 @@ mod tests {
         assert_eq!(cfg.launch_at_login, back.launch_at_login);
         assert_eq!(cfg.unknown_evidence_policy, back.unknown_evidence_policy);
         assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn retired_paste_modifier_key_still_loads_but_no_longer_exists() {
+        // The knob never reached the paste path, so it was dropped from the
+        // model. An existing config that still carries it must keep loading
+        // rather than failing as an unknown key.
+        let text = "schema_version = 2\npaste_modifier = \"cmd\"\n";
+        let parsed = parse_runtime_config(text).unwrap();
+        parsed.validate().unwrap();
+        // The value is gone from the runtime model: exporting no longer
+        // claims a modifier preference the paste path would ignore.
+        assert_eq!(parsed.shareable().paste_modifier, "");
+        // Real typos are still rejected.
+        assert!(parse_runtime_config("schema_version = 2\npaste_modifer = \"cmd\"\n").is_err());
     }
 
     #[test]

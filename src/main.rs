@@ -32,14 +32,9 @@ use anyhow::Context as _;
 use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::trust::{PrivacyPostureInput, PrivacyScore};
 use vbuff_gui::{AppState, SharedState};
-use vbuff_platform::{
-    CapabilityLevel, CapabilitySeverity, GlobalHotkeyBackend, HotkeyBackend, parse_combo,
-};
+use vbuff_platform::{CapabilityLevel, GlobalHotkeyBackend, HotkeyBackend, parse_combo};
 use vbuff_store::Store;
-use vbuff_types::{
-    CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CapturePauseReason, ClientIntent,
-    SecurityPostureLevel, SecurityPostureSummary,
-};
+use vbuff_types::{CapturePauseReason, ClientIntent};
 
 use config::Config;
 use diagnostics::Diagnostics;
@@ -129,8 +124,8 @@ fn main() -> anyhow::Result<()> {
     if !background_launch {
         initial_state.request_show();
     }
-    initial_state.security_posture = summarize_security_posture(&security_posture);
-    initial_state.capabilities = summarize_capabilities(&security_posture);
+    initial_state.security_posture = security_posture.summary();
+    initial_state.capabilities = security_posture.capabilities.clone();
     initial_state.privacy_score = Some(PrivacyScore::calculate(privacy_posture_input(
         &config,
         &security_posture,
@@ -217,60 +212,6 @@ fn main() -> anyhow::Result<()> {
     app_result
 }
 
-fn summarize_capabilities(posture: &vbuff_platform::SecurityPosture) -> Vec<CapabilityView> {
-    posture
-        .capabilities
-        .iter()
-        .map(|capability| CapabilityView {
-            feature: capability.feature.clone(),
-            level: match capability.level {
-                CapabilityLevel::Active => CapabilityViewLevel::Active,
-                CapabilityLevel::Degraded => CapabilityViewLevel::Degraded,
-                CapabilityLevel::Unavailable => CapabilityViewLevel::Unavailable,
-                CapabilityLevel::NotApplicable => CapabilityViewLevel::NotApplicable,
-            },
-            detail: capability.detail.clone(),
-            severity: match capability.severity {
-                CapabilitySeverity::RequiredForCapture => {
-                    CapabilityViewSeverity::RequiredForCapture
-                }
-                CapabilitySeverity::Informational => CapabilityViewSeverity::Informational,
-            },
-        })
-        .collect()
-}
-
-fn summarize_security_posture(posture: &vbuff_platform::SecurityPosture) -> SecurityPostureSummary {
-    let mut summary = SecurityPostureSummary {
-        strict_mode: posture.strict_mode,
-        ..SecurityPostureSummary::default()
-    };
-    for capability in &posture.capabilities {
-        match capability.level {
-            CapabilityLevel::Active | CapabilityLevel::NotApplicable => {
-                summary.active = summary.active.saturating_add(1);
-            }
-            CapabilityLevel::Degraded => {
-                summary.degraded = summary.degraded.saturating_add(1);
-            }
-            CapabilityLevel::Unavailable => {
-                summary.unavailable = summary.unavailable.saturating_add(1);
-            }
-        }
-    }
-    // The level is driven by capture-gating (required) capabilities only;
-    // informational gaps stay visible in the counters but never force
-    // Partial or Blocked on their own.
-    summary.level = if posture.strict_mode && !posture.strict_allows_capture() {
-        SecurityPostureLevel::Blocked
-    } else if posture.required_capabilities_satisfied() {
-        SecurityPostureLevel::Protected
-    } else {
-        SecurityPostureLevel::Partial
-    };
-    summary
-}
-
 fn privacy_posture_input(
     config: &Config,
     posture: &vbuff_platform::SecurityPosture,
@@ -303,30 +244,5 @@ fn privacy_posture_input(
         sync_enabled: false,
         denied_source_count,
         retention_days: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn posture_summary_blocks_only_when_strict_required_capabilities_fail() {
-        let blocked =
-            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(true, true, false));
-        assert_eq!(blocked.level, SecurityPostureLevel::Blocked);
-
-        let non_strict =
-            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(false, true, false));
-        assert_eq!(non_strict.level, SecurityPostureLevel::Partial);
-    }
-
-    #[test]
-    fn posture_summary_protected_is_reachable() {
-        let summary =
-            summarize_security_posture(&vbuff_platform::SecurityPosture::detect(true, true, true));
-        assert_eq!(summary.level, SecurityPostureLevel::Protected);
-        // Informational gaps are still counted globally.
-        assert!(summary.degraded > 0 || summary.unavailable > 0);
     }
 }

@@ -9,13 +9,10 @@ use vbuff_types::{
 use crate::secret::{SecretKind, detect_secrets};
 use crate::trust::{handling_for_secret, sensitivity_reason_for_secret};
 
-/// Clipboard source being evaluated by the capture gate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SelectionSource {
-    #[default]
-    Clipboard,
-    Primary,
-}
+/// Clipboard source being evaluated by the capture gate. The vocabulary is
+/// owned by `vbuff-types` so the platform backends that report a selection
+/// and the gate that judges it cannot drift apart.
+pub use vbuff_types::SelectionSource;
 
 /// A policy action resolved before content is persisted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -279,9 +276,7 @@ impl CapturePolicy {
         }
         match input.concealment {
             ConcealmentSignal::Concealed => return CaptureDecision::Skip(DropReason::Concealed),
-            ConcealmentSignal::Unknown
-                if self.unknown_evidence == UnknownEvidencePolicy::Skip =>
-            {
+            ConcealmentSignal::Unknown if self.unknown_evidence == UnknownEvidencePolicy::Skip => {
                 return CaptureDecision::Skip(DropReason::ConcealmentUnknown);
             }
             // `Unknown` concealment is the permanent state of the generic
@@ -830,7 +825,10 @@ mod tests {
 
     #[test]
     fn new_drop_reasons_are_intentional_and_named_stably() {
-        assert_eq!(DropReason::ProvenanceUnknown.class(), DropClass::Intentional);
+        assert_eq!(
+            DropReason::ProvenanceUnknown.class(),
+            DropClass::Intentional
+        );
         assert_eq!(
             DropReason::ConcealmentUnknown.class(),
             DropClass::Intentional

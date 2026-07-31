@@ -165,9 +165,7 @@ fn expired_sensitive_clip_is_scrubbed_from_database_and_wal() {
     {
         let inspection = rusqlite::Connection::open(&db).unwrap();
         let stored: Option<Vec<u8>> = inspection
-            .query_row("SELECT normalized_hash FROM clips", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT normalized_hash FROM clips", [], |row| row.get(0))
             .unwrap();
         assert!(stored.is_none(), "sensitive row kept a normalized_hash");
     }

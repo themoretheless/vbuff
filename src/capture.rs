@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use vbuff_core::capture::{
     AdaptivePollScheduler, CaptureAction, CaptureDecision, CaptureInput, CaptureLossLedger,
     CaptureOutcome, CapturePolicy, CaptureRule, DropClass, DropReason, GenerationObservation,
-    GenerationTracker, PollObservation, SelectionSource, SelfWriteLedger, SkippedCapture,
-    SkippedCaptureRing, SourcePredicate, SubsystemBudget, UnknownEvidencePolicy,
-    annotate_integrity, prune_redundant_flavors, verify_integrity,
+    GenerationTracker, PollObservation, SelfWriteLedger, SkippedCapture, SkippedCaptureRing,
+    SourcePredicate, SubsystemBudget, UnknownEvidencePolicy, annotate_integrity,
+    prune_redundant_flavors, verify_integrity,
 };
 use vbuff_core::observability::RedactedClipFields;
 use vbuff_core::reliability::{
@@ -18,7 +18,7 @@ use vbuff_core::reliability::{
     RecoveryAction, SupervisorObservation, shed_to_text_preview,
 };
 use vbuff_core::{content_hash_from_flavors, detect_kind};
-use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend, ClipboardSelection};
+use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend};
 use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta, NoticeLevel, ProvenanceConfidence};
 
 use crate::config::{Config, SourceRuleAction};
@@ -413,10 +413,7 @@ fn run_worker(
         let policy_input = CaptureInput {
             flavors: &captured.flavors,
             provenance: &captured.provenance,
-            source: match captured.selection {
-                ClipboardSelection::Clipboard => SelectionSource::Clipboard,
-                ClipboardSelection::Primary => SelectionSource::Primary,
-            },
+            source: captured.selection,
             primary_intended: captured.primary_intended,
             coherent_generation: captured.coherent_generation,
             concealment: captured.concealment,
@@ -879,6 +876,7 @@ fn build_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vbuff_core::capture::SelectionSource;
     use vbuff_types::Flavor;
 
     fn captured(text: &str, source_app: Option<&str>) -> CapturedClipboard {
@@ -1038,7 +1036,10 @@ mod tests {
             state.read_succeeded(),
             Some(CaptureHealth::DegradedSourcePrivacy)
         );
-        assert_eq!(state.store_succeeded(), CaptureHealth::DegradedSourcePrivacy);
+        assert_eq!(
+            state.store_succeeded(),
+            CaptureHealth::DegradedSourcePrivacy
+        );
         assert_eq!(
             state.read_succeeded(),
             Some(CaptureHealth::DegradedSourcePrivacy)
@@ -1047,7 +1048,10 @@ mod tests {
         // A storage failure still dominates while it is unresolved.
         assert_eq!(state.store_failed(), CaptureHealth::StorageError);
         assert_eq!(state.read_succeeded(), None);
-        assert_eq!(state.store_succeeded(), CaptureHealth::DegradedSourcePrivacy);
+        assert_eq!(
+            state.store_succeeded(),
+            CaptureHealth::DegradedSourcePrivacy
+        );
     }
 
     #[test]

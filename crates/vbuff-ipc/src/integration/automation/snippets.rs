@@ -197,7 +197,8 @@ impl SnippetBridgeCursor {
     /// mismatch (tampered, stale, or legacy empty manifest) is fail-closed
     /// treated as "no base", which degrades the plan to conflicts.
     pub fn trusted_manifest(&self) -> Option<&SnippetSyncManifest> {
-        if self.manifest.validate().is_ok() && self.manifest.compute_hash() == self.last_manifest_hash
+        if self.manifest.validate().is_ok()
+            && self.manifest.compute_hash() == self.last_manifest_hash
         {
             Some(&self.manifest)
         } else {
@@ -294,9 +295,7 @@ pub fn plan_snippet_mirror(
                     // Re-add after a tombstone or a brand-new key: target is
                     // provably unchanged (it holds nothing), so nothing is
                     // overwritten by the upsert.
-                    Some(SnippetSyncedState::Deleted) | None => {
-                        SnippetMirrorAction::UpsertTarget
-                    }
+                    Some(SnippetSyncedState::Deleted) | None => SnippetMirrorAction::UpsertTarget,
                 };
                 (action, left.revision, 0)
             }

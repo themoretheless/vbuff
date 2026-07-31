@@ -1,6 +1,6 @@
 //! One-shot tokens for x-callback-style `vbuff://` automation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -17,6 +17,10 @@ const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_TOKEN_BYTES: usize = 2 * 1024;
 const MAX_CALLBACK_BYTES: usize = 2 * 1024;
 const MAX_TTL_MS: u64 = 10 * 60 * 1_000;
+/// Hard ceiling on live replay entries, mirroring `MAX_REMOTE_REPLAY_ENTRIES`
+/// in `integration::automation::remote`. Reaching it fails closed: a fresh
+/// token is refused rather than silently accepted without a replay record.
+const MAX_CALLBACK_REPLAY_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +147,8 @@ pub enum CallbackError {
     TargetMismatch,
     #[error("callback token has already been consumed")]
     Replayed,
+    #[error("callback replay window is saturated")]
+    ReplayWindowFull,
     #[error("callback token lifetime is invalid")]
     InvalidTtl,
     #[error("randomness is unavailable")]
@@ -151,7 +157,13 @@ pub enum CallbackError {
 
 pub struct CallbackTokenIssuer {
     key: [u8; 32],
-    consumed: BTreeSet<[u8; 16]>,
+    /// Nonces of consumed tokens keyed to the expiry of the token that carried
+    /// them, so the window can drop an entry the moment it stops mattering.
+    consumed: BTreeMap<[u8; 16], u64>,
+    /// Highest `now_ms` ever observed by [`Self::verify_and_consume`]. Time is
+    /// clamped to this floor so a rewound caller clock cannot make an already
+    /// evicted token look fresh again (see the eviction argument there).
+    clock_floor_ms: u64,
 }
 
 impl CallbackTokenIssuer {
@@ -164,7 +176,8 @@ impl CallbackTokenIssuer {
     pub fn from_key(key: [u8; 32]) -> Self {
         Self {
             key,
-            consumed: BTreeSet::new(),
+            consumed: BTreeMap::new(),
+            clock_floor_ms: 0,
         }
     }
 
@@ -190,12 +203,38 @@ impl CallbackTokenIssuer {
         encode(&self.key, &claims)
     }
 
+    /// Verifies a one-shot token and burns its nonce.
+    ///
+    /// Retention of the replay window is exactly the validity window of each
+    /// token, never shorter: an entry is stored under the token's
+    /// `expires_at_ms` and dropped only once `now_ms >= expires_at_ms`, which
+    /// is precisely the point where the same token starts failing the
+    /// freshness check with [`CallbackError::Expired`]. So eviction can never
+    /// resurrect a token:
+    ///
+    /// * while `now_ms < expires_at_ms` the entry is still present and the
+    ///   replay is refused with [`CallbackError::Replayed`];
+    /// * once the entry is evicted, `now_ms >= expires_at_ms` held at that
+    ///   moment, and `now_ms` is clamped to a non-decreasing floor, so every
+    ///   later call refuses the token with [`CallbackError::Expired`].
+    ///
+    /// The clamp matters because eviction is the only thing that makes replay
+    /// rejection depend on the clock; without it a caller whose wall clock
+    /// jumped backwards could re-present an already forgotten nonce inside a
+    /// re-opened validity window.
+    ///
+    /// Memory is therefore bounded by the issuance rate over `MAX_TTL_MS`, and
+    /// hard-capped by `MAX_CALLBACK_REPLAY_ENTRIES` fail-closed.
     pub fn verify_and_consume(
         &mut self,
         token: &str,
         target: &CallbackTarget,
         now_ms: u64,
     ) -> Result<(), CallbackError> {
+        self.clock_floor_ms = self.clock_floor_ms.max(now_ms);
+        let now_ms = self.clock_floor_ms;
+        self.consumed
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
         let claims = decode(&self.key, token)?;
         if now_ms < claims.issued_at_ms || now_ms >= claims.expires_at_ms {
             return Err(CallbackError::Expired);
@@ -203,9 +242,13 @@ impl CallbackTokenIssuer {
         if claims.target_hash != target.binding_hash()? {
             return Err(CallbackError::TargetMismatch);
         }
-        if !self.consumed.insert(claims.nonce) {
+        if self.consumed.contains_key(&claims.nonce) {
             return Err(CallbackError::Replayed);
         }
+        if self.consumed.len() >= MAX_CALLBACK_REPLAY_ENTRIES {
+            return Err(CallbackError::ReplayWindowFull);
+        }
+        self.consumed.insert(claims.nonce, claims.expires_at_ms);
         Ok(())
     }
 }
@@ -329,6 +372,98 @@ mod tests {
             CallbackTarget::new(TransformAction::Trim, "https://", None),
             Err(CallbackError::UnsafeCallback)
         );
+    }
+
+    fn window_target() -> CallbackTarget {
+        CallbackTarget::new(TransformAction::Trim, "bear://x-callback-url/create", None).unwrap()
+    }
+
+    #[test]
+    fn replay_entries_are_evicted_once_they_leave_the_validity_window() {
+        let target = window_target();
+        let mut issuer = CallbackTokenIssuer::from_key([3; 32]);
+        let token = issuer.issue(&target, 0, 100).unwrap();
+        issuer.verify_and_consume(&token, &target, 10).unwrap();
+        assert_eq!(issuer.consumed.len(), 1);
+
+        // One millisecond before expiry the entry must survive cleanup.
+        assert_eq!(
+            issuer.verify_and_consume(&token, &target, 99),
+            Err(CallbackError::Replayed)
+        );
+        assert_eq!(issuer.consumed.len(), 1);
+
+        // At expiry the entry is dropped, and the token is refused on time
+        // instead of on the nonce set, so nothing is weakened by the eviction.
+        assert_eq!(
+            issuer.verify_and_consume(&token, &target, 100),
+            Err(CallbackError::Expired)
+        );
+        assert!(issuer.consumed.is_empty());
+    }
+
+    #[test]
+    fn cleanup_keeps_rejecting_replays_inside_the_window() {
+        let target = window_target();
+        let mut issuer = CallbackTokenIssuer::from_key([6; 32]);
+        let long_lived = issuer.issue(&target, 0, MAX_TTL_MS).unwrap();
+        issuer.verify_and_consume(&long_lived, &target, 1).unwrap();
+
+        // Every verification runs cleanup; short-lived neighbours come and go
+        // while the long-lived nonce must stay burned for its whole window.
+        for step in 2..512 {
+            let short_lived = issuer.issue(&target, step, 1).unwrap();
+            issuer
+                .verify_and_consume(&short_lived, &target, step)
+                .unwrap();
+            assert_eq!(
+                issuer.verify_and_consume(&long_lived, &target, step),
+                Err(CallbackError::Replayed)
+            );
+            assert_eq!(issuer.consumed.len(), 2);
+        }
+        assert_eq!(
+            issuer.verify_and_consume(&long_lived, &target, MAX_TTL_MS - 1),
+            Err(CallbackError::Replayed)
+        );
+    }
+
+    #[test]
+    fn rewound_clock_cannot_resurrect_an_evicted_nonce() {
+        let target = window_target();
+        let mut issuer = CallbackTokenIssuer::from_key([8; 32]);
+        let token = issuer.issue(&target, 0, 100).unwrap();
+        issuer.verify_and_consume(&token, &target, 10).unwrap();
+
+        let later = issuer.issue(&target, 200, 10).unwrap();
+        issuer.verify_and_consume(&later, &target, 200).unwrap();
+        assert_eq!(issuer.consumed.len(), 1);
+
+        assert_eq!(
+            issuer.verify_and_consume(&token, &target, 50),
+            Err(CallbackError::Expired)
+        );
+    }
+
+    #[test]
+    fn saturated_replay_window_fails_closed() {
+        let target = window_target();
+        let mut issuer = CallbackTokenIssuer::from_key([5; 32]);
+        let token = issuer.issue(&target, 0, 100).unwrap();
+        for index in 0..MAX_CALLBACK_REPLAY_ENTRIES {
+            let mut nonce = [0_u8; 16];
+            nonce[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            issuer.consumed.insert(nonce, 1_000);
+        }
+        assert_eq!(
+            issuer.verify_and_consume(&token, &target, 10),
+            Err(CallbackError::ReplayWindowFull)
+        );
+
+        // Once the saturating entries age out, the window accepts again.
+        let token = issuer.issue(&target, 1_000, 100).unwrap();
+        issuer.verify_and_consume(&token, &target, 1_000).unwrap();
+        assert_eq!(issuer.consumed.len(), 1);
     }
 
     #[test]
