@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use vbuff_core::capture::{CaptureDecision, CaptureInput, CapturePolicy, SelectionSource};
 use vbuff_core::content_hash_from_flavors;
 use vbuff_types::validation::is_valid_identifier;
-use vbuff_types::{Body, Clip, ClipId, ConcealmentSignal, ContentKind, ProvenanceConfidence};
+use vbuff_types::{
+    Body, Clip, ClipId, ConcealmentSignal, ContentKind, GenerationCoherence, ProvenanceConfidence,
+    SelectionIntent,
+};
 
 use crate::{Result, Store, StoreError, duration_millis_i64, now_millis, raw_to_clip, row_to_clip};
 
@@ -1219,8 +1222,10 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
         flavors: &clip.flavors,
         provenance: &clip.meta.provenance,
         source: SelectionSource::Clipboard,
-        primary_intended: true,
-        coherent_generation: true,
+        // An import never observed a clipboard read at all, so it has no
+        // intent or coherence evidence to report.
+        intent: SelectionIntent::Unknown,
+        coherence: GenerationCoherence::Unknown,
         concealment: ConcealmentSignal::Unknown,
         provenance_confidence: ProvenanceConfidence::Unknown,
         self_write: false,

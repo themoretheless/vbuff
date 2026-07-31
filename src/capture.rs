@@ -19,7 +19,9 @@ use vbuff_core::reliability::{
 };
 use vbuff_core::{content_hash_from_flavors, detect_kind};
 use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend};
-use vbuff_types::{CaptureHealth, Clip, ClipId, ClipMeta, NoticeLevel, ProvenanceConfidence};
+use vbuff_types::{
+    CaptureHealth, Clip, ClipId, ClipMeta, GenerationCoherence, NoticeLevel, ProvenanceConfidence,
+};
 
 use crate::config::{Config, SourceRuleAction};
 use crate::diagnostics::Diagnostics;
@@ -214,33 +216,13 @@ fn run_worker(
     diagnostics.poll_interval(scheduler.interval());
     let mut last_hash: Option<[u8; 32]> = None;
     let mut health_state = CaptureHealthState::default();
-    // Honest degradation: source-dependent privacy rules are armed, but this
-    // backend cannot prove where copies come from. Surface the degradation
-    // once at startup; the sticky health flag keeps it visible.
+    // Honest degradation: source-dependent privacy rules are armed, but the
+    // backend may not be able to prove where copies come from. Judged from
+    // the evidence of a real read rather than from a static backend claim,
+    // so what the user is told and what the gate actually did cannot
+    // disagree. Surfaced once; the sticky health flag keeps it visible.
     let rules_armed = !policy.excluded_apps.is_empty() || !policy.rules.is_empty();
-    if rules_armed && clipboard.evidence().provenance == ProvenanceConfidence::Unknown {
-        match policy.unknown_evidence {
-            UnknownEvidencePolicy::Allow => {
-                tracing::warn!(
-                    "unknown_evidence_policy=allow: source privacy rules run without \
-                     provenance evidence (legacy fail-open)"
-                );
-            }
-            UnknownEvidencePolicy::Guard | UnknownEvidencePolicy::Skip => {
-                health_state.degrade_source_privacy();
-                if diagnostics.capture_health(CaptureHealth::DegradedSourcePrivacy) {
-                    tracing::warn!(
-                        mode = ?policy.unknown_evidence,
-                        "clipboard backend cannot prove source identity; source privacy degraded"
-                    );
-                }
-                diagnostics.notice(
-                    NoticeLevel::Warning,
-                    "Source privacy degraded: the clipboard backend cannot identify source apps",
-                );
-            }
-        }
-    }
+    let mut source_privacy_judged = false;
     let mut generation_tracker = GenerationTracker::default();
     let mut loss_ledger = CaptureLossLedger::default();
     let mut skipped = SkippedCaptureRing::new(8);
@@ -313,6 +295,13 @@ fn run_worker(
                 continue;
             }
         };
+        if rules_armed
+            && !source_privacy_judged
+            && captured.provenance_confidence == ProvenanceConfidence::Unknown
+        {
+            source_privacy_judged = true;
+            degrade_unprovable_source(&policy, &diagnostics, &mut health_state);
+        }
         forensic.push(CaptureForensicEvent {
             observed_at: Instant::now(),
             generation: captured.generation.map(|generation| generation.sequence),
@@ -322,8 +311,7 @@ fn run_worker(
                 .iter()
                 .map(|flavor| flavor.body.byte_size())
                 .fold(0_u64, u64::saturating_add),
-            owner_changed: !captured.coherent_generation,
-            coherent: captured.coherent_generation,
+            coherence: captured.coherence,
         });
         annotate_integrity(&mut captured.flavors);
         if !verify_integrity(&captured.flavors).is_empty() {
@@ -332,7 +320,7 @@ fn run_worker(
                     generation = event.generation,
                     flavor_count = event.flavor_count,
                     total_bytes = event.total_bytes,
-                    owner_changed = event.owner_changed,
+                    coherence = ?event.coherence,
                     "content-free torn-read evidence retained"
                 );
             }
@@ -414,15 +402,19 @@ fn run_worker(
             flavors: &captured.flavors,
             provenance: &captured.provenance,
             source: captured.selection,
-            primary_intended: captured.primary_intended,
-            coherent_generation: captured.coherent_generation,
+            intent: captured.intent,
+            coherence: captured.coherence,
             concealment: captured.concealment,
             provenance_confidence: captured.provenance_confidence,
             self_write,
         };
+        // An explicit user re-grab bypasses the gate, but never a read the
+        // backend affirmatively reported as torn. Unknown coherence must stay
+        // eligible here: it is the permanent state of the generic backend, so
+        // requiring proof would silently disable recovery altogether.
         let decision = if explicit_recovery
             && !self_write
-            && captured.coherent_generation
+            && captured.coherence != GenerationCoherence::Torn
             && captured
                 .flavors
                 .iter()
@@ -729,7 +721,6 @@ fn capture_policy(config: &Config) -> CapturePolicy {
             .cloned()
             .collect(),
         rules,
-        ..CapturePolicy::default()
     }
 }
 
@@ -824,6 +815,41 @@ fn spawn_watchdog(
     });
 }
 
+/// Report that source-dependent privacy rules are armed while the reads
+/// backing them carry no provenance evidence.
+///
+/// Driven by the evidence on an actual read, which is the single channel a
+/// backend has for stating what it can prove. A separate static capability
+/// declaration would let the warning shown to the user and the decision the
+/// gate makes on the very same signal disagree.
+fn degrade_unprovable_source(
+    policy: &CapturePolicy,
+    diagnostics: &Diagnostics,
+    health_state: &mut CaptureHealthState,
+) {
+    match policy.unknown_evidence {
+        UnknownEvidencePolicy::Allow => {
+            tracing::warn!(
+                "unknown_evidence_policy=allow: source privacy rules run without \
+                 provenance evidence (legacy fail-open)"
+            );
+        }
+        UnknownEvidencePolicy::Guard | UnknownEvidencePolicy::Skip => {
+            health_state.degrade_source_privacy();
+            if diagnostics.capture_health(CaptureHealth::DegradedSourcePrivacy) {
+                tracing::warn!(
+                    mode = ?policy.unknown_evidence,
+                    "clipboard backend cannot prove source identity; source privacy degraded"
+                );
+            }
+            diagnostics.notice(
+                NoticeLevel::Warning,
+                "Source privacy degraded: the clipboard backend cannot identify source apps",
+            );
+        }
+    }
+}
+
 fn watchdog_health(
     heartbeat: &Heartbeat,
     paused: bool,
@@ -893,13 +919,16 @@ mod tests {
         }
     }
 
+    /// Mirrors the worker's own wiring: every evidence field is forwarded
+    /// from the read, so the fixtures exercise what a real backend reports
+    /// instead of hard-coded optimism.
     fn decision(policy: &CapturePolicy, captured: &CapturedClipboard) -> CaptureDecision {
         policy.decide(CaptureInput {
             flavors: &captured.flavors,
             provenance: &captured.provenance,
-            source: SelectionSource::Clipboard,
-            primary_intended: true,
-            coherent_generation: true,
+            source: captured.selection,
+            intent: captured.intent,
+            coherence: captured.coherence,
             concealment: captured.concealment,
             provenance_confidence: captured.provenance_confidence,
             self_write: false,
@@ -969,6 +998,87 @@ mod tests {
                 sensitivity_reason: Some(vbuff_types::SensitivityReason::OperatingSystemHint),
             }
         );
+    }
+
+    /// The shipping backend proves nothing: `ArboardClipboard::read` returns
+    /// `..CapturedClipboard::default()`. Pin what that default now is, and
+    /// pin that it still captures — making the unknowns visible must not
+    /// turn into refusing the only backend that exists.
+    #[test]
+    fn generic_backend_read_reports_unknown_evidence_and_still_captures() {
+        let read = CapturedClipboard {
+            flavors: vec![Flavor::inline("text/plain", b"hello".to_vec())],
+            ..CapturedClipboard::default()
+        };
+
+        assert_eq!(read.coherence, GenerationCoherence::Unknown);
+        assert_eq!(read.intent, vbuff_types::SelectionIntent::Unknown);
+        assert_eq!(read.concealment, vbuff_types::ConcealmentSignal::Unknown);
+        assert_eq!(read.provenance_confidence, ProvenanceConfidence::Unknown);
+        assert_eq!(read.selection, SelectionSource::Clipboard);
+
+        let policy = capture_policy(&Config::default());
+        assert!(matches!(
+            decision(&policy, &read),
+            CaptureDecision::Capture { .. }
+        ));
+    }
+
+    /// A backend that reads PRIMARY without being able to prove intent is
+    /// refused: on X11/Wayland PRIMARY changes on every mouse drag, so the
+    /// missing evidence is exactly the hazard the gate exists for.
+    #[test]
+    fn primary_selection_without_intent_evidence_is_refused() {
+        let mut read = CapturedClipboard {
+            flavors: vec![Flavor::inline("text/plain", b"hello".to_vec())],
+            selection: SelectionSource::Primary,
+            ..CapturedClipboard::default()
+        };
+        let policy = capture_policy(&Config::default());
+
+        assert_eq!(
+            decision(&policy, &read),
+            CaptureDecision::Skip(DropReason::IntentUnknown)
+        );
+
+        read.intent = vbuff_types::SelectionIntent::Intended;
+        assert!(matches!(
+            decision(&policy, &read),
+            CaptureDecision::Capture { .. }
+        ));
+    }
+
+    /// Source-privacy degradation is now judged from the evidence a read
+    /// actually carried, so it cannot disagree with what the gate did with
+    /// that same read. Guard/Skip degrade; Allow is the deliberate opt-out.
+    #[test]
+    fn unprovable_source_degrades_health_except_in_allow_mode() {
+        for (mode, expected) in [
+            (
+                UnknownEvidencePolicy::Guard,
+                Some(CaptureHealth::DegradedSourcePrivacy),
+            ),
+            (
+                UnknownEvidencePolicy::Skip,
+                Some(CaptureHealth::DegradedSourcePrivacy),
+            ),
+            (UnknownEvidencePolicy::Allow, Some(CaptureHealth::Watching)),
+        ] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let diagnostics = Diagnostics::new(vbuff_gui::SharedState::default());
+            let mut health_state = CaptureHealthState::default();
+
+            degrade_unprovable_source(&policy, &diagnostics, &mut health_state);
+
+            assert_eq!(
+                health_state.read_succeeded(),
+                expected,
+                "mode {mode:?} degraded the wrong way"
+            );
+        }
     }
 
     #[test]

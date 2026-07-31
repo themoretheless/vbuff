@@ -1,17 +1,18 @@
 //! Cross-platform clipboard backend built on `arboard`.
 //!
 //! `arboard` reads text and image flavors. It cannot enumerate every MIME
-//! flavor, read concealed-type markers, or prove source attribution (that is
-//! the job of the future native backends), but it is enough for the MVP:
-//! capture text and images, and write them back for paste.
+//! flavor, read concealed-type markers, prove source attribution, or observe
+//! clipboard ownership and selection intent (that is the job of the future
+//! native backends), but it is enough for the MVP: capture text and images,
+//! and write them back for paste.
 //!
-//! Degradation contract: reads therefore report
-//! `concealment: ConcealmentSignal::Unknown` and
-//! `provenance_confidence: ProvenanceConfidence::Unknown` (via
-//! `CapturedClipboard::default()`), and the inherited
-//! `ClipboardBackend::evidence()` reports `Unknown` for both signals. The
-//! capture policy — not this adapter — decides how to degrade on that
-//! uncertainty; this backend never claims evidence it cannot supply.
+//! Degradation contract: reads therefore report `Unknown` for all four
+//! evidence signals — `concealment`, `provenance_confidence`, `coherence`
+//! and `intent` — which is precisely what `CapturedClipboard::default()`
+//! yields, so `..CapturedClipboard::default()` below is an honest statement
+//! and not a shortcut. The capture policy — not this adapter — decides how to
+//! degrade on that uncertainty; this backend never claims evidence it cannot
+//! supply.
 
 use std::borrow::Cow;
 

@@ -5,7 +5,7 @@
 
 use vbuff_types::{
     CaptureGeneration, CaptureLineage, CaptureProvenance, ConcealmentSignal, Flavor,
-    ProvenanceConfidence,
+    GenerationCoherence, ProvenanceConfidence, SelectionIntent,
 };
 
 use crate::Result;
@@ -51,8 +51,17 @@ pub enum ClipboardWriteReceipt {
     RetentionHintUnsupported,
 }
 
-/// A coherent snapshot of one clipboard generation.
-#[derive(Clone, Debug)]
+/// A snapshot of one clipboard read, with the evidence the backend could
+/// actually observe about it.
+///
+/// The four evidence fields are the *only* channel through which a backend
+/// states what it can prove: a backend that cannot observe a signal reports
+/// `Unknown` for it on every read, which is exactly the same information a
+/// separate static capability declaration would carry — with no second copy
+/// to drift out of sync. Every one of them defaults to `Unknown` (fail
+/// closed), so a backend that forgets a field claims nothing rather than
+/// claiming proof it does not have.
+#[derive(Clone, Debug, Default)]
 pub struct CapturedClipboard {
     /// Every flavor read from the clipboard, byte-for-byte where possible.
     pub flavors: Vec<Flavor>,
@@ -60,11 +69,13 @@ pub struct CapturedClipboard {
     pub generation: Option<CaptureGeneration>,
     pub lineage: CaptureLineage,
     pub selection: ClipboardSelection,
-    /// Native backend confirmed the owner/generation remained stable while
-    /// every flavor was materialized.
-    pub coherent_generation: bool,
-    /// PRIMARY has remained stable and an intent signal was observed.
-    pub primary_intended: bool,
+    /// Whether the owner/generation stayed stable while every flavor was
+    /// materialized. `Unknown` means the backend cannot observe clipboard
+    /// ownership at all — not that the read is proven coherent.
+    pub coherence: GenerationCoherence,
+    /// Whether a deliberate-copy signal was observed. Consulted only for
+    /// PRIMARY selections. `Unknown` means the backend cannot observe intent.
+    pub intent: SelectionIntent,
     /// OS concealment evidence for this read. `Unknown` means the backend
     /// cannot read concealment markers — not that the content is proven
     /// clear; policy decides how to degrade on that uncertainty.
@@ -74,22 +85,6 @@ pub struct CapturedClipboard {
     pub provenance_confidence: ProvenanceConfidence,
 }
 
-impl Default for CapturedClipboard {
-    fn default() -> Self {
-        Self {
-            flavors: Vec::new(),
-            provenance: CaptureProvenance::default(),
-            generation: None,
-            lineage: CaptureLineage::default(),
-            selection: ClipboardSelection::Clipboard,
-            coherent_generation: true,
-            primary_intended: true,
-            concealment: ConcealmentSignal::Unknown,
-            provenance_confidence: ProvenanceConfidence::Unknown,
-        }
-    }
-}
-
 impl CapturedClipboard {
     /// True if nothing usable was captured.
     pub fn is_empty(&self) -> bool {
@@ -97,31 +92,17 @@ impl CapturedClipboard {
     }
 }
 
-/// Static description of the evidence a clipboard backend can authoritatively
-/// supply, independent of any single read.
-///
-/// Both signals default to `Unknown` (fail closed): a backend that does not
-/// override [`ClipboardBackend::evidence`] honestly reports that it can prove
-/// neither source attribution nor concealment state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendEvidence {
-    /// Confidence of the provenance this backend attaches to reads.
-    pub provenance: ProvenanceConfidence,
-    /// Concealment signal strength this backend can observe.
-    pub concealment: ConcealmentSignal,
-}
-
 /// Reads from and writes to the system clipboard.
 pub trait ClipboardBackend: Send {
     /// Read the current clipboard contents as a flavor set.
+    ///
+    /// The returned [`CapturedClipboard`] carries the backend's evidence for
+    /// *this* read, and is the single channel for it: report `Unknown` for
+    /// anything the backend cannot observe rather than asserting a default.
+    /// There is deliberately no separate static capability method — a second
+    /// declaration of the same facts can only drift away from what reads
+    /// actually report.
     fn read(&mut self) -> Result<CapturedClipboard>;
-
-    /// Evidence this backend can authoritatively supply. The default reports
-    /// `Unknown` for both signals so uninstrumented backends fail closed
-    /// instead of implying source/concealment proof they do not have.
-    fn evidence(&self) -> BackendEvidence {
-        BackendEvidence::default()
-    }
 
     /// Write a flavor set back to the clipboard (for paste-back).
     fn write(&mut self, flavors: &[Flavor]) -> Result<()>;

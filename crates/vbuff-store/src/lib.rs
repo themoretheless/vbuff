@@ -1984,6 +1984,16 @@ impl Store {
     }
 
     /// Reclassify a bounded set of historical structural secrets.
+    ///
+    /// This runs unattended from idle maintenance and is destructive: a
+    /// matched row loses its search projection, its similarity hashes, its
+    /// facets and its embeddings, and gains a forced expiry. It therefore
+    /// asks [`MIN_RECLASSIFY_CONFIDENCE`], not the capture-time floor - the
+    /// weakest detector (`HighEntropy`) fires on ordinary URLs and Windows
+    /// paths, and retroactively shredding a clip the user has been living
+    /// with is not a mistake worth making on that evidence.
+    ///
+    /// [`MIN_RECLASSIFY_CONFIDENCE`]: vbuff_core::secret::MIN_RECLASSIFY_CONFIDENCE
     pub fn clawback_sensitive(
         &self,
         limit: usize,
@@ -2035,8 +2045,8 @@ impl Store {
         };
         for (_, id, metadata_json, item_text) in candidates {
             let detected = vbuff_core::secret::detect_secrets(&item_text)
-                .iter()
-                .any(|finding| finding.confidence >= 0.9);
+                .into_iter()
+                .any(vbuff_core::secret::SecretFinding::justifies_reclassification);
             if !detected {
                 continue;
             }
@@ -4794,6 +4804,54 @@ mod tests {
             after.is_none(),
             "reclassified row must lose its normalized_hash"
         );
+    }
+
+    #[test]
+    fn clawback_acts_at_the_reclassification_floor_and_refuses_everything_below_it() {
+        let store = Store::open_in_memory().unwrap();
+        // Below the floor: the entropy detector scores 0.72, which is enough
+        // to mask a fresh copy but must never shred a clip the user already
+        // owns. An opaque blob is the strongest thing that detector produces.
+        let blob = store
+            .insert(&make_clip("xQ7vR2pL9mK4wZ8tB6nH3jF5cD1aG0uY7eT4iS2"))
+            .unwrap();
+        // No finding at all: a link is structure rather than randomness.
+        let url = store
+            .insert(&make_clip(
+                "https://example.com/blog/post?utm_source=Newsletter&id=8fA2",
+            ))
+            .unwrap();
+        // Exactly at the floor: a Luhn-valid card number scores 0.90, and the
+        // comparison is inclusive.
+        let card = store.insert(&make_clip("4111111111111111")).unwrap();
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.reclassified, 1, "only the row at the floor may move");
+        for (id, label) in [(blob, "opaque blob"), (url, "url")] {
+            assert!(
+                !item_text_of(&store, id).is_empty(),
+                "{label} was reclassified on sub-floor evidence"
+            );
+        }
+        assert!(
+            item_text_of(&store, card).is_empty(),
+            "a finding exactly at the floor must be reclassified"
+        );
+    }
+
+    fn item_text_of(store: &Store, id: ClipId) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT item_text FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]

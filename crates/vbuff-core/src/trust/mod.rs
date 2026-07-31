@@ -15,6 +15,6 @@ pub use rules::{
     RuleMatchReason, SimulationError, SimulationInput, SimulationResult,
 };
 pub use secrets::{
-    DetectorUpdateError, SecretHandling, SecretMask, SensitivityReason, SignedDetectorUpdate,
+    DetectorUpdateError, SecretHandling, SensitivityReason, SignedDetectorUpdate,
     handling_for_secret, sensitivity_reason_for_secret, sensitivity_watermark,
 };

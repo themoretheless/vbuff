@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use vbuff_types::Flavor;
+use vbuff_types::{Flavor, GenerationCoherence};
 
 /// Recovery requested after a capture-health observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,8 +254,12 @@ pub struct CaptureForensicEvent {
     pub generation: Option<u64>,
     pub flavor_count: u16,
     pub total_bytes: u64,
-    pub owner_changed: bool,
-    pub coherent: bool,
+    /// What the backend could actually observe about clipboard ownership
+    /// during this read. Previously two mutually negating booleans
+    /// (`owner_changed`/`coherent`) that a backend unable to observe
+    /// ownership still filled in as "coherent, owner unchanged" — a
+    /// fabricated attestation in the one record kept to judge torn reads.
+    pub coherence: GenerationCoherence,
 }
 
 #[derive(Clone, Debug)]
@@ -353,16 +357,14 @@ mod tests {
             generation: Some(1),
             flavor_count: 2,
             total_bytes: 4,
-            owner_changed: false,
-            coherent: true,
+            coherence: GenerationCoherence::Coherent,
         });
         ring.push(CaptureForensicEvent {
             observed_at: now,
             generation: Some(2),
             flavor_count: 1,
             total_bytes: 9,
-            owner_changed: true,
-            coherent: false,
+            coherence: GenerationCoherence::Torn,
         });
         assert_eq!(ring.entries().count(), 1);
         assert_eq!(ring.entries().next().unwrap().generation, Some(2));

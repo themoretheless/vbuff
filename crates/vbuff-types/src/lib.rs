@@ -344,6 +344,50 @@ pub enum ConcealmentSignal {
     Unknown,
 }
 
+/// Whether one clipboard read saw a single, stable clipboard generation.
+///
+/// Three states for the same reason as [`ConcealmentSignal`]: the legacy
+/// boolean had no way to say "this backend cannot observe owner/generation
+/// identity", so that case was reported as `true` — an affirmative claim of
+/// coherence nobody verified, which then travelled on into the capture gate
+/// and the forensic ring as if it were evidence.
+/// [`GenerationCoherence::Unknown`] keeps "held stable" and "nobody could
+/// look" apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationCoherence {
+    /// The backend held the clipboard owner/generation stable while every
+    /// flavor was materialized.
+    Coherent,
+    /// The backend observed the owner or generation change mid-read: the
+    /// flavor set may splice two different copies.
+    Torn,
+    /// The backend cannot observe owner/generation identity. Fail-closed
+    /// default.
+    #[default]
+    Unknown,
+}
+
+/// Whether a selection change carried evidence of deliberate user intent.
+///
+/// Only consulted for [`SelectionSource::Primary`]: the X11/Wayland PRIMARY
+/// selection changes on every mouse drag, so capturing it without positive
+/// intent evidence records text the user never copied. The legacy boolean
+/// reported "no evidence either way" as `true`, i.e. as an observed intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionIntent {
+    /// The backend observed a deliberate copy: the selection settled and an
+    /// intent signal (gesture, key, ownership dwell) was seen.
+    Intended,
+    /// The backend affirmatively observed no intent signal — an incidental
+    /// selection.
+    Incidental,
+    /// The backend cannot observe intent signals. Fail-closed default.
+    #[default]
+    Unknown,
+}
+
 /// Source context captured at the same instant as the clipboard generation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -708,6 +752,8 @@ mod tests {
             ProvenanceConfidence::Unknown
         );
         assert_eq!(ConcealmentSignal::default(), ConcealmentSignal::Unknown);
+        assert_eq!(GenerationCoherence::default(), GenerationCoherence::Unknown);
+        assert_eq!(SelectionIntent::default(), SelectionIntent::Unknown);
         assert_eq!(
             serde_json::to_string(&ProvenanceConfidence::Proven).unwrap(),
             r#""proven""#
@@ -719,6 +765,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ConcealmentSignal>(r#""clear""#).unwrap(),
             ConcealmentSignal::Clear
+        );
+        assert_eq!(
+            serde_json::to_string(&GenerationCoherence::Torn).unwrap(),
+            r#""torn""#
+        );
+        assert_eq!(
+            serde_json::from_str::<GenerationCoherence>(r#""coherent""#).unwrap(),
+            GenerationCoherence::Coherent
+        );
+        assert_eq!(
+            serde_json::to_string(&SelectionIntent::Incidental).unwrap(),
+            r#""incidental""#
+        );
+        assert_eq!(
+            serde_json::from_str::<SelectionIntent>(r#""intended""#).unwrap(),
+            SelectionIntent::Intended
         );
     }
 
