@@ -71,11 +71,13 @@ pub enum DensityMode {
 
 impl DensityMode {
     pub fn row_height(self, viewport_height: f32) -> f32 {
+        // Two-line 46px rows from the Split Cockpit design; compact trims to
+        // 42px, comfortable widens to 52px.
         match self {
-            Self::Compact => 56.0,
-            Self::Comfortable => 68.0,
-            Self::Auto if viewport_height < 560.0 => 56.0,
-            Self::Auto => 60.0,
+            Self::Compact => 42.0,
+            Self::Comfortable => 52.0,
+            Self::Auto if viewport_height < 500.0 => 42.0,
+            Self::Auto => 46.0,
         }
     }
 }
