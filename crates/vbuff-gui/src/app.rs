@@ -600,6 +600,10 @@ impl eframe::App for PopupApp {
                     self.command_query.clear();
                     self.command_focus_next_frame = true;
                 }
+                if !self.command_palette_open && modifier_down && i.key_pressed(Key::F) {
+                    self.surface = PopupSurface::History;
+                    self.request_focus_next_frame = true;
+                }
                 if !self.command_palette_open && modifier_down && i.key_pressed(Key::Comma) {
                     self.surface = PopupSurface::Settings;
                     self.request_focus_next_frame = false;
