@@ -4817,6 +4817,7 @@ dependencies = [
  "similar",
  "thiserror 2.0.18",
  "ulid",
+ "unicode-normalization",
  "url",
  "vbuff-types",
  "zeroize",
