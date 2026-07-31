@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-pub use vbuff_types::CapturePauseReason as AutoPauseReason;
+use vbuff_types::CapturePauseReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,16 +91,16 @@ impl Default for AutoPausePolicy {
 }
 
 impl AutoPausePolicy {
-    pub fn reason(self, signals: AutoPauseSignals) -> Option<AutoPauseReason> {
+    pub fn reason(self, signals: AutoPauseSignals) -> Option<CapturePauseReason> {
         if self.pause_on_lock && signals.screen_locked {
-            Some(AutoPauseReason::ScreenLocked)
+            Some(CapturePauseReason::ScreenLocked)
         } else if self.pause_on_remote_control && signals.remote_control_active {
-            Some(AutoPauseReason::RemoteControl)
+            Some(CapturePauseReason::RemoteControl)
         } else if self
             .idle_after
             .is_some_and(|threshold| !threshold.is_zero() && signals.idle_for >= threshold)
         {
-            Some(AutoPauseReason::Idle)
+            Some(CapturePauseReason::Idle)
         } else {
             None
         }
@@ -109,14 +109,14 @@ impl AutoPausePolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoPauseTransition {
-    Pause(AutoPauseReason),
+    Pause(CapturePauseReason),
     Resume,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct AutoPauseController {
     policy: AutoPausePolicy,
-    active_reason: Option<AutoPauseReason>,
+    active_reason: Option<CapturePauseReason>,
 }
 
 impl AutoPauseController {
@@ -145,7 +145,7 @@ impl AutoPauseController {
         }
     }
 
-    pub const fn active_reason(self) -> Option<AutoPauseReason> {
+    pub const fn active_reason(self) -> Option<CapturePauseReason> {
         self.active_reason
     }
 }
@@ -341,7 +341,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::Idle))
+            Some(AutoPauseTransition::Pause(CapturePauseReason::Idle))
         );
         assert_eq!(
             controller.observe(
@@ -351,7 +351,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::ScreenLocked))
+            Some(AutoPauseTransition::Pause(CapturePauseReason::ScreenLocked))
         );
         assert_eq!(controller.observe(AutoPauseSignals::default(), true), None);
         assert_eq!(controller.active_reason(), None);
@@ -368,7 +368,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::RemoteControl))
+            Some(AutoPauseTransition::Pause(CapturePauseReason::RemoteControl))
         );
         assert_eq!(
             controller.observe(AutoPauseSignals::default(), false),

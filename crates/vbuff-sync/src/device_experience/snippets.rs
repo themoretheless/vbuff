@@ -3,7 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_SHARED_APPROVERS, all_zero};
+use vbuff_types::validation::all_zero;
+
+use super::MAX_SHARED_APPROVERS;
 use crate::{Result, SyncError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +51,7 @@ impl SharedSnippetProposal {
         author_device_hash: [u8; 32],
         base_revision: u64,
     ) -> Result<Self> {
-        if proposal_id.iter().all(|byte| *byte == 0)
+        if all_zero(&proposal_id)
             || all_zero(&snippet_hash)
             || all_zero(&author_device_hash)
         {
@@ -107,7 +109,7 @@ impl SharedSnippetProposal {
             || allowed_approvers.len() > MAX_SHARED_APPROVERS
             || required > allowed_approvers.len()
             || all_zero(&approver)
-            || allowed_approvers.iter().any(all_zero)
+            || allowed_approvers.iter().any(|approver| all_zero(approver))
             || allowed_approvers.contains(&self.author_device_hash)
             || approver == self.author_device_hash
             || !allowed_approvers.contains(&approver)

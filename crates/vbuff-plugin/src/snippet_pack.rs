@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::valid_version;
 
 use crate::{PluginError, Result};
 
@@ -162,16 +163,6 @@ fn valid_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
         })
-}
-
-fn valid_version(value: &str) -> bool {
-    let mut parts = value.split('.');
-    let valid = (0..3).all(|_| {
-        parts
-            .next()
-            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    });
-    valid && parts.next().is_none()
 }
 
 #[cfg(test)]

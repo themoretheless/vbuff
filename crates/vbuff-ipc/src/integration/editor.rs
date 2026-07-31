@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::{is_valid_identifier_with_extra, is_valid_label};
 
 use super::IntegrationContractError;
 
@@ -49,19 +50,19 @@ impl EditorCaptureMetadata {
         if self
             .language
             .as_ref()
-            .is_some_and(|language| !valid_language_id(language))
+            .is_some_and(|language| !is_valid_identifier_with_extra(language, 64, b"+#"))
             || self
                 .file_path
                 .as_ref()
-                .is_some_and(|path| !valid_text_field(path, 4_096))
+                .is_some_and(|path| !is_valid_label(path, 4_096))
             || self
                 .repository
                 .as_ref()
-                .is_some_and(|repository| !valid_text_field(repository, 256))
+                .is_some_and(|repository| !is_valid_label(repository, 256))
             || self
                 .branch
                 .as_ref()
-                .is_some_and(|branch| !valid_text_field(branch, 256))
+                .is_some_and(|branch| !is_valid_label(branch, 256))
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -186,18 +187,6 @@ fn markdown_fence(input: &str) -> String {
     "`".repeat(longest_run.saturating_add(1).max(3))
 }
 
-fn valid_language_id(language: &str) -> bool {
-    !language.is_empty()
-        && language.len() <= 64
-        && language.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'#' | b'-' | b'_' | b'.')
-        })
-}
-
-fn valid_text_field(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorPasteContext {
@@ -213,7 +202,7 @@ impl EditorPasteContext {
             || self
                 .language
                 .as_ref()
-                .is_some_and(|language| !valid_language_id(language))
+                .is_some_and(|language| !is_valid_identifier_with_extra(language, 64, b"+#"))
         {
             return Err(IntegrationContractError::InvalidField);
         }

@@ -21,14 +21,12 @@ mod error;
 pub mod format_map;
 pub mod geometry;
 mod hotkey;
-pub mod keymap;
 pub mod lifecycle;
 mod paste;
 pub mod paste_fidelity;
 pub mod permission;
 pub mod security;
 pub mod traits;
-pub mod tripwire;
 pub mod wayland;
 pub mod windows;
 
@@ -51,11 +49,9 @@ pub use desktop_policy::{
     linux_environment_note, permission_repair_plan, resolve_hotkey_conflict,
 };
 pub use format_map::{FormatFamily, FormatKey, canonical_format};
-pub use keymap::{CanonicalAction, KeyBinding, KeymapTarget, canonical_keymap};
 pub use paste_fidelity::{PasteConformanceIssue, PasteConformanceReport, PasteTrace};
 pub use permission::{PermissionEvent, PermissionKind, PermissionState, PermissionWatchdog};
 pub use security::{ProcessHardeningReport, harden_current_process};
-pub use tripwire::{ClipboardReadObservation, ScrapeTripwire, TripwireAlert};
 
 pub use clipboard::ArboardClipboard;
 pub use confirmed_paste::ConfirmedPaste;

@@ -5,6 +5,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use vbuff_types::ContentKind;
+use vbuff_types::validation::{all_zero, is_valid_label};
 
 use super::IntegrationContractError;
 
@@ -63,11 +64,14 @@ impl ClipAccessFilter {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if self.tags.len() > MAX_ACCESS_LABELS
             || self.collections.len() > MAX_ACCESS_LABELS
-            || self.tags.iter().any(|tag| !valid_label(tag, MAX_TAG_BYTES))
+            || self
+                .tags
+                .iter()
+                .any(|tag| !is_valid_label(tag, MAX_TAG_BYTES))
             || self
                 .collections
                 .iter()
-                .any(|collection| !valid_label(collection, MAX_COLLECTION_BYTES))
+                .any(|collection| !is_valid_label(collection, MAX_COLLECTION_BYTES))
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -125,7 +129,7 @@ impl Default for McpReadPolicy {
 impl McpReadPolicy {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if !self.read_only
-            || !valid_label(&self.required_tag, MAX_TAG_BYTES)
+            || !is_valid_label(&self.required_tag, MAX_TAG_BYTES)
             || !(1..=100).contains(&self.maximum_results)
         {
             return Err(IntegrationContractError::InvalidField);
@@ -176,7 +180,7 @@ impl McpSessionLease {
         user_consented: bool,
     ) -> Result<Self, IntegrationContractError> {
         policy.validate()?;
-        if session_key.iter().all(|byte| *byte == 0)
+        if all_zero(session_key)
             || !user_consented
             || ttl_ms == 0
             || ttl_ms > MAX_MCP_LEASE_TTL_MS
@@ -268,14 +272,10 @@ fn valid_context(context: &ClipAccessContext<'_>) -> bool {
         && context
             .tags
             .iter()
-            .all(|tag| valid_label(tag, MAX_TAG_BYTES))
+            .all(|tag| is_valid_label(tag, MAX_TAG_BYTES))
         && context
             .collection
-            .is_none_or(|collection| valid_label(collection, MAX_COLLECTION_BYTES))
-}
-
-fn valid_label(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
+            .is_none_or(|collection| is_valid_label(collection, MAX_COLLECTION_BYTES))
 }
 
 #[cfg(test)]

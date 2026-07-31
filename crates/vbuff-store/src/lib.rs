@@ -25,6 +25,7 @@ use vbuff_core::fingerprint::{
     fingerprint_bands, hamming_distance, simhash64,
 };
 use vbuff_core::intelligence::{AiGate, AiOperation};
+use vbuff_types::validation::is_valid_identifier;
 use vbuff_types::{
     CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta,
     ClipboardHealthDigest, ContentKind, Flavor, SensitivityReason,
@@ -63,6 +64,14 @@ pub const DATA_CONTRACT_V2_SCHEMA_VERSION: i64 = 6;
 
 /// The current schema version, stored in `PRAGMA user_version`.
 pub const SCHEMA_VERSION: i64 = 7;
+
+/// Discriminant of [`ContentKind::Code`] as it appears in SQL text (the FTS
+/// code-mirror predicate `kind = 7`). Sourced from the canonical codec so it
+/// cannot drift from [`ContentKind::stored_discriminant`]. The v7 trigger
+/// bodies in `Store::apply_migrations` keep the literal spelled out because
+/// trigger text persists verbatim in `sqlite_master` of existing databases;
+/// `schema_bakes_canonical_code_discriminant` pins the two together.
+const CODE_KIND_SQL: i64 = ContentKind::Code.stored_discriminant();
 
 /// Hard expiry ceiling applied at insert time to sensitive clips that carry
 /// no TTL of their own, so persistable secret classes never live in the
@@ -783,22 +792,22 @@ impl Store {
             r#"
             SELECT (SELECT COUNT(*) FROM clip_fts_prose) = (SELECT COUNT(*) FROM clips)
                AND (SELECT COUNT(*) FROM clip_fts_code) =
-                   (SELECT COUNT(*) FROM clips WHERE kind = 7)
+                   (SELECT COUNT(*) FROM clips WHERE kind = ?1)
             "#,
-            [],
+            params![CODE_KIND_SQL],
             |row| row.get(0),
         )?;
         if !fts_in_sync {
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 r#"
                 DELETE FROM clip_fts_prose;
                 DELETE FROM clip_fts_code;
                 INSERT INTO clip_fts_prose(rowid, item_text)
                     SELECT seq, item_text FROM clips;
                 INSERT INTO clip_fts_code(rowid, item_text)
-                    SELECT seq, item_text FROM clips WHERE kind = 7;
-                "#,
-            )?;
+                    SELECT seq, item_text FROM clips WHERE kind = {CODE_KIND_SQL};
+                "#
+            ))?;
         }
         conn.execute_batch(
             r#"
@@ -853,8 +862,9 @@ impl Store {
         let transaction = self.conn.unchecked_transaction()?;
         let count = pending.len();
         for (id, kind, item_text, flavors_json) in pending {
-            let simhash = (kind != kind_to_int(ContentKind::Image)).then(|| simhash64(&item_text));
-            let dhash = if kind == kind_to_int(ContentKind::Image) {
+            let image_kind = ContentKind::Image.stored_discriminant();
+            let simhash = (kind != image_kind).then(|| simhash64(&item_text));
+            let dhash = if kind == image_kind {
                 let flavors = serde_clip::flavors_from_json(&flavors_json)?;
                 let byte_size = flavors.iter().map(|flavor| flavor.body.byte_size()).sum();
                 let clip = Clip {
@@ -1159,7 +1169,7 @@ impl Store {
                 clip.id.to_string_repr(),
                 clip.content_hash.as_slice(),
                 flavors_json,
-                kind_to_int(clip.meta.kind),
+                clip.meta.kind.stored_discriminant(),
                 created,
                 updated,
                 clip.meta.byte_size as i64,
@@ -1917,11 +1927,13 @@ impl Store {
         )?;
         let missing_code = query_count(
             &self.conn,
-            r#"
+            &format!(
+                r#"
             SELECT COUNT(*) FROM clips AS c
             LEFT JOIN clip_fts_code AS f ON f.rowid = c.seq
-            WHERE c.kind = 7 AND f.rowid IS NULL
-            "#,
+            WHERE c.kind = {CODE_KIND_SQL} AND f.rowid IS NULL
+            "#
+            ),
         )?;
         let orphan_prose = query_count(
             &self.conn,
@@ -1933,11 +1945,13 @@ impl Store {
         )?;
         let orphan_code = query_count(
             &self.conn,
-            r#"
+            &format!(
+                r#"
             SELECT COUNT(*) FROM clip_fts_code AS f
-            LEFT JOIN clips AS c ON c.seq = f.rowid AND c.kind = 7
+            LEFT JOIN clips AS c ON c.seq = f.rowid AND c.kind = {CODE_KIND_SQL}
             WHERE c.seq IS NULL
-            "#,
+            "#
+            ),
         )?;
         let dirty: i64 = self.conn.query_row(
             "SELECT value FROM maintenance_state WHERE key = 'fts_dirty'",
@@ -2101,7 +2115,9 @@ impl Store {
         let dead = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for (blob_ref, kind) in &dead {
-            cas.remove(kind_from_int(*kind), blob_ref)?;
+            let kind = ContentKind::from_stored_discriminant(*kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            cas.remove(kind, blob_ref)?;
         }
         self.conn
             .execute("DELETE FROM blob_refs WHERE refcount = 0", [])?;
@@ -2109,12 +2125,18 @@ impl Store {
             .conn
             .prepare("SELECT hash, kind FROM blob_refs WHERE refcount > 0")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                kind_from_int(row.get::<_, i64>(1)?),
-                row.get::<_, String>(0)?,
-            ))
+            Ok((row.get::<_, i64>(1)?, row.get::<_, String>(0)?))
         })?;
-        let live = rows.collect::<rusqlite::Result<HashSet<_>>>()?;
+        // Fail closed on unknown discriminants: guessing a kind here would
+        // both look for the blob under the wrong directory and let orphan
+        // removal delete a file that a corrupt row still references.
+        let mut live = HashSet::new();
+        for row in rows {
+            let (kind, blob_ref) = row?;
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            live.insert((kind, blob_ref));
+        }
         drop(statement);
         let orphans = cas.remove_orphans(&live)?;
         Ok(dead.len() + orphans)
@@ -2733,14 +2755,9 @@ impl Store {
 
     /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
     ///
-    /// Returns the number of clips evicted. This mirrors the policy in
-    /// [`vbuff_core::eviction::evict`] but is implemented directly in SQL so a
-    /// cap enforcement never has to load the full `Clip` rows (flavor bytes
-    /// included) into memory just to compute which ids to drop. The two
-    /// implementations are kept honest against each other by
-    /// `enforce_cap_matches_pure_eviction_policy` below rather than merged,
-    /// since merging would force this hot path back through an in-memory
-    /// `Vec<Clip>` fetch.
+    /// Returns the number of clips evicted. The policy is implemented directly
+    /// in SQL so a cap enforcement never has to load the full `Clip` rows
+    /// (flavor bytes included) into memory just to compute which ids to drop.
     pub fn enforce_cap(&self, max_history: usize) -> Result<usize> {
         let total = self.count()?;
         if total <= max_history {
@@ -2985,11 +3002,12 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
         chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
     let updated_at = chrono::DateTime::from_timestamp_millis(raw.updated_at).unwrap_or(created_at);
     let stored_meta: StoredMetadata = serde_json::from_str(&raw.metadata_json)?;
-    let mut meta = ClipMeta::now(
-        kind_from_int(raw.kind),
-        raw.byte_size as u64,
-        raw.source_app,
-    );
+    // Fail closed: an unknown discriminant means the row (or a newer schema)
+    // is not something this build can interpret; silently mapping it to
+    // `Other` used to hide the corruption.
+    let kind = ContentKind::from_stored_discriminant(raw.kind)
+        .ok_or_else(|| StoreError::Corrupt("unknown content kind in db".into()))?;
+    let mut meta = ClipMeta::now(kind, raw.byte_size as u64, raw.source_app);
     meta.created_at = created_at;
     meta.updated_at = updated_at;
     stored_meta.apply_to(&mut meta);
@@ -3163,11 +3181,7 @@ fn persist_embedding(
 fn validate_local_embedding_backend(backend: &dyn EmbeddingBackend) -> Result<()> {
     let id = backend.id();
     if backend.locality() != EmbeddingLocality::Local
-        || id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !is_valid_identifier(id, 128)
         || !(1..=8_192).contains(&backend.dimensions())
     {
         return Err(StoreError::Maintenance(
@@ -3212,34 +3226,6 @@ fn escape_like(s: &str) -> String {
     out
 }
 
-fn kind_to_int(kind: ContentKind) -> i64 {
-    match kind {
-        ContentKind::Text => 0,
-        ContentKind::Rtf => 1,
-        ContentKind::Html => 2,
-        ContentKind::Image => 3,
-        ContentKind::File => 4,
-        ContentKind::Color => 5,
-        ContentKind::Url => 6,
-        ContentKind::Code => 7,
-        ContentKind::Other => 8,
-    }
-}
-
-fn kind_from_int(v: i64) -> ContentKind {
-    match v {
-        0 => ContentKind::Text,
-        1 => ContentKind::Rtf,
-        2 => ContentKind::Html,
-        3 => ContentKind::Image,
-        4 => ContentKind::File,
-        5 => ContentKind::Color,
-        6 => ContentKind::Url,
-        7 => ContentKind::Code,
-        _ => ContentKind::Other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3266,6 +3252,36 @@ mod tests {
             pinned: false,
             favorite: false,
         }
+    }
+
+    #[test]
+    fn schema_bakes_canonical_code_discriminant() {
+        // The v7 trigger bodies bake `kind = 7` into sqlite_master, and that
+        // text persists verbatim in existing databases, so the canonical
+        // codec must never renumber Code.
+        assert_eq!(CODE_KIND_SQL, 7);
+        let store = Store::open_in_memory().unwrap();
+        let trigger_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'clips_fts_ai'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains(&format!(
+            "new.kind = {}",
+            ContentKind::Code.stored_discriminant()
+        )));
+    }
+
+    #[test]
+    fn unknown_kind_discriminant_fails_closed_as_corrupt() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("victim")).unwrap();
+        store.conn.execute("UPDATE clips SET kind = 99", []).unwrap();
+        let error = store.list(10).unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)));
     }
 
     #[test]

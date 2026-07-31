@@ -1,4 +1,4 @@
-use vbuff_types::Clip;
+use vbuff_types::{Clip, ContentKind};
 
 use super::{ClipTags, NaturalQuery, PasteAffinity, PinnedAliases, QueryPinSet, SearchScopeLock};
 
@@ -307,23 +307,33 @@ pub fn complete_query(input: &str) -> Vec<String> {
     }
     let token = input.split_whitespace().next_back().unwrap_or_default();
     let lower = token.to_ascii_lowercase();
-    let candidates: &[&str] = if lower.starts_with("kind:") {
-        &[
-            "kind:text",
-            "kind:url",
-            "kind:image",
-            "kind:code",
-            "kind:file",
-            "kind:color",
-        ]
+    // Deliberate UX subset: only the kinds users plausibly filter by are
+    // completed (Rtf, Html and Other stay out, though the parser accepts
+    // them). The spelling comes from the canonical slugs so completion can
+    // never drift from what the parser understands.
+    const COMPLETED_KINDS: [ContentKind; 6] = [
+        ContentKind::Text,
+        ContentKind::Url,
+        ContentKind::Image,
+        ContentKind::Code,
+        ContentKind::File,
+        ContentKind::Color,
+    ];
+    let candidates: Vec<String> = if lower.starts_with("kind:") {
+        COMPLETED_KINDS
+            .iter()
+            .map(|kind| format!("kind:{}", kind.slug()))
+            .collect()
     } else {
-        &["app:", "kind:", "tag:", "device:", "before:", "after:"]
+        ["app:", "kind:", "tag:", "device:", "before:", "after:"]
+            .iter()
+            .map(|prefix| (*prefix).to_owned())
+            .collect()
     };
     candidates
-        .iter()
+        .into_iter()
         .filter(|candidate| candidate.starts_with(&lower))
         .take(MAX_COMPLETIONS)
-        .map(|candidate| (*candidate).to_owned())
         .collect()
 }
 

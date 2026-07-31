@@ -3,7 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{IntegrationContractError, valid_identifier, valid_label};
+use vbuff_types::validation::{all_zero, is_valid_identifier, is_valid_label};
+
+use super::IntegrationContractError;
 
 /// Domain separator for the manifest content hash (versioned).
 const SNIPPET_MANIFEST_HASH_DOMAIN: &[u8] = b"vbuff-snippet-manifest-v1\0";
@@ -74,20 +76,20 @@ impl SnippetSyncManifest {
     }
 
     /// Bounded validation: at most 10 000 entries, keys follow the same
-    /// `valid_label(.., 128)` rules as `snippet_map`, and a `Present` state
+    /// `is_valid_label(.., 128)` rules as `snippet_map`, and a `Present` state
     /// never carries the zero hash (same rule as `snippet_map` records).
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if self.entries.len() > MAX_SNIPPET_MANIFEST_ENTRIES {
             return Err(IntegrationContractError::InvalidField);
         }
         for (key, state) in &self.entries {
-            if !valid_label(key, 128) {
+            if !is_valid_label(key, 128) {
                 return Err(IntegrationContractError::InvalidField);
             }
-            if let SnippetSyncedState::Present { content_hash } = state {
-                if content_hash.iter().all(|byte| *byte == 0) {
-                    return Err(IntegrationContractError::InvalidField);
-                }
+            if let SnippetSyncedState::Present { content_hash } = state
+                && all_zero(content_hash)
+            {
+                return Err(IntegrationContractError::InvalidField);
             }
         }
         Ok(())
@@ -177,9 +179,7 @@ impl fmt::Debug for SnippetBridgeCursor {
 
 impl SnippetBridgeCursor {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
-        if !valid_identifier(&self.adapter, 64)
-            || self.last_manifest_hash.iter().all(|byte| *byte == 0)
-        {
+        if !is_valid_identifier(&self.adapter, 64) || all_zero(&self.last_manifest_hash) {
             return Err(IntegrationContractError::InvalidField);
         }
         Ok(())
@@ -349,8 +349,8 @@ fn snippet_map(
 ) -> Result<BTreeMap<String, SnippetMirrorRecord>, IntegrationContractError> {
     let mut map = BTreeMap::new();
     for record in records {
-        if !valid_label(&record.key, 128)
-            || record.content_hash.iter().all(|byte| *byte == 0)
+        if !is_valid_label(&record.key, 128)
+            || all_zero(&record.content_hash)
             || map.insert(record.key.clone(), record.clone()).is_some()
         {
             return Err(IntegrationContractError::InvalidField);

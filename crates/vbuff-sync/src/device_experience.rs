@@ -28,17 +28,5 @@ const MAX_NEARBY_TARGETS: usize = 16;
 const MAX_NEARBY_AGE_MS: u64 = 5 * 60 * 1_000;
 const MAX_QR_TOKEN_TTL_MS: u64 = 5 * 60 * 1_000;
 
-pub(crate) fn valid_identifier(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum_bytes
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn all_zero<const N: usize>(value: &[u8; N]) -> bool {
-    value.iter().all(|byte| *byte == 0)
-}
-
 #[cfg(test)]
 mod tests;

@@ -5,7 +5,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use super::{IntegrationContractError, valid_identifier};
+use vbuff_types::validation::{all_zero, is_valid_identifier};
+
+use super::IntegrationContractError;
 
 const MAX_REMOTE_REPLAY_ENTRIES: usize = 4_096;
 type HmacSha256 = Hmac<Sha256>;
@@ -32,8 +34,8 @@ impl fmt::Debug for RemotePasteRequest {
 impl RemotePasteRequest {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if !valid_forwarded_socket(&self.forwarded_socket)
-            || !valid_identifier(&self.session_nonce, 128)
-            || !valid_identifier(&self.clip_id, 128)
+            || !is_valid_identifier(&self.session_nonce, 128)
+            || !is_valid_identifier(&self.clip_id, 128)
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -69,7 +71,7 @@ impl RemotePasteLease {
         ttl_ms: u64,
     ) -> Result<Self, IntegrationContractError> {
         request.validate()?;
-        if session_key.iter().all(|byte| *byte == 0) || ttl_ms == 0 || ttl_ms > 60_000 {
+        if all_zero(session_key) || ttl_ms == 0 || ttl_ms > 60_000 {
             return Err(IntegrationContractError::InvalidField);
         }
         let expires_at_ms = issued_at_ms
@@ -110,7 +112,7 @@ impl RemoteReplayWindow {
     ) -> Result<(), IntegrationContractError> {
         self.consumed.retain(|_, expiry| *expiry > now_ms);
         request.validate()?;
-        if session_key.iter().all(|byte| *byte == 0) {
+        if all_zero(session_key) {
             return Err(IntegrationContractError::InvalidField);
         }
         if now_ms < lease.issued_at_ms || now_ms >= lease.expires_at_ms {
@@ -147,7 +149,7 @@ fn remote_proof(
     issued_at_ms: u64,
     expires_at_ms: u64,
 ) -> Result<[u8; 32], IntegrationContractError> {
-    if key.iter().all(|byte| *byte == 0) {
+    if all_zero(key) {
         return Err(IntegrationContractError::InvalidField);
     }
     let mut mac =

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::{is_valid_identifier, valid_version};
 
 use crate::{PluginError, Result};
 
@@ -306,22 +307,10 @@ fn valid_scope_path(path: &str) -> bool {
         && !path.split(['/', '\\']).any(|component| component == "..")
 }
 
+/// Kept as a named `fn` because `validate_action_scope` takes it as a
+/// `fn(&str) -> bool` pointer; the predicate itself is the canonical one.
 fn valid_command_id(command: &str) -> bool {
-    !command.is_empty()
-        && command.len() <= 128
-        && command
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn valid_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let valid = (0..3).all(|_| {
-        parts
-            .next()
-            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    });
-    valid && parts.next().is_none()
+    is_valid_identifier(command, 128)
 }
 
 #[cfg(test)]

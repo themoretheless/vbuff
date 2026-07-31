@@ -93,7 +93,7 @@ impl CasStore {
         harden_directory(&quarantine)?;
         let destination = quarantine.join(format!(
             "{}-{blob_ref}-{}.corrupt",
-            kind_slug(kind),
+            kind.slug(),
             ClipId::new()
         ));
         std::fs::rename(source, destination).map_err(StoreError::Io)
@@ -125,8 +125,8 @@ impl CasStore {
 
     fn orphan_files(&self, live: &HashSet<(ContentKind, String)>) -> Result<Vec<(PathBuf, u64)>> {
         let mut orphans = Vec::new();
-        for (kind, slug) in ALL_KINDS {
-            let kind_root = self.root.join(slug);
+        for &kind in ContentKind::ALL {
+            let kind_root = self.root.join(kind.slug());
             if !kind_root.exists() {
                 continue;
             }
@@ -256,7 +256,7 @@ impl CasStore {
         }
         Ok(self
             .root
-            .join(kind_slug(kind))
+            .join(kind.slug())
             .join(&blob_ref[0..2])
             .join(&blob_ref[2..4])
             .join(blob_ref))
@@ -353,29 +353,3 @@ fn threshold_for(kind: ContentKind) -> usize {
         }
     }
 }
-
-fn kind_slug(kind: ContentKind) -> &'static str {
-    match kind {
-        ContentKind::Text => "text",
-        ContentKind::Url => "url",
-        ContentKind::Color => "color",
-        ContentKind::Code => "code",
-        ContentKind::Image => "image",
-        ContentKind::File => "file",
-        ContentKind::Rtf => "rtf",
-        ContentKind::Html => "html",
-        ContentKind::Other => "other",
-    }
-}
-
-const ALL_KINDS: [(ContentKind, &str); 9] = [
-    (ContentKind::Text, "text"),
-    (ContentKind::Url, "url"),
-    (ContentKind::Color, "color"),
-    (ContentKind::Code, "code"),
-    (ContentKind::Image, "image"),
-    (ContentKind::File, "file"),
-    (ContentKind::Rtf, "rtf"),
-    (ContentKind::Html, "html"),
-    (ContentKind::Other, "other"),
-];

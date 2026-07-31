@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::{all_zero, is_valid_identifier, is_valid_label};
 
 use super::IntegrationContractError;
 
@@ -44,12 +45,12 @@ impl AutomationCommand {
             Self::AddClip { tag: None } => return Ok(()),
             Self::AddClip { tag: Some(tag) } | Self::PasteByTag { tag } => tag,
             Self::SendToDevice { device_id } => {
-                return valid_identifier(device_id, 128)
+                return is_valid_identifier(device_id, 128)
                     .then_some(())
                     .ok_or(IntegrationContractError::InvalidField);
             }
         };
-        valid_label(value, 64)
+        is_valid_label(value, 64)
             .then_some(())
             .ok_or(IntegrationContractError::InvalidField)
     }
@@ -100,34 +101,22 @@ impl fmt::Debug for TargetedSendRequest {
 
 impl TargetedSendRequest {
     pub fn validate(&self, now_ms: u64) -> Result<(), IntegrationContractError> {
-        if self.request_id.iter().all(|byte| *byte == 0)
+        if all_zero(&self.request_id)
             || self.issued_at_ms > now_ms
             || self.expires_at_ms <= self.issued_at_ms
             || self.expires_at_ms - self.issued_at_ms > 10 * 60 * 1_000
-            || !valid_identifier(&self.target_device_id, 128)
+            || !is_valid_identifier(&self.target_device_id, 128)
         {
             return Err(IntegrationContractError::InvalidRecipient);
         }
         if now_ms >= self.expires_at_ms {
             return Err(IntegrationContractError::Expired);
         }
-        if !valid_identifier(&self.clip_id, 128) {
+        if !is_valid_identifier(&self.clip_id, 128) {
             return Err(IntegrationContractError::InvalidField);
         }
         Ok(())
     }
-}
-
-fn valid_identifier(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum_bytes
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn valid_label(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]

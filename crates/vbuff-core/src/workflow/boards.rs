@@ -1,6 +1,6 @@
 //! Temporary pin boards, queues, collectors, baskets, and action ranking.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use thiserror::Error;
@@ -430,57 +430,6 @@ impl NamedSlots {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct ActionCandidate {
-    pub id: String,
-    pub destination_apps: BTreeSet<String>,
-    pub supported_kinds: BTreeSet<ContentKind>,
-    pub usage_count: u32,
-    pub last_used_ms: u64,
-}
-
-impl fmt::Debug for ActionCandidate {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActionCandidate")
-            .field("id", &self.id)
-            .field("destination_app_count", &self.destination_apps.len())
-            .field("supported_kinds", &self.supported_kinds)
-            .field("usage_count", &self.usage_count)
-            .field("last_used_ms", &self.last_used_ms)
-            .finish()
-    }
-}
-
-pub fn rank_actions(
-    candidates: &[ActionCandidate],
-    context: &BoardContext,
-) -> Result<Vec<String>, BoardError> {
-    let mut scored = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        validate_text(&candidate.id, MAX_LABEL_BYTES)?;
-        if candidate
-            .destination_apps
-            .iter()
-            .any(|value| validate_text(value, MAX_CONTEXT_BYTES).is_err())
-        {
-            return Err(BoardError::InvalidText);
-        }
-        let destination = context
-            .app_id
-            .as_ref()
-            .is_some_and(|app| candidate.destination_apps.contains(app));
-        let kind = candidate.supported_kinds.contains(&context.kind);
-        let score = u64::from(destination) * 1_000_000_000
-            + u64::from(kind) * 100_000_000
-            + u64::from(candidate.usage_count.min(1_000_000)) * 1_000
-            + candidate.last_used_ms.min(999);
-        scored.push((score, candidate.id.clone()));
-    }
-    scored.sort_by(|left, right| right.cmp(left));
-    Ok(scored.into_iter().map(|(_, id)| id).collect())
-}
-
 fn slot_index(slot: u8) -> Result<usize, BoardError> {
     if (1..=MAX_BOARD_SLOTS as u8).contains(&slot) {
         Ok(usize::from(slot - 1))
@@ -582,34 +531,5 @@ mod tests {
         slots.assign('a', id(3)).unwrap();
         assert_eq!(slots.get('A'), Some(id(3)));
         assert_eq!(slots.assign('Z', id(4)), Err(BoardError::InvalidSlot));
-    }
-
-    #[test]
-    fn destination_and_kind_dominate_action_ranking() {
-        let context = BoardContext {
-            app_id: Some("dev.editor".into()),
-            window_class: None,
-            kind: ContentKind::Code,
-        };
-        let candidates = [
-            ActionCandidate {
-                id: "popular".into(),
-                destination_apps: BTreeSet::new(),
-                supported_kinds: BTreeSet::new(),
-                usage_count: 100,
-                last_used_ms: 999,
-            },
-            ActionCandidate {
-                id: "editor-code".into(),
-                destination_apps: BTreeSet::from(["dev.editor".into()]),
-                supported_kinds: BTreeSet::from([ContentKind::Code]),
-                usage_count: 0,
-                last_used_ms: 0,
-            },
-        ];
-        assert_eq!(
-            rank_actions(&candidates, &context).unwrap()[0],
-            "editor-code"
-        );
     }
 }

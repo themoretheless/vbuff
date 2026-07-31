@@ -1,6 +1,7 @@
 //! Typed encrypted artifacts that can accompany a replicated clip.
 
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::is_valid_identifier;
 
 use crate::crypto::SealedEnvelope;
 use crate::policy::{DeviceLane, SyncContext, SyncPolicy, seal_if_allowed};
@@ -36,12 +37,7 @@ impl std::fmt::Debug for EmbeddingArtifact {
 
 impl EmbeddingArtifact {
     pub fn validate(&self) -> Result<()> {
-        if self.backend_id.is_empty()
-            || self.backend_id.len() > 128
-            || !self
-                .backend_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        if !is_valid_identifier(&self.backend_id, 128)
             || self.dimensions == 0
             || usize::from(self.dimensions) > MAX_EMBEDDING_DIMENSIONS
             || self.vector.len() != usize::from(self.dimensions)
