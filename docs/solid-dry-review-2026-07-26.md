@@ -68,13 +68,17 @@
 
 ## План волн
 
-**Волна A — «Снять мины» (S, ~2-3 дня, поведение не меняется):**
-1. Удалить все файлы-сироты (T7) — одним коммитом на крейт.
-2. `vbuff-types::validation` + замена ~20 копий (T2); заодно `all_zero` ×15 инлайн.
-3. Единый kind-кодек в types + параметризация SQL-литералов (T3).
-4. `tighten_sensitive` + `SENSITIVE_SCRUB_SET` (T6-store); `count()` без DELETE, purge в idle-тик (T8).
-5. callback replay-window retain (T5); `VerifierState.schema` (T11); signing-preimage в update + доменная конвенция (T5).
-6. Удалить `paste_modifier` из CONFIG_KEYS; `SecurityPosture::level()` общий для main/doctor; enum-mirrors capability → types (T4, T9).
+**Волна A — «Снять мины» — ЗАКРЫТА 2026-07-31** (коммиты `04c9768`, `21823e3`, `0480cd5`):
+1. ✅ Файлы-сироты удалены во всех пяти зонах (T7); ссылки в docs/implementation-batch-* на удалённые файлы переписаны в «Retired».
+2. ✅ `vbuff-types::validation` + миграция копий в ipc/sync/store/core/plugin/update (T2). Обследование зафиксировало, что «core/trust ×4» из ревью не подтверждается: в trust одна копия, остальные жили в recall/feedback/intelligence.
+3. ✅ `ContentKind::{stored_discriminant, from_stored_discriminant, slug, FromStr}` в types (T3); store перешёл на fail-closed декод (было молчаливое `_ => Other`), литерал `kind = 7` получил один источник и пин-тест на текст триггера. `recall::kind_code` намеренно оставлен локальным доменом фингерпринта (не персистится) с doc-comment.
+4. ✅ `tighten_sensitive` + `SENSITIVE_SCRUB_SET` (T6-store); `count()` больше не удаляет (T8). Побочно закрыты два расхождения в сторону ужесточения: clawback больше не растягивает более короткий TTL, импорт получил тот же потолок TTL.
+5. ✅ callback replay-окно ограничено по времени и числу записей + монотонный пол часов (T5); `VerifierState` получил версию схемы, integrity-checksum и связку verify+store (T11); три signing-preimage в update слиты в одну функцию с пин-тестами байтов (T5). Доменная конвенция описана в [domain-separation-convention.md](domain-separation-convention.md).
+6. ✅ `paste_modifier` убран из модели (ключ TOML остаётся принимаемым, чтобы существующие конфиги грузились); `SecurityPosture::level()`/`summary()` — единый вердикт для GUI и doctor; зеркала `CapabilityLevel/Severity/FeatureCapability`, `PrivacyDecisionKind`, `SelectionSource` заменены на типы из vbuff-types (T4, T9).
+
+**Найдено сверх плана и исправлено:** аудит доменных строк (42 билдера, а не 9) выявил реальную коллизию в `sync/merkle.rs::leaf_hash` — два поля переменной длины без длин-префиксов, идентификаторы от пира не валидируются; два разных набора записей давали один корень, и расхождение навсегда пряталось от реконсиляции. Исправлено длин-префиксами с бампом домена до `v2` (потребителей вне модуля не было) + регрессионный тест на конкретную коллизию.
+
+**Проверено и отклонено:** заявка того же аудита о расхождении `content_hash` / `content_hash_from_flavors` на spilled-флейворах не является живым дефектом — все пути гидратируют клип до пересчёта хеша, а `content_hash` вообще не имеет продакшн-вызовов.
 
 **Волна B — «Единые примитивы» (M, ~1-1.5 недели):**
 1. Query AST + реестр FacetSpec + `normalize_lookup` (T1) — с goldens на обе стороны.
