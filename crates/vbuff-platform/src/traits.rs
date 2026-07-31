@@ -32,13 +32,10 @@ pub struct KeyCombo {
     pub key: String,
 }
 
-/// Which OS selection supplied the snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ClipboardSelection {
-    #[default]
-    Clipboard,
-    Primary,
-}
+/// Which OS selection supplied the snapshot. Historical platform-side name
+/// for the shared [`vbuff_types::SelectionSource`] vocabulary: the capture
+/// gate consumes exactly this value, so there is nothing to translate.
+pub use vbuff_types::SelectionSource as ClipboardSelection;
 
 /// Retention request attached to a clipboard write.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

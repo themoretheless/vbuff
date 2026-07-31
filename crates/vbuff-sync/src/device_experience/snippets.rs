@@ -51,10 +51,7 @@ impl SharedSnippetProposal {
         author_device_hash: [u8; 32],
         base_revision: u64,
     ) -> Result<Self> {
-        if all_zero(&proposal_id)
-            || all_zero(&snippet_hash)
-            || all_zero(&author_device_hash)
-        {
+        if all_zero(&proposal_id) || all_zero(&snippet_hash) || all_zero(&author_device_hash) {
             return Err(SyncError::Invalid("invalid snippet proposal id".into()));
         }
         Ok(Self {

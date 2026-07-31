@@ -1442,8 +1442,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut declared = clip("no detectable secret here");
         declared.meta.sensitive = true;
-        declared.meta.sensitivity_reason =
-            Some(vbuff_types::SensitivityReason::CaptureRule);
+        declared.meta.sensitivity_reason = Some(vbuff_types::SensitivityReason::CaptureRule);
         declared.meta.sync_eligible = false;
 
         assert!(store.stage_import(&declared, "backup.json").is_err());
@@ -1474,8 +1473,12 @@ mod tests {
     #[test]
     fn stale_import_quarantine_entries_are_purged_and_become_unavailable() {
         let store = Store::open_in_memory().unwrap();
-        let fresh_id = store.stage_import(&clip("fresh import"), "backup.json").unwrap();
-        let stale_id = store.stage_import(&clip("stale import"), "backup.json").unwrap();
+        let fresh_id = store
+            .stage_import(&clip("fresh import"), "backup.json")
+            .unwrap();
+        let stale_id = store
+            .stage_import(&clip("stale import"), "backup.json")
+            .unwrap();
         // Age one entry beyond the quarantine TTL.
         store
             .conn

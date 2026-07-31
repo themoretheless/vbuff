@@ -4,9 +4,12 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use vbuff_types::validation;
 
+use crate::manifest::signing_preimage;
 use crate::{Result, UpdateError};
 
-const ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"vbuff-build-attestation-v1\0";
+/// Bare label; the NUL terminator is framing and belongs to
+/// [`signing_preimage`], which documents the convention.
+const ATTESTATION_SIGNATURE_DOMAIN: &str = "vbuff-build-attestation-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildAttestation {
@@ -79,13 +82,10 @@ impl SignedBuildAttestation {
 fn signing_bytes(key_id: &str, attestation: &BuildAttestation) -> Result<Vec<u8>> {
     validate_key_id(key_id)?;
     let canonical = attestation.canonical_bytes()?;
-    let mut bytes =
-        Vec::with_capacity(ATTESTATION_SIGNATURE_DOMAIN.len() + key_id.len() + 1 + canonical.len());
-    bytes.extend_from_slice(ATTESTATION_SIGNATURE_DOMAIN);
-    bytes.extend_from_slice(key_id.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(&canonical);
-    Ok(bytes)
+    Ok(signing_preimage(
+        ATTESTATION_SIGNATURE_DOMAIN,
+        &[key_id.as_bytes(), &canonical],
+    ))
 }
 
 fn validate_key_id(key_id: &str) -> Result<()> {
@@ -148,6 +148,42 @@ pub fn verify_reader_checksum(mut reader: impl Read, expected: &[u8; 32]) -> Res
 mod tests {
     use super::*;
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Byte-for-byte pin of the attestation signing preimage: domain,
+    /// terminator, key id, separator, canonical JSON, no trailing terminator.
+    /// Any drift here invalidates every attestation already published.
+    #[test]
+    fn attestation_signing_preimage_is_pinned() {
+        let bytes = signing_bytes(
+            "release-1",
+            &BuildAttestation {
+                schema: 1,
+                source_commit: "0123456789abcdef".into(),
+                builder_id: "https://github.com/vbuff/vbuff/actions".into(),
+                source_date_epoch: 1_700_000_000,
+                artifact_sha256: [0xab; 32],
+            },
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"vbuff-build-attestation-v1\0release-1\0"));
+        assert_eq!(
+            hex(&bytes),
+            "76627566662d6275696c642d6174746573746174696f6e2d76310072656c65617365\
+             2d31007b22736368656d61223a312c22736f757263655f636f6d6d6974223a223031\
+             3233343536373839616263646566222c226275696c6465725f6964223a2268747470\
+             733a2f2f6769746875622e636f6d2f76627566662f76627566662f616374696f6e73\
+             222c22736f757263655f646174655f65706f6368223a313730303030303030302c22\
+             61727469666163745f736861323536223a5b3137312c3137312c3137312c3137312c\
+             3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137\
+             312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c\
+             3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137\
+             312c3137312c3137315d7d"
+        );
+    }
+
     #[test]
     fn attestation_binds_source_builder_and_artifact() {
         let key = SigningKey::from_bytes(&[5; 32]);
@@ -183,11 +219,7 @@ mod tests {
     #[test]
     fn streaming_verifier_accepts_only_exact_hex_and_bytes() {
         let expected = sha256_bytes(b"artifact");
-        let encoded = expected
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(parse_sha256_hex(&encoded).unwrap(), expected);
+        assert_eq!(parse_sha256_hex(&hex(&expected)).unwrap(), expected);
         assert_eq!(
             verify_reader_checksum(&b"artifact"[..], &expected).unwrap(),
             expected

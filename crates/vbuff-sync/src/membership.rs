@@ -630,8 +630,13 @@ mod tests {
             );
             let (_, _, c_member) = member_parts("c", 43, 44);
             assert!(
-                log.append(MembershipAction::Add(c_member.clone()), bad, clock.clone(), &a_key)
-                    .is_err()
+                log.append(
+                    MembershipAction::Add(c_member.clone()),
+                    bad,
+                    clock.clone(),
+                    &a_key
+                )
+                .is_err()
             );
             assert!(
                 log.append(

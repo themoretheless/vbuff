@@ -180,10 +180,7 @@ impl McpSessionLease {
         user_consented: bool,
     ) -> Result<Self, IntegrationContractError> {
         policy.validate()?;
-        if all_zero(session_key)
-            || !user_consented
-            || ttl_ms == 0
-            || ttl_ms > MAX_MCP_LEASE_TTL_MS
+        if all_zero(session_key) || !user_consented || ttl_ms == 0 || ttl_ms > MAX_MCP_LEASE_TTL_MS
         {
             return Err(IntegrationContractError::InvalidField);
         }

@@ -4,6 +4,7 @@ use serde::Serialize;
 use vbuff_platform::lifecycle::SessionContext;
 use vbuff_platform::{ProcessHardeningReport, SecurityPosture};
 use vbuff_store::{Store, StoreDoctorReport, StoreOpenProfile};
+use vbuff_types::SecurityPostureLevel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DoctorFormat {
@@ -26,8 +27,11 @@ struct DoctorOutput {
     store: StoreDoctorReport,
 }
 
+/// Health is the store plus the one shared security verdict
+/// ([`SecurityPosture::level`]), so `doctor` can never call a machine healthy
+/// while the GUI badge reports the same posture as degraded.
 fn doctor_ok(store_present: bool, store: &StoreDoctorReport, posture: &SecurityPosture) -> bool {
-    store_present && store.is_healthy() && posture.required_capabilities_satisfied()
+    store_present && store.is_healthy() && posture.level() == SecurityPostureLevel::Protected
 }
 
 pub(crate) fn requested() -> Option<DoctorFormat> {

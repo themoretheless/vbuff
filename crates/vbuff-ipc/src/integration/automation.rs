@@ -379,7 +379,8 @@ mod tests {
         let plan = plan_snippet_mirror(&[], &target, None).unwrap();
         assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
         // Trusted base that never saw the key.
-        let plan = plan_snippet_mirror(&[], &target, Some(&SnippetSyncManifest::default())).unwrap();
+        let plan =
+            plan_snippet_mirror(&[], &target, Some(&SnippetSyncManifest::default())).unwrap();
         assert_eq!(plan[0].action, SnippetMirrorAction::Conflict);
         // Tombstoned in the base but present on target: still no safe delete.
         let base = snippet_manifest(&[("local-only", SnippetSyncedState::Deleted)]);
@@ -562,7 +563,10 @@ mod tests {
                 },
             ),
         ]);
-        let source = [snippet_record("deploy", 1, 5), snippet_record("conflict", 6, 9)];
+        let source = [
+            snippet_record("deploy", 1, 5),
+            snippet_record("conflict", 6, 9),
+        ];
         let target = [
             snippet_record("deploy", 2, 1),
             snippet_record("old", 4, 3),

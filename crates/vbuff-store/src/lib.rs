@@ -3402,7 +3402,10 @@ mod tests {
     fn unknown_kind_discriminant_fails_closed_as_corrupt() {
         let store = Store::open_in_memory().unwrap();
         store.insert(&make_clip("victim")).unwrap();
-        store.conn.execute("UPDATE clips SET kind = 99", []).unwrap();
+        store
+            .conn
+            .execute("UPDATE clips SET kind = 99", [])
+            .unwrap();
         let error = store.list(10).unwrap_err();
         assert!(matches!(error, StoreError::Corrupt(_)));
     }

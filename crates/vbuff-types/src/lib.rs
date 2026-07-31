@@ -30,7 +30,7 @@ pub use status::{
     CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CaptureBudgetAlert, CaptureHealth,
     CapturePauseReason, CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel,
     PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel,
-    SecurityPostureSummary, SloMetricState, SloStatusSummary,
+    SecurityPostureSummary, SelectionSource, SloMetricState, SloStatusSummary,
 };
 
 /// A ULID-based identifier for a clip.
@@ -822,7 +822,10 @@ mod tests {
         let json = serde_json::to_value(&meta).unwrap();
         // Simulate a database row written before the field existed.
         let mut older = json.clone();
-        older.as_object_mut().unwrap().remove("provenance_confidence");
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance_confidence");
         let restored: ClipMeta = serde_json::from_value(older).unwrap();
         assert_eq!(
             restored.provenance_confidence,

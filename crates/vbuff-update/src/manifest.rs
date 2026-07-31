@@ -11,8 +11,64 @@ use crate::{Result, UpdateError};
 const MAX_ARTIFACTS: usize = 32;
 const MAX_TARGET_LEN: usize = 96;
 const MAX_ARTIFACT_URL_LEN: usize = 2 * 1024;
-const UPDATE_SIGNATURE_DOMAIN: &[u8] = b"vbuff-update-manifest-v1\0";
-const ROTATION_CONFIRMATION_DOMAIN: &[u8] = b"vbuff-update-key-rotation-v1\0";
+const UPDATE_SIGNATURE_DOMAIN: &str = "vbuff-update-manifest-v1";
+const ROTATION_CONFIRMATION_DOMAIN: &str = "vbuff-update-key-rotation-v1";
+
+/// Builds the byte string that every signature in this crate is computed over.
+///
+/// Layout, and the written domain convention it encodes:
+///
+/// ```text
+/// domain || 0x00 || parts[0] || 0x00 || parts[1] || … || parts[n-1]
+/// ```
+///
+/// * **The domain is a bare ASCII label, never a NUL-terminated constant.**
+///   The terminator belongs to the framing, so it is appended here exactly
+///   once. Constants that carried their own `\0` were the reason the
+///   convention drifted: a copied constant can silently lose the terminator,
+///   and nothing in the type system notices.
+/// * **The domain terminator is mandatory**, even when `parts` is empty.
+///   Without it `"vbuff-update-manifest-v1"` + `"x"` and
+///   `"vbuff-update-manifest-v1x"` + `""` would hash identically, so a
+///   signature made under one domain could be replayed under another whose
+///   name is a prefix of the first.
+/// * **Exactly one `0x00` separates adjacent parts, and there is no trailing
+///   terminator** after the final part. This is what the three historical
+///   copies did, so the bytes are unchanged; see the pinned tests.
+/// * **No length prefixes.** The framing is therefore only unambiguous while
+///   every part except the last is NUL-free — the caller's obligation. All
+///   current call sites pass a key id validated by
+///   `vbuff_types::validation::valid_key_id` (`[A-Za-z0-9._-]`, so NUL-free)
+///   followed by a single trailing payload, which may contain anything.
+///   `serde_json` output cannot contain a raw NUL in any case, since control
+///   characters are escaped. A caller that needs two variable-length,
+///   NUL-permitting fields must add explicit length framing rather than lean
+///   on this function.
+///
+/// The debug assertion below is the executable form of that obligation.
+///
+/// Shared with [`crate::attestation`]; each module keeps its own domain
+/// constant next to the payload it covers, and the framing lives only here.
+pub(crate) fn signing_preimage(domain: &str, parts: &[&[u8]]) -> Vec<u8> {
+    debug_assert!(
+        parts
+            .split_last()
+            .is_none_or(|(_, leading)| leading.iter().all(|part| !part.contains(&0))),
+        "only the final signing-preimage part may contain NUL bytes"
+    );
+    let capacity =
+        domain.len() + parts.len().max(1) + parts.iter().map(|part| part.len()).sum::<usize>();
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(domain.as_bytes());
+    bytes.push(0);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(part);
+    }
+    bytes
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -81,14 +137,10 @@ impl KeyRotation {
             manifest_sequence,
         })
         .map_err(|error| UpdateError::Serialization(error.to_string()))?;
-        let mut bytes = Vec::with_capacity(
-            ROTATION_CONFIRMATION_DOMAIN.len() + key_id.len() + 1 + payload.len(),
-        );
-        bytes.extend_from_slice(ROTATION_CONFIRMATION_DOMAIN);
-        bytes.extend_from_slice(key_id.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(&payload);
-        Ok(bytes)
+        Ok(signing_preimage(
+            ROTATION_CONFIRMATION_DOMAIN,
+            &[key_id.as_bytes(), &payload],
+        ))
     }
 }
 
@@ -376,15 +428,17 @@ fn validate_key_id(key_id: &str) -> Result<()> {
 fn manifest_signing_bytes(key_id: &str, manifest: &UpdateManifest) -> Result<Vec<u8>> {
     validate_key_id(key_id)?;
     let canonical = manifest.canonical_bytes()?;
-    let mut bytes =
-        Vec::with_capacity(UPDATE_SIGNATURE_DOMAIN.len() + key_id.len() + 1 + canonical.len());
-    bytes.extend_from_slice(UPDATE_SIGNATURE_DOMAIN);
-    bytes.extend_from_slice(key_id.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(&canonical);
-    Ok(bytes)
+    Ok(signing_preimage(
+        UPDATE_SIGNATURE_DOMAIN,
+        &[key_id.as_bytes(), &canonical],
+    ))
 }
 
+/// Not a signing preimage: this is a stable bucket assignment, and its
+/// framing is deliberately its own. The domain carries no terminator and the
+/// fixed-width sequence precedes the trailing installation id, which is
+/// unambiguous without one. Re-framing it through [`signing_preimage`] would
+/// reshuffle every installation's rollout bucket, so it stays as published.
 fn rollout_bucket(installation_id: &[u8], sequence: u64) -> u8 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"vbuff-staged-rollout-v1");
@@ -398,6 +452,33 @@ fn rollout_bucket(installation_id: &[u8], sequence: u64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lower-case hex, so a broken pin prints a diff that can be read and
+    /// copied instead of a thousand-element byte-vector dump.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Fixture shared by the two manifest preimage pins. Deliberately built
+    /// here rather than via `manifest()`: the pinned bytes must not move when
+    /// an unrelated test tweaks that helper.
+    fn pinned_manifest() -> UpdateManifest {
+        UpdateManifest {
+            schema: 2,
+            sequence: 7,
+            version: Version::parse("1.2.3").unwrap(),
+            minimum_client: Version::parse("1.0.0").unwrap(),
+            published_at_ms: 1_700_000_000_000,
+            rollout_percent: 50,
+            artifacts: vec![Artifact {
+                target: "aarch64-apple-darwin".into(),
+                url: "https://releases.vbuff.dev/vbuff".into(),
+                sha256: [0xab; 32],
+                byte_size: 1024,
+            }],
+            next_key: None,
+        }
+    }
 
     fn manifest(sequence: u64, version: &str) -> UpdateManifest {
         UpdateManifest {
@@ -520,7 +601,8 @@ mod tests {
             .unwrap();
 
         // Past the watermark but before activation: the new key is not live.
-        let early = SignedUpdateManifest::sign("release-2", manifest(11, "0.3.0"), &second).unwrap();
+        let early =
+            SignedUpdateManifest::sign("release-2", manifest(11, "0.3.0"), &second).unwrap();
         assert_eq!(
             verifier.verify(&early, &Version::parse("0.2.0").unwrap(), b"install"),
             Err(UpdateError::UntrustedKey)
@@ -638,8 +720,7 @@ mod tests {
     fn schema_one_rejects_key_rotation() {
         let second = SigningKey::from_bytes(&[2; 32]);
         let mut rotating = manifest(10, "0.2.0");
-        rotating.next_key =
-            Some(KeyRotation::confirmed("release-2", &second, 11, 10).unwrap());
+        rotating.next_key = Some(KeyRotation::confirmed("release-2", &second, 11, 10).unwrap());
         assert!(matches!(
             rotating.validate(),
             Err(UpdateError::InvalidManifest(_))
@@ -702,6 +783,73 @@ mod tests {
         assert_eq!(
             verifier(&first).verify(&signed, &Version::parse("0.1.0").unwrap(), b"install"),
             Err(UpdateError::InvalidSignature)
+        );
+    }
+
+    /// Pins the framing itself. Every byte below is load-bearing: the domain
+    /// terminator, the single separator between parts, and the *absence* of a
+    /// trailing terminator. Changing any of them silently invalidates every
+    /// signature ever issued by this crate.
+    #[test]
+    fn signing_preimage_framing_is_pinned() {
+        // "dom" 0x00 "a" 0x00 "bc"
+        assert_eq!(
+            hex(&signing_preimage("dom", &[b"a", b"bc"])),
+            "646f6d0061006263"
+        );
+        // A lone part is terminated by the domain separator only.
+        assert_eq!(hex(&signing_preimage("dom", &[b"a"])), "646f6d0061");
+        // The domain terminator is emitted even with nothing to separate.
+        assert_eq!(hex(&signing_preimage("dom", &[])), "646f6d00");
+        // Prefix-domain confusion is what the terminator buys: without it
+        // both of these would be the same byte string.
+        assert_ne!(
+            signing_preimage("dom", &[b"ain"]),
+            signing_preimage("domain", &[b""])
+        );
+        // Empty parts still consume a separator, so the split stays unique.
+        assert_eq!(hex(&signing_preimage("d", &[b"", b"x"])), "64000078");
+    }
+
+    /// Byte-for-byte pin of the manifest signing preimage. These are the
+    /// bytes released manifests were signed over; they must never move.
+    #[test]
+    fn manifest_signing_preimage_is_pinned() {
+        let bytes = manifest_signing_bytes("release-1", &pinned_manifest()).unwrap();
+        assert!(bytes.starts_with(b"vbuff-update-manifest-v1\0release-1\0"));
+        assert_eq!(
+            hex(&bytes),
+            "76627566662d7570646174652d6d616e69666573742d76310072656c656173652d31\
+             007b22736368656d61223a322c2273657175656e6365223a372c2276657273696f6e\
+             223a22312e322e33222c226d696e696d756d5f636c69656e74223a22312e302e3022\
+             2c227075626c69736865645f61745f6d73223a313730303030303030303030302c22\
+             726f6c6c6f75745f70657263656e74223a35302c22617274696661637473223a5b7b\
+             22746172676574223a22616172636836342d6170706c652d64617277696e222c2275\
+             726c223a2268747470733a2f2f72656c65617365732e76627566662e6465762f7662\
+             756666222c22736861323536223a5b3137312c3137312c3137312c3137312c313731\
+             2c3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c31\
+             37312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c313731\
+             2c3137312c3137312c3137312c3137312c3137312c3137312c3137312c3137312c31\
+             37312c3137315d2c22627974655f73697a65223a313032347d5d2c226e6578745f6b\
+             6579223a6e756c6c7d"
+        );
+    }
+
+    /// Byte-for-byte pin of the key-rotation proof-of-possession preimage.
+    #[test]
+    fn rotation_confirmation_preimage_is_pinned() {
+        let bytes = KeyRotation::confirmation_bytes("release-2", &[0xcd; 32], 11, 7).unwrap();
+        assert!(bytes.starts_with(b"vbuff-update-key-rotation-v1\0release-2\0"));
+        assert_eq!(
+            hex(&bytes),
+            "76627566662d7570646174652d6b65792d726f746174696f6e2d76310072656c6561\
+             73652d32007b226b65795f6964223a2272656c656173652d32222c227075626c6963\
+             5f6b6579223a5b3230352c3230352c3230352c3230352c3230352c3230352c323035\
+             2c3230352c3230352c3230352c3230352c3230352c3230352c3230352c3230352c32\
+             30352c3230352c3230352c3230352c3230352c3230352c3230352c3230352c323035\
+             2c3230352c3230352c3230352c3230352c3230352c3230352c3230352c3230355d2c\
+             226163746976617465735f61745f73657175656e6365223a31312c226d616e696665\
+             73745f73657175656e6365223a377d"
         );
     }
 

@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vbuff_core::capture::{CaptureOutcome, DropClass};
-use vbuff_core::privacy::{PrivacyDecisionKind, PrivacyLedger};
+use vbuff_core::privacy::PrivacyLedger;
 use vbuff_gui::SharedState;
 use vbuff_types::{
-    CaptureBudgetAlert, CaptureHealth, NoticeLevel, PrivacyDecisionLevel, PrivacyEventSummary,
-    PrivacyLedgerSummary, SloMetricState,
+    CaptureBudgetAlert, CaptureHealth, NoticeLevel, PrivacyEventSummary, PrivacyLedgerSummary,
+    SloMetricState,
 };
 
 use crate::runtime_metrics::{RuntimeMetrics, RuntimeSnapshot};
@@ -172,11 +172,7 @@ fn privacy_summary(ledger: &PrivacyLedger) -> PrivacyLedgerSummary {
                 sequence: entry.sequence,
                 timestamp_ms: entry.timestamp_ms,
                 count: entry.count,
-                decision: match entry.decision {
-                    PrivacyDecisionKind::Captured => PrivacyDecisionLevel::Captured,
-                    PrivacyDecisionKind::Skipped => PrivacyDecisionLevel::Skipped,
-                    PrivacyDecisionKind::Lost => PrivacyDecisionLevel::Lost,
-                },
+                decision: entry.decision,
                 reason: entry.reason.into(),
             })
             .collect(),

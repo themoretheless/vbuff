@@ -106,10 +106,7 @@ impl Osc52Policy {
         if self.maximum_bytes == 0
             || self.maximum_bytes > MAX_OSC52_PAYLOAD_BYTES
             || self.allowed_remote_hosts.len() > MAX_ALLOWED_REMOTE_HOSTS
-            || self
-                .allowed_remote_hosts
-                .iter()
-                .any(|host| all_zero(host))
+            || self.allowed_remote_hosts.iter().any(|host| all_zero(host))
             || (!self.allow_remote && !self.allowed_remote_hosts.is_empty())
         {
             return Err(IntegrationContractError::InvalidField);
