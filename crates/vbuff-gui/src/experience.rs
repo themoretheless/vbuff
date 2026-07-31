@@ -88,6 +88,25 @@ pub enum HandedMode {
     Right,
 }
 
+/// Smallest selectable interface scale, in percent.
+pub const UI_SCALE_MIN_PERCENT: u16 = 75;
+/// Largest selectable interface scale, in percent.
+pub const UI_SCALE_MAX_PERCENT: u16 = 200;
+/// Default interface scale: the platform default, unscaled.
+pub const UI_SCALE_DEFAULT_PERCENT: u16 = 100;
+/// Selectable interface scale steps, in percent.
+pub const UI_SCALE_PRESETS: &[u16] = &[75, 90, 100, 110, 125, 150, 175, 200];
+
+/// Snap an arbitrary scale percentage to the nearest supported preset.
+pub fn snap_ui_scale_percent(percent: u16) -> u16 {
+    let clamped = percent.clamp(UI_SCALE_MIN_PERCENT, UI_SCALE_MAX_PERCENT);
+    UI_SCALE_PRESETS
+        .iter()
+        .copied()
+        .min_by_key(|preset| preset.abs_diff(clamped))
+        .unwrap_or(UI_SCALE_DEFAULT_PERCENT)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiPreferences {
     pub density: DensityMode,
@@ -96,6 +115,18 @@ pub struct UiPreferences {
     pub handed_mode: HandedMode,
     pub motion_inspector: bool,
     pub show_health_digest: bool,
+    /// Interface scale in percent; presented snapped to [`UI_SCALE_PRESETS`].
+    pub ui_scale_percent: u16,
+}
+
+impl UiPreferences {
+    /// Clamp the stored percentage and express it as an egui zoom factor.
+    pub fn ui_scale_factor(&self) -> f32 {
+        f32::from(
+            self.ui_scale_percent
+                .clamp(UI_SCALE_MIN_PERCENT, UI_SCALE_MAX_PERCENT),
+        ) / 100.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,6 +158,7 @@ impl Default for UiPreferences {
             handed_mode: HandedMode::Off,
             motion_inspector: false,
             show_health_digest: false,
+            ui_scale_percent: UI_SCALE_DEFAULT_PERCENT,
         }
     }
 }
@@ -460,6 +492,30 @@ mod tests {
         );
         assert_eq!(HistoryScope::from_jump_key('x'), None);
         assert!(!format!("{:?}", HistoryScope::Source("private.app".into())).contains("private"));
+    }
+
+    #[test]
+    fn ui_scale_percent_snaps_to_presets_and_clamps() {
+        assert_eq!(snap_ui_scale_percent(100), 100);
+        assert_eq!(snap_ui_scale_percent(103), 100);
+        assert_eq!(snap_ui_scale_percent(107), 110);
+        assert_eq!(snap_ui_scale_percent(0), UI_SCALE_MIN_PERCENT);
+        assert_eq!(snap_ui_scale_percent(999), UI_SCALE_MAX_PERCENT);
+    }
+
+    #[test]
+    fn ui_scale_factor_is_clamped_to_the_supported_range() {
+        let low = UiPreferences {
+            ui_scale_percent: 10,
+            ..Default::default()
+        };
+        assert!((low.ui_scale_factor() - 0.75).abs() < f32::EPSILON);
+        let high = UiPreferences {
+            ui_scale_percent: 400,
+            ..Default::default()
+        };
+        assert!((high.ui_scale_factor() - 2.0).abs() < f32::EPSILON);
+        assert!((UiPreferences::default().ui_scale_factor() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]

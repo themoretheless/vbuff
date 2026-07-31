@@ -34,8 +34,9 @@ use vbuff_types::{
 use crate::design::{self, Icon};
 use crate::experience::{
     ClipBadge, DeliveryCapabilities, DensityMode, FocusLossGuard, FocusLossState, HandedMode,
-    HistoryScope, MotionBudget, ScrollTuner, UiPreferences, clip_badges, contextual_search_hint,
-    contrast_ratio, match_highlight_alpha,
+    HistoryScope, MotionBudget, ScrollTuner, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_PRESETS,
+    UiPreferences, clip_badges, contextual_search_hint, contrast_ratio, match_highlight_alpha,
+    snap_ui_scale_percent,
 };
 use crate::navigation::PopupSurface;
 use crate::projection::{FilteredClip, clip_is_expired, filter_clips};
@@ -140,6 +141,9 @@ pub struct PopupApp {
     request_focus_next_frame: bool,
     /// Set after global spacing and interaction tokens are installed.
     design_signature: Option<(bool, bool)>,
+    /// Last interface scale pushed to the egui context (or adopted back from
+    /// keyboard zoom), as a zoom factor.
+    applied_ui_scale: f32,
     /// True while the destructive clear-history confirmation is open.
     confirm_clear_history: bool,
     /// Clip awaiting explicit delete confirmation.
@@ -189,6 +193,7 @@ impl PopupApp {
             thumbnails: std::collections::HashMap::new(),
             request_focus_next_frame: false,
             design_signature: None,
+            applied_ui_scale: 1.0,
             confirm_clear_history: false,
             confirm_delete: None,
             confirm_profile: None,
@@ -277,6 +282,38 @@ impl PopupApp {
         self.preferences = preferences;
     }
 
+    /// Keep the egui zoom factor and the persisted interface scale in sync.
+    ///
+    /// Settings changes push the preference to the context; egui keyboard
+    /// zoom (Cmd/Ctrl +/-) pulls back into the preference, so both paths stay
+    /// consistent and the usual preference-diff persists the result.
+    fn sync_ui_scale(&mut self, ctx: &egui::Context) {
+        if !ctx.options(|o| o.zoom_with_keyboard) {
+            ctx.options_mut(|o| o.zoom_with_keyboard = true);
+        }
+        const TOLERANCE: f32 = 0.001;
+        let preference_scale = self.preferences.ui_scale_factor();
+        let context_scale = ctx.zoom_factor();
+        if (preference_scale - self.applied_ui_scale).abs() > TOLERANCE {
+            ctx.set_zoom_factor(preference_scale);
+            // Re-request the base point size: physical pixels scale with the
+            // zoom factor, so the same layout stays visible, rendered larger.
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
+                design::POPUP_SIZE[0],
+                design::POPUP_SIZE[1],
+            )));
+            self.applied_ui_scale = preference_scale;
+        } else if (context_scale - self.applied_ui_scale).abs() > TOLERANCE {
+            let snapped = snap_ui_scale_percent((context_scale * 100.0).round() as u16);
+            self.preferences.ui_scale_percent = snapped;
+            let snapped_scale = f32::from(snapped) / 100.0;
+            if (snapped_scale - context_scale).abs() > TOLERANCE {
+                ctx.set_zoom_factor(snapped_scale);
+            }
+            self.applied_ui_scale = snapped_scale;
+        }
+    }
+
     /// Describe what selecting a row can honestly do on this native backend.
     pub fn set_delivery_capabilities(&mut self, capabilities: DeliveryCapabilities) {
         self.delivery = capabilities;
@@ -340,6 +377,7 @@ impl eframe::App for PopupApp {
             design::apply(&ctx, self.preferences.reduced_motion);
             self.design_signature = Some(design_signature);
         }
+        self.sync_ui_scale(&ctx);
 
         // 1. Keep the hidden resident path content-light. A hidden supervisory
         // repaint reads only activation and accessibility metadata.
@@ -1511,6 +1549,42 @@ impl PopupApp {
                         "Comfortable",
                     );
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Interface scale");
+                    let current = self.preferences.ui_scale_percent;
+                    let smaller = UI_SCALE_PRESETS
+                        .iter()
+                        .rev()
+                        .find(|preset| **preset < current);
+                    if ui
+                        .add_enabled(smaller.is_some(), egui::Button::new("−"))
+                        .clicked()
+                        && let Some(preset) = smaller
+                    {
+                        self.preferences.ui_scale_percent = *preset;
+                    }
+                    ui.label(RichText::new(format!("{current}%")).monospace());
+                    let larger = UI_SCALE_PRESETS.iter().find(|preset| **preset > current);
+                    if ui
+                        .add_enabled(larger.is_some(), egui::Button::new("+"))
+                        .clicked()
+                        && let Some(preset) = larger
+                    {
+                        self.preferences.ui_scale_percent = *preset;
+                    }
+                    if current != UI_SCALE_DEFAULT_PERCENT && ui.button("Reset").clicked() {
+                        self.preferences.ui_scale_percent = UI_SCALE_DEFAULT_PERCENT;
+                    }
+                });
+                ui.label(
+                    RichText::new(if cfg!(target_os = "macos") {
+                        "Zoom with Cmd +/-/0"
+                    } else {
+                        "Zoom with Ctrl +/-/0"
+                    })
+                    .small()
+                    .weak(),
+                );
                 ui.checkbox(&mut self.preferences.large_preview, "Large preview pane");
                 ui.checkbox(&mut self.preferences.reduced_motion, "Reduced motion");
 

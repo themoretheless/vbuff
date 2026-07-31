@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use vbuff_core::onboarding::DefaultProfile;
-use vbuff_gui::{DensityMode, HandedMode, UiPreferences};
+use vbuff_gui::{
+    DensityMode, HandedMode, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT, UI_SCALE_MIN_PERCENT,
+    UiPreferences, snap_ui_scale_percent,
+};
 
 const CONFIG_SCHEMA_VERSION: u16 = 2;
 const LEGACY_CONFIG_SCHEMA_VERSION: u16 = 1;
@@ -84,6 +87,8 @@ pub struct Config {
     pub ui_motion_inspector: bool,
     /// Expand the metadata-only clipboard health digest.
     pub ui_show_health_digest: bool,
+    /// Interface scale in percent (75..=200); 100 follows the platform default.
+    pub ui_scale_percent: u16,
 }
 
 impl fmt::Debug for Config {
@@ -119,6 +124,7 @@ impl fmt::Debug for Config {
             .field("ui_handed_mode", &self.ui_handed_mode)
             .field("ui_motion_inspector", &self.ui_motion_inspector)
             .field("ui_show_health_digest", &self.ui_show_health_digest)
+            .field("ui_scale_percent", &self.ui_scale_percent)
             .finish()
     }
 }
@@ -155,6 +161,7 @@ impl Default for Config {
             ui_handed_mode: "off".into(),
             ui_motion_inspector: false,
             ui_show_health_digest: false,
+            ui_scale_percent: UI_SCALE_DEFAULT_PERCENT,
         }
     }
 }
@@ -411,6 +418,7 @@ impl Config {
             },
             motion_inspector: self.ui_motion_inspector,
             show_health_digest: self.ui_show_health_digest,
+            ui_scale_percent: snap_ui_scale_percent(self.ui_scale_percent),
         }
     }
 
@@ -437,6 +445,9 @@ impl Config {
         .into();
         self.ui_motion_inspector = preferences.motion_inspector;
         self.ui_show_health_digest = preferences.show_health_digest;
+        self.ui_scale_percent = preferences
+            .ui_scale_percent
+            .clamp(UI_SCALE_MIN_PERCENT, UI_SCALE_MAX_PERCENT);
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -468,6 +479,10 @@ impl Config {
         anyhow::ensure!(
             matches!(self.ui_handed_mode.as_str(), "off" | "left" | "right"),
             "invalid handed mode"
+        );
+        anyhow::ensure!(
+            (UI_SCALE_MIN_PERCENT..=UI_SCALE_MAX_PERCENT).contains(&self.ui_scale_percent),
+            "invalid UI scale percent"
         );
         for rule in &self.source_rules {
             for value in [&rule.app_contains, &rule.url_host_suffix]
@@ -809,6 +824,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "ui_handed_mode",
         "ui_motion_inspector",
         "ui_show_health_digest",
+        "ui_scale_percent",
     ];
     const SOURCE_RULE_KEYS: &[&str] = &["app_contains", "title_regex", "url_host_suffix", "action"];
 
@@ -1079,6 +1095,7 @@ action = "skip"
             handed_mode: HandedMode::Left,
             motion_inspector: true,
             show_health_digest: true,
+            ui_scale_percent: 125,
         };
 
         config.apply_ui_preferences(&preferences, true);

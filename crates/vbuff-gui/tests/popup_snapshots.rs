@@ -98,6 +98,36 @@ fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
     }
 }
 
+#[test]
+fn popup_settings_golden_covers_non_default_interface_scale() {
+    let mut results = SnapshotResults::new();
+    let snapshots = SnapshotOptions::new()
+        .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
+    for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
+        let state = Arc::new(Mutex::new(snapshot_state(Surface::Settings)));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 620.0))
+            .with_pixels_per_point(1.0)
+            .with_theme(theme)
+            .wgpu()
+            .build_eframe(|_| PopupApp::new(state));
+        let preferences = vbuff_gui::UiPreferences {
+            ui_scale_percent: 125,
+            ..Default::default()
+        };
+        harness.state_mut().set_preferences(preferences);
+        let ctx = harness.ctx.clone();
+        harness.state_mut().request_settings_view(&ctx);
+        harness.state_mut().set_health_digest_visible(true);
+        harness.run_steps(2);
+        harness.snapshot_options(
+            format!("popup_{theme_name}_1x_settings_scale_125"),
+            &snapshots,
+        );
+        results.extend(harness.take_snapshot_results());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Surface {
     Empty,

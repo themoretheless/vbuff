@@ -76,6 +76,9 @@ pub(crate) fn run(
         .with_title("vbuff")
         .with_inner_size(vbuff_gui::popup_size())
         .with_min_inner_size(vbuff_gui::popup_min_size())
+        // The interface-scale preference re-requests the base point size; the
+        // monitor clamp keeps the physically larger window on screen.
+        .with_clamp_size_to_monitor_size(true)
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
