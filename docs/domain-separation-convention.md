@@ -6,9 +6,10 @@ preimage in the workspace.
 Origin: `docs/solid-dry-review-2026-07-26.md`, T5 ("плавающая конвенция
 NUL-терминатора доменов по workspace (9 билдеров)"), wave A item 5, part T5.
 
-Status: **audit only**. No Rust source was modified while producing this
-document. Everything below is a description of the code as of the current
-worktree, plus a proposal.
+Status: **audit only, and now partly historical**. No Rust source was modified
+while producing this document; everything below described the code as of the
+end of wave A. Wave B then migrated several of the sites - see section 0 for
+what changed before relying on any row.
 
 Concurrency caveat: other wave-A work was landing in this worktree while the
 audit ran (commits `04c9768`, `21823e3`, plus uncommitted edits in
@@ -22,6 +23,32 @@ is **37 builders that carry an explicit `vbuff-…` domain string**, plus **5
 preimage builders with no domain at all**, for **42 sites** total across 7
 crates. The review's "9" is roughly the count of NUL-terminated domain
 constants (`b"vbuff-…\0"`), not the count of preimage builders.
+
+---
+
+## 0. What has changed since this audit was written
+
+The tables below are the state at the end of wave A and are kept as the
+record of what the audit found. Wave B then acted on several of the rows, so
+**do not read the tables as current code**. What moved:
+
+| Row | Then | Now |
+|---|---|---|
+| 20 `merkle.rs::leaf_hash` | `vbuff-merkle-leaf-v1`, the one **practical** collision (§4.1) | Fixed in wave A with hand-rolled prefixes (`-v2`), then moved onto the crate's shared `Preimage` builder (`-v3`) so `vbuff-sync` has one framing rather than two; regression test on the exact colliding pair, plus a byte pin on the framing. The interior-node domain became `-v2` at the same time: it had no terminator at all |
+| 19 `ledger.rs` | `vbuff-sync-ledger-v1`, unprefixed `signer_device` (§4.3) | `-v2` through the shared `SignedChain`; signer is a prefixed field |
+| 22 `provenance.rs` | `vbuff-custody-v1`; the signer was **not hashed at all**, only compared afterwards | `-v2`; the signer is inside the signed bytes |
+| 23 `membership.rs::entry_hash` | `vbuff-membership-entry-v2` | `-v3`, same shared builder |
+| 24 `membership.rs::sas` | `vbuff-membership-sas-v2` | `-v3`; also fixed a separate arithmetic defect - the digest was reduced modulo 10^19 while being printed as twenty digits, so the leading digit was always `0` (63.1 bits, not the documented 66.4) |
+| 6 HMAC rows (`vbuff-ipc`) | six mechanisms, MAC construction written twice each | one `vbuff_types::mac::hmac_proof`; **bytes unchanged** for all of them, proven against a test-only oracle that reproduces the old sequence verbatim |
+| 35 `sync/capability.rs` | the only HMAC with **no domain at all** | domain `vbuff-capability-token-v2`, plus a bounded replay window |
+
+Every domain bump above is on a type with no persistence writer and no
+consumer outside its own crate, which is why the break was free; stale data
+fails at deserialization rather than verifying under the new rules.
+
+Still open, and still accurate as written below: `content_hash`
+(`vbuff-core/src/hash.rs`) carries no domain at all while being the most
+persisted digest in the product.
 
 ---
 
