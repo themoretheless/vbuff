@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use egui::{Color32, Key, RichText, Stroke, TextureHandle, ViewportCommand};
 use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
 use vbuff_core::feedback::FeedbackEnvironment;
@@ -38,7 +38,7 @@ use crate::experience::{
     contrast_ratio, match_highlight_alpha,
 };
 use crate::navigation::PopupSurface;
-use crate::projection::{FilteredClip, clip_is_expired, filter_clips};
+use crate::projection::{FilteredClip, ProjectionCache, clip_is_expired};
 use crate::state::{ClipText, RestoredClip, SharedState, StarterPack, UiAction};
 use crate::view::{relative_time, short_app_name};
 
@@ -168,6 +168,8 @@ pub struct PopupApp {
     action_flyout: Option<ClipId>,
     undo_slot: Option<UndoSlot>,
     expanded_duplicates: HashSet<ClipId>,
+    /// Memoized history projection; see [`ProjectionCache`] for the key.
+    projection_cache: ProjectionCache,
     last_announcement_revision: u64,
     preview_clip_id: Option<ClipId>,
     /// Content-free session label supplied by the composition layer. The GUI
@@ -217,6 +219,7 @@ impl PopupApp {
             action_flyout: None,
             undo_slot: None,
             expanded_duplicates: HashSet::new(),
+            projection_cache: ProjectionCache::default(),
             last_announcement_revision: 0,
             preview_clip_id: None,
             session_environment: "unknown".into(),
@@ -321,13 +324,23 @@ impl PopupApp {
     }
 
     /// Build the current filtered view of clips.
-    fn filtered(&self, clips: &[Clip]) -> Vec<FilteredClip> {
-        filter_clips(
+    ///
+    /// `now` is passed in rather than read here so that one frame's projection
+    /// and its clip index agree on a single instant, and so the memoization in
+    /// [`ProjectionCache`] has an explicit clock to key on.
+    fn filtered(
+        &mut self,
+        clips: &[Clip],
+        revision: u64,
+        now: DateTime<Utc>,
+    ) -> Arc<[FilteredClip]> {
+        self.projection_cache.projection(
             clips,
+            revision,
             &self.query,
             &self.history_scope,
             &self.expanded_duplicates,
-            Utc::now(),
+            now,
         )
     }
 }
@@ -490,7 +503,11 @@ impl eframe::App for PopupApp {
         };
 
         // 4. Compute the filtered list and preserve selection by stable id.
-        let filtered = self.filtered(&clips);
+        // One clock for the whole frame: the projection and the clip index
+        // below both drop expired clips, and reading the wall clock twice let
+        // a clip expire between them and vanish from one but not the other.
+        let projection_now = Utc::now();
+        let filtered = self.filtered(&clips, revision, projection_now);
         let total = filtered.len();
         if let Some(previous_id) = self.preview_clip_id {
             self.selected = filtered
@@ -741,7 +758,6 @@ impl eframe::App for PopupApp {
         }
 
         // 6. Render the panel.
-        let projection_now = Utc::now();
         let clip_by_id: HashMap<ClipId, &Clip> = clips
             .iter()
             .filter(|clip| !clip_is_expired(clip, projection_now))

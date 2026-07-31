@@ -17,7 +17,10 @@ use vbuff_types::{
     SelectionIntent,
 };
 
-use crate::{Result, Store, StoreError, duration_millis_i64, now_millis, raw_to_clip, row_to_clip};
+use crate::{
+    DeleteGuards, LEGAL_HOLD_BLOCKED, Result, Store, StoreError, clip_projection,
+    duration_millis_i64, now_millis, raw_to_clip, row_to_clip,
+};
 
 const MAX_COLLECTION_ID_BYTES: usize = 96;
 const MAX_COLLECTION_NAME_BYTES: usize = 160;
@@ -424,8 +427,7 @@ impl Store {
         };
         let sql = format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            SELECT {projection}
             FROM clips c
             JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
@@ -433,18 +435,14 @@ impl Store {
             ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC
             LIMIT ?2
             "#,
+            projection = clip_projection("c"),
         );
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(
             params![now_millis(), limit.min(MAX_EXPORT_CLIPS) as i64],
             row_to_clip,
         )?;
-        let mut clips = Vec::new();
-        for row in rows {
-            clips.push(raw_to_clip(row?)?);
-        }
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.hydrated_clips(rows)
     }
 
     /// Return the newest active clip by actual recency, independent of the
@@ -453,9 +451,9 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                r#"
-                SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                       c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+                &format!(
+                    r#"
+                SELECT {projection}
                 FROM clips c
                 JOIN clip_annotations a ON a.clip_id = c.id
                 WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
@@ -463,16 +461,13 @@ impl Store {
                 ORDER BY c.updated_at DESC, c.seq DESC
                 LIMIT 1
                 "#,
+                    projection = clip_projection("c"),
+                ),
                 [now_millis()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(row)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        row.map(|row| self.hydrated_clip(row)).transpose()
     }
 
     /// Fetch one non-expired clip by id from the authoritative repository.
@@ -480,22 +475,19 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite
+                &format!(
+                    r#"
+                SELECT {projection}
                 FROM clips
                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)
                 "#,
+                    projection = clip_projection("clips"),
+                ),
                 params![id.to_string_repr(), now_millis()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(row)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        row.map(|row| self.hydrated_clip(row)).transpose()
     }
 
     pub fn upsert_collection(&self, record: &CollectionRecord) -> Result<()> {
@@ -563,19 +555,18 @@ impl Store {
     ) -> Result<CollectionRetentionPreview> {
         let policy = self.collection_policy(collection_id)?;
         let bounded_limit = limit.min(10_000);
-        let mut statement = self.conn.prepare(
+        // Same protections `enforce_collection_retention` applies row by row,
+        // so the preview cannot promise a deletion the sweep will refuse.
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.updated_at, c.byte_size
-            FROM clips c
-            JOIN clip_annotations a ON a.clip_id = c.id
-            WHERE a.collection_id = ?1 AND a.legal_hold = 0
-              AND c.pinned = 0 AND c.favorite = 0
-              AND NOT EXISTS (
-                SELECT 1 FROM session_protected p WHERE p.clip_id = c.id
-              )
-            ORDER BY c.updated_at DESC, c.seq DESC
+            SELECT clips.id, clips.updated_at, clips.byte_size
+            FROM clips
+            JOIN clip_annotations a ON a.clip_id = clips.id
+            WHERE a.collection_id = ?1{guards}
+            ORDER BY clips.updated_at DESC, clips.seq DESC
             "#,
-        )?;
+            guards = DeleteGuards::SWEEP.sql(),
+        ))?;
         let rows = statement.query_map([collection_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -624,48 +615,46 @@ impl Store {
         let preview = self.collection_retention_preview(collection_id, limit)?;
         let transaction = self.conn.unchecked_transaction()?;
         for id in &preview.clip_ids {
-            crate::ensure_delete_eligible(&transaction, *id, true)?;
-            let deleted = transaction.execute(
+            // Collection membership is re-checked here rather than trusted
+            // from the preview: a clip can leave the collection between the
+            // two statements, and a retention sweep must never remove a clip
+            // that is no longer in the collection it is sweeping.
+            let still_a_member: bool = transaction.query_row(
                 r#"
-                DELETE FROM clips
-                WHERE id = ?1 AND pinned = 0 AND favorite = 0
-                  AND EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id
-                      AND annotations.collection_id = ?2
-                      AND annotations.legal_hold = 0
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM temp.session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
+                SELECT EXISTS (
+                    SELECT 1 FROM clip_annotations
+                    WHERE clip_id = ?1 AND collection_id = ?2
+                )
                 "#,
                 params![id.to_string_repr(), collection_id],
+                |row| row.get(0),
             )?;
-            if deleted != 1 {
-                crate::ensure_delete_eligible(&transaction, *id, true)?;
+            if !still_a_member {
+                return Err(StoreError::Maintenance(
+                    "collection retention eligibility changed".into(),
+                ));
+            }
+            if self.delete_clip_row(&transaction, *id, DeleteGuards::SWEEP)? != 1 {
                 return Err(StoreError::Maintenance(
                     "collection retention eligibility changed".into(),
                 ));
             }
         }
         transaction.commit()?;
-        if !preview.clip_ids.is_empty() {
-            self.scrub_deleted_pages()?;
-        }
         Ok(preview)
     }
 
     pub fn attachment_manifest(&self, id: ClipId) -> Result<AttachmentManifest> {
+        // Deliberately unhydrated: the manifest describes how flavors are
+        // *stored*, so it must see the `Spilled` bodies rather than the
+        // payloads `hydrated_clip` would inline in their place.
         let (raw, derived_index_present) = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite,
-                       item_text != ''
-                FROM clips WHERE id = ?1
-                "#,
+                &format!(
+                    "SELECT {projection}, item_text != '' FROM clips WHERE id = ?1",
+                    projection = clip_projection("clips"),
+                ),
                 [id.to_string_repr()],
                 |row| Ok((row_to_clip(row)?, row.get::<_, i64>(11)? != 0)),
             )
@@ -1139,8 +1128,39 @@ impl Store {
         Ok(output)
     }
 
+    /// Strict form used by explicit deletes: a missing clip is `ClipNotFound`
+    /// and a held clip is an error the caller must show the user.
     pub(crate) fn ensure_not_legal_hold(&self, id: ClipId) -> Result<()> {
-        crate::ensure_delete_eligible(&self.conn, id, false)
+        let held = self
+            .conn
+            .query_row(
+                "SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1",
+                [id.to_string_repr()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match held {
+            // A live clip whose annotation sidecar is gone cannot be judged:
+            // its hold state is unknowable, so deleting it would be deleting
+            // something that might be held. Corruption, not absence.
+            None if self.ensure_clip_exists(id).is_ok() => {
+                Err(StoreError::Corrupt("clip annotation row is missing".into()))
+            }
+            None => Err(StoreError::ClipNotFound(id.to_string_repr())),
+            Some(0) => Ok(()),
+            Some(_) => Err(StoreError::Maintenance(LEGAL_HOLD_BLOCKED.into())),
+        }
+    }
+
+    /// Lenient form used by background sweeps: a clip that is already gone is
+    /// not held, because there is nothing left to protect.
+    pub(crate) fn legal_hold_active(&self, id: ClipId) -> Result<bool> {
+        let held: i64 = self.conn.query_row(
+            "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1), 0)",
+            [id.to_string_repr()],
+            |row| row.get(0),
+        )?;
+        Ok(held != 0)
     }
 
     fn ensure_clip_exists(&self, id: ClipId) -> Result<()> {

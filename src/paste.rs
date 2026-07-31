@@ -9,8 +9,9 @@ use vbuff_core::content_hash_from_flavors;
 use vbuff_core::intelligence::{PasteGuardDecision, PasteGuardFingerprint};
 use vbuff_platform::lifecycle::{DisplayServer, SessionContext};
 use vbuff_platform::{
-    ArboardClipboard, ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, ConfirmedPaste,
-    ConfirmedPasteBackend, PastePermissionSelfCheck, WriteOptions,
+    ClipboardBackend, ClipboardRetention, ClipboardWriteReceipt, ConfirmedPaste,
+    ConfirmedPasteBackend, PastePermissionSelfCheck, SYSTEM_CLIPBOARD_BACKEND, SystemClipboard,
+    WriteOptions, system_clipboard,
 };
 use vbuff_types::{CaptureLineage, ClipId, Flavor};
 
@@ -32,7 +33,14 @@ pub(crate) enum PasteOutcome {
 }
 
 /// Owns the reusable clipboard writer and paste backend.
-pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = ConfirmedPaste> {
+///
+/// The clipboard default is the process-wide [`SystemClipboard`] rather than a
+/// concrete backend name, so this coordinator and the capture worker cannot
+/// end up on different clipboards. The paste default is still a concrete type
+/// on purpose: `ConfirmedPaste` is constructed at exactly one site, so there is
+/// no second place for it to diverge from, and giving it a seam it does not
+/// need would only imply a choice that does not exist.
+pub(crate) struct PasteCoordinator<C = SystemClipboard, P = ConfirmedPaste> {
     clipboard: Option<C>,
     paste: Option<P>,
     pending_at: Option<Instant>,
@@ -43,7 +51,7 @@ pub(crate) struct PasteCoordinator<C = ArboardClipboard, P = ConfirmedPaste> {
     permission_check: PastePermissionSelfCheck,
 }
 
-impl PasteCoordinator<ArboardClipboard, ConfirmedPaste> {
+impl PasteCoordinator<SystemClipboard, ConfirmedPaste> {
     /// Build the resident coordinator against the process session snapshot the
     /// caller already holds. Taking the session as an argument is what keeps
     /// the "automatic paste" claim in the GUI and the session `doctor` reports
@@ -52,8 +60,14 @@ impl PasteCoordinator<ArboardClipboard, ConfirmedPaste> {
         self_writes: Arc<Mutex<SelfWriteLedger>>,
         session: &SessionContext,
     ) -> Self {
-        let clipboard = ArboardClipboard::new().map_err(|error| {
-            tracing::warn!("clipboard writer unavailable: {error}");
+        // Same seam the capture worker opens, with the degradation policy
+        // unchanged: an unavailable clipboard is logged and the coordinator
+        // keeps running without a writer.
+        let clipboard = system_clipboard().map_err(|error| {
+            tracing::warn!(
+                backend = SYSTEM_CLIPBOARD_BACKEND,
+                "clipboard writer unavailable: {error}"
+            );
             error
         });
         let session_allows_paste = session.input_injection_allowed
@@ -514,6 +528,25 @@ mod tests {
 
     fn flavors() -> Vec<Flavor> {
         vec![Flavor::inline("text/plain", b"hello".to_vec())]
+    }
+
+    /// The resident coordinator and the capture worker must hold the *same*
+    /// clipboard backend. The worker judges capture on that backend's per-read
+    /// evidence, while this coordinator's write receipt decides whether a
+    /// sensitive clip may reach the clipboard at all; two backends in one
+    /// process would let those verdicts describe different clipboards with
+    /// nothing failing to announce it.
+    ///
+    /// Pinned as a type identity rather than a runtime assertion, because the
+    /// hazard is a swap that updates one construction site and forgets the
+    /// other — that stops compiling here instead of shipping.
+    #[test]
+    fn the_resident_coordinator_holds_the_process_clipboard_backend() {
+        // What the capture worker opens.
+        let _seam: fn() -> PlatformResult<SystemClipboard> = system_clipboard;
+        // What `app.rs` stores, spelled the way `app.rs` spells it.
+        let _resident: Option<PasteCoordinator<SystemClipboard, ConfirmedPaste>> =
+            None::<PasteCoordinator>;
     }
 
     /// The permission the popup shows is decided by the session snapshot the

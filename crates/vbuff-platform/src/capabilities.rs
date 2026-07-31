@@ -3,6 +3,8 @@
 use serde::Serialize;
 use vbuff_types::{SecurityPostureLevel, SecurityPostureSummary};
 
+#[cfg(test)]
+use crate::SYSTEM_CLIPBOARD_BACKEND;
 use crate::lifecycle::{DisplayServer, SessionContext};
 use crate::wayland::{WaylandCapabilities, WaylandFeatureState};
 
@@ -51,6 +53,19 @@ impl SecurityPosture {
     /// The session is an argument, not a second detection: the posture the GUI
     /// badge shows and the session `doctor` prints are then two views of one
     /// [`SessionContext`], and cannot describe different display servers.
+    ///
+    /// # The clipboard rows are claims about the compiled backend
+    ///
+    /// `clipboard_*` and `foreground_identity` state what the backend linked
+    /// into this build can observe. That is a *static* claim, and the trait
+    /// deliberately no longer offers one: a backend reports what it observed
+    /// per read, precisely so a standing declaration cannot drift from
+    /// reality. These rows exist anyway because the trust surface has to say
+    /// something before the first read happens.
+    ///
+    /// The drift is guarded rather than prevented: `clipboard_rows_describe_the_compiled_backend`
+    /// fails the moment [`SYSTEM_CLIPBOARD_BACKEND`] changes, so a second
+    /// backend cannot ship while these sentences still describe the first one.
     pub fn detect(
         session: &SessionContext,
         strict_mode: bool,
@@ -373,6 +388,22 @@ mod tests {
     fn non_strict_mode_always_allows_capture() {
         assert!(detect(false, false, false).strict_allows_capture());
         assert!(!detect(false, false, false).required_capabilities_satisfied());
+    }
+
+    /// The `clipboard_*` and `foreground_identity` details are sentences about
+    /// one specific backend. Nothing else ties them to it, so a second backend
+    /// would silently turn them into lies on the trust surface - and a backend
+    /// that *can* prove the source application would be reported as unable to.
+    /// Changing the compiled backend must therefore fail here first.
+    #[test]
+    fn clipboard_rows_describe_the_compiled_backend() {
+        assert_eq!(
+            SYSTEM_CLIPBOARD_BACKEND, "arboard",
+            "the compiled clipboard backend changed: re-read every clipboard_* \
+             and foreground_identity detail in SecurityPosture::detect before \
+             updating this assertion, because each one asserts what that \
+             backend cannot observe"
+        );
     }
 
     #[test]

@@ -20,6 +20,10 @@ use crate::experience::UiPreferences;
 #[derive(Default)]
 pub struct AppState {
     /// The current clip list, already ordered (pinned first, then recency).
+    ///
+    /// Replace it only through [`AppState::set_clips`]. The GUI's projection
+    /// cache treats [`AppState::revision`] as this list's identity, so a
+    /// replacement that skips the bump would leave a stale list on screen.
     pub clips: Arc<[Clip]>,
     /// True if clipboard capture is currently paused.
     pub paused: bool,
@@ -69,6 +73,12 @@ pub struct AppState {
     pub show_requested: bool,
     /// A monotonically increasing revision; bumped when `clips` changes so the
     /// GUI can cheaply detect updates.
+    ///
+    /// This is the GUI projection cache's clip-list identity, so the bump is a
+    /// contract rather than an optimization: see the test at the bottom of this
+    /// file, and `ProjectionCache` for what the cache does with it. Bumping it
+    /// for something other than a clip change is harmless (it only costs a
+    /// recompute); *not* bumping it for a clip change is not.
     pub revision: u64,
 }
 
@@ -347,6 +357,27 @@ mod tests {
         );
         assert!(state.notice.is_none());
         assert!(!state.paused);
+    }
+
+    /// The GUI projection cache keys on `revision` to decide whether the clip
+    /// list it projected is still the current one. Every replacement has to
+    /// move it, including a replacement with an equal-length or empty list.
+    #[test]
+    fn replacing_the_clip_list_always_bumps_the_revision() {
+        let mut state = AppState::with_clips(vec![clip_with_content()]);
+        let start = state.revision;
+
+        state.set_clips(vec![clip_with_content()]);
+        assert_eq!(state.revision, start.wrapping_add(1));
+
+        // Same length, different contents: nothing about the list's shape
+        // signals the change, so the counter is the only signal there is.
+        state.set_clips(vec![clip_with_content()]);
+        assert_eq!(state.revision, start.wrapping_add(2));
+
+        state.set_clips(Vec::new());
+        assert_eq!(state.revision, start.wrapping_add(3));
+        assert!(state.clips.is_empty());
     }
 
     #[test]
