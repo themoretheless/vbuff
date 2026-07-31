@@ -1226,15 +1226,11 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
     // evidence the capturing backend did not supply.
     clip.meta.provenance_confidence = ProvenanceConfidence::Unknown;
     if sensitive {
-        clip.meta.sensitive = true;
         clip.meta.sensitivity_reason = sensitivity_reason.or(clip.meta.sensitivity_reason);
         let detected_expiry = expires_after
             .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
             .map(|ttl| Utc::now() + ttl);
-        clip.meta.expires_at = match (clip.meta.expires_at, detected_expiry) {
-            (Some(imported), Some(detected)) => Some(imported.min(detected)),
-            (imported, detected) => imported.or(detected),
-        };
+        crate::tighten_sensitive(&mut clip.meta, detected_expiry);
     }
     Ok(clip)
 }
