@@ -4028,6 +4028,506 @@ mod tests {
         assert_eq!(hits[0].primary_text(), url.primary_text());
     }
 
+    // ---------------------------------------------------------------------
+    // Characterization tests for the store search SQL path.
+    //
+    // These pin the *current* behaviour of `Store::search_page` -- the facet
+    // vocabulary, the LIKE/FTS tier split, the escaping, and the expiry
+    // filter -- so the planned grammar unification has a baseline to diff
+    // against. Several of them assert behaviour that is arguably wrong; each
+    // such case says so in a comment rather than being "fixed" here.
+    // ---------------------------------------------------------------------
+
+    /// Assert which tier the next `search` call will take. Several tests below
+    /// only make sense on one tier, and the planner can also promote itself
+    /// on slow LIKE latencies, so pin the expectation explicitly rather than
+    /// letting a promoted planner turn a real regression into a silent pass.
+    fn assert_tier(store: &Store, query: &str, expect_fts: bool) {
+        let text = search::parse_query(query).text;
+        let actual = !text.is_empty()
+            && store
+                .search_planner
+                .borrow()
+                .use_fts(store.count().unwrap(), &text);
+        assert_eq!(
+            actual,
+            expect_fts,
+            "expected {} tier for {query:?}",
+            if expect_fts { "FTS" } else { "LIKE" }
+        );
+    }
+
+    /// Pin the LIKE tier for the next search. Below the row threshold the
+    /// planner still promotes itself once observed LIKE latencies pass its
+    /// p95 budget, which a loaded test machine trips; clearing the window
+    /// keeps tier-specific characterization honest instead of flaky.
+    fn reset_to_like_tier(store: &Store, query: &str) {
+        *store.search_planner.borrow_mut() = search::SearchPlanner::default();
+        assert_tier(store, query, false);
+    }
+
+    /// Every facet key the store grammar accepts, end to end: indexer writes
+    /// the row into `clip_facets`, parser recognizes the key, SQL matches it.
+    #[test]
+    fn store_grammar_resolves_all_four_facets_end_to_end() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut url = make_clip("https://Docs.RS/rusqlite");
+        url.meta.kind = ContentKind::Url;
+        let url_id = store.insert(&url).unwrap();
+
+        let mut color = make_clip("#FF8800");
+        color.meta.kind = ContentKind::Color;
+        let color_id = store.insert(&color).unwrap();
+
+        let mut code = make_clip("fn main() { let x = 1; }");
+        code.meta.kind = ContentKind::Code;
+        let code_id = store.insert(&code).unwrap();
+
+        let date_id = store.insert(&make_clip("2026-07-26")).unwrap();
+
+        // `host` is the URL host, lowercased by the url crate and again by the
+        // indexer; the parser lowercases the query value to match.
+        let hits = store.search("host:DOCS.rs", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, url_id);
+
+        // `color` is the whole trimmed text, lowercased, only for Color rows.
+        let hits = store.search("color:#ff8800", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, color_id);
+
+        // `lang` is one of four hardcoded heuristics, only for Code rows.
+        let hits = store.search("lang:rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, code_id);
+
+        // `iso_date` is the whole trimmed text when it matches the ISO regex.
+        let hits = store.search("iso_date:2026-07-26", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, date_id);
+
+        // Facets AND together, and repeated keys therefore self-cancel.
+        assert!(
+            store
+                .search("host:docs.rs lang:rust", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search("host:docs.rs host:example.com", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Facet + text also ANDs: the text tier still has to match.
+        assert_eq!(store.search("host:docs.rs rusqlite", 10).unwrap().len(), 1);
+        assert!(store.search("host:docs.rs nomatch", 10).unwrap().is_empty());
+    }
+
+    /// Which facets are gated on `ContentKind` and which are not. `color` and
+    /// `lang` only ever appear on Color/Code rows; `host` and `iso_date` are
+    /// derived from the text alone, on any kind.
+    #[test]
+    fn facet_extraction_is_kind_gated_only_for_color_and_lang() {
+        let store = Store::open_in_memory().unwrap();
+        // Plain Text rows still get text-derived facets.
+        let url_as_text = store.insert(&make_clip("https://example.org/x")).unwrap();
+        let date_as_text = store.insert(&make_clip("2026-01-02")).unwrap();
+        // ...but not the kind-gated ones.
+        store.insert(&make_clip("#ff8800")).unwrap();
+        store
+            .insert(&make_clip("fn other() { let y = 2; }"))
+            .unwrap();
+
+        let hits = store.search("host:example.org", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, url_as_text);
+
+        let hits = store.search("iso_date:2026-01-02", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, date_as_text);
+
+        assert!(store.search("color:#ff8800", 10).unwrap().is_empty());
+        assert!(store.search("lang:rust", 10).unwrap().is_empty());
+    }
+
+    /// `host` and `iso_date` are whole-text predicates, not scanners: the
+    /// trimmed text must itself parse as a URL, or itself match the ISO
+    /// regex. A URL or a date embedded in a sentence is not indexed.
+    #[test]
+    fn host_and_iso_date_facets_require_the_whole_text_to_match() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_clip("see https://embedded.example"))
+            .unwrap();
+        store
+            .insert(&make_clip("meeting on 2026-01-02 at ten"))
+            .unwrap();
+        // Leading and trailing whitespace is trimmed first, so it is harmless.
+        let padded = store
+            .insert(&make_clip("  https://padded.example  "))
+            .unwrap();
+
+        let indexed: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM clip_facets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 1, "only the padded URL should be indexed");
+
+        assert!(
+            store
+                .search("host:embedded.example", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search("iso_date:2026-01-02", 10).unwrap().is_empty());
+        let hits = store.search("host:padded.example", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, padded);
+    }
+
+    /// The indexer writes a fifth facet key that the query grammar has no
+    /// word for, so it is dead weight in the index today.
+    #[test]
+    fn payment_facet_is_indexed_but_unreachable_from_the_query_grammar() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("4111 1111 1111 1111")).unwrap();
+
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM clip_facets WHERE key = 'has_payment_number'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        // Not in the vocabulary -> degrades to a literal text search.
+        assert!(
+            store
+                .search("has_payment_number:true", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Defect, pinned as-is: the indexer stores `iso_date` verbatim while the
+    /// parser lowercases the query value, so any ISO timestamp carrying `T`
+    /// or `Z` is permanently unmatchable. The space-separated variant is
+    /// unreachable too, because the parser splits on whitespace first.
+    #[test]
+    fn iso_date_facet_with_a_time_component_is_unmatchable() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("2026-07-26T09:30:00Z")).unwrap();
+        store.insert(&make_clip("2026-07-27 09:30:00")).unwrap();
+
+        let mut stored = store
+            .conn
+            .prepare("SELECT value FROM clip_facets WHERE key = 'iso_date' ORDER BY value")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        stored.sort();
+        assert_eq!(stored, vec!["2026-07-26T09:30:00Z", "2026-07-27 09:30:00"]);
+
+        // Case-preserved in the index, lowercased in the query: never equal.
+        assert!(
+            store
+                .search("iso_date:2026-07-26T09:30:00Z", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search("iso_date:2026-07-26t09:30:00z", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Whitespace splits the token before the facet arm ever sees it.
+        assert!(
+            store
+                .search("iso_date:2026-07-27 09:30:00", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // The date-only prefix is a different facet value, so no match either.
+        assert!(store.search("iso_date:2026-07-26", 10).unwrap().is_empty());
+    }
+
+    /// Defect, pinned as-is: `Url::parse` stores IDNA/punycode hosts while the
+    /// parser only lowercases, so a Unicode `host:` value can never match.
+    #[test]
+    fn unicode_host_facet_is_stored_as_punycode_and_never_matches() {
+        let store = Store::open_in_memory().unwrap();
+        let mut url = make_clip("https://пример.рф/page");
+        url.meta.kind = ContentKind::Url;
+        store.insert(&url).unwrap();
+
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM clip_facets WHERE key = 'host'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.starts_with("xn--"),
+            "expected punycode, got {stored}"
+        );
+        assert!(store.search("host:пример.рф", 10).unwrap().is_empty());
+        assert_eq!(
+            store.search(&format!("host:{stored}"), 10).unwrap().len(),
+            1
+        );
+    }
+
+    /// The core grammar's facet keys are not rejected and not translated:
+    /// they fall through to the literal text tier, which searches the
+    /// projected `item_text` (text + source app + kind label).
+    #[test]
+    fn core_grammar_facets_degrade_to_literal_text() {
+        let store = Store::open_in_memory().unwrap();
+        let mut from_mail = make_clip("quarterly numbers");
+        from_mail.meta.source_app = Some("Mail".into());
+        store.insert(&from_mail).unwrap();
+        let literal_id = store
+            .insert(&make_clip("note about app:mail routing"))
+            .unwrap();
+
+        // `app:mail` never reaches `source_app`; it becomes the LIKE pattern
+        // `%app:mail%`, matching only text that literally contains it.
+        let hits = store.search("app:mail", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, literal_id);
+
+        for query in [
+            "kind:code",
+            "tag:work",
+            "device:laptop",
+            "before:yesterday",
+            "after:2026-07-01",
+        ] {
+            assert!(
+                store.search(query, 10).unwrap().is_empty(),
+                "{query} unexpectedly matched"
+            );
+        }
+
+        // A bare `kind` word still matches through the kind label the
+        // projection appends, which is what makes the silent fallthrough
+        // confusing rather than merely empty.
+        assert_eq!(store.search("text", 10).unwrap().len(), 2);
+    }
+
+    /// `escape_like` neutralizes the three LIKE metacharacters, and the SQL
+    /// declares `ESCAPE '\'` to match. Quotes need no escaping: the pattern
+    /// is a bound parameter.
+    #[test]
+    fn like_tier_escapes_wildcards_and_the_escape_character() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("snake_case"), "snake\\_case");
+        assert_eq!(escape_like("c:\\tmp"), "c:\\\\tmp");
+        // Double quotes and FTS operators are left alone on this tier.
+        assert_eq!(escape_like("say \"hi\" a*"), "say \"hi\" a*");
+
+        let store = Store::open_in_memory().unwrap();
+        let percent = store.insert(&make_clip("growth 50% quarterly")).unwrap();
+        store.insert(&make_clip("growth 50X quarterly")).unwrap();
+        let underscore = store.insert(&make_clip("snake_case name")).unwrap();
+        store.insert(&make_clip("snakeXcase name")).unwrap();
+        let backslash = store.insert(&make_clip("path c:\\tmp\\log")).unwrap();
+        store.insert(&make_clip("path c:Xtmp\\log")).unwrap();
+        let quoted = store.insert(&make_clip("say \"quoted\" now")).unwrap();
+
+        for (query, expected) in [
+            ("50%", percent),
+            ("snake_case", underscore),
+            ("c:\\tmp", backslash),
+            ("\"quoted\"", quoted),
+        ] {
+            reset_to_like_tier(&store, query);
+            let hits = store.search(query, 10).unwrap();
+            assert_eq!(hits.len(), 1, "{query} matched {} rows", hits.len());
+            assert_eq!(hits[0].id, expected, "{query} matched the wrong row");
+        }
+    }
+
+    /// The LIKE tier inherits SQLite's ASCII-only case folding, so a
+    /// non-ASCII query is effectively case-sensitive here. The FTS tier uses
+    /// `unicode61`, which folds the same query -- the two tiers therefore
+    /// disagree on the same database.
+    #[test]
+    fn like_and_fts_tiers_disagree_on_non_ascii_case_folding() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("привет мир")).unwrap();
+        store.insert(&make_clip("Hello World")).unwrap();
+
+        // Fewer than 250 rows and no recorded latency -> LIKE tier.
+        reset_to_like_tier(&store, "ПРИВЕТ");
+        assert!(store.search("ПРИВЕТ", 10).unwrap().is_empty());
+        reset_to_like_tier(&store, "привет");
+        assert_eq!(store.search("привет", 10).unwrap().len(), 1);
+        // ASCII does fold on the LIKE tier.
+        reset_to_like_tier(&store, "hello");
+        assert_eq!(store.search("hello", 10).unwrap().len(), 1);
+
+        // Cross the row threshold to promote the same store to the FTS tier.
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        assert_tier(&store, "ПРИВЕТ", true);
+        assert_eq!(store.search("ПРИВЕТ", 10).unwrap().len(), 1);
+    }
+
+    /// On the FTS tier `fts_literal` wraps the whole text in one phrase, so
+    /// FTS5 operators are inert: `alpha OR beta` is a three-token phrase, not
+    /// a disjunction, and a trailing `*` is not a prefix query.
+    #[test]
+    fn fts_tier_neutralizes_query_operators() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        let phrase = store.insert(&make_clip("alpha OR beta together")).unwrap();
+        store.insert(&make_clip("alpha standalone")).unwrap();
+        store.insert(&make_clip("beta standalone")).unwrap();
+
+        assert_tier(&store, "alpha OR beta", true);
+        let hits = store.search("alpha OR beta", 10).unwrap();
+        assert_eq!(hits.len(), 1, "OR behaved as a disjunction");
+        assert_eq!(hits[0].id, phrase);
+
+        // `*` is a separator for unicode61, not a prefix operator: `stand*`
+        // becomes the single-token phrase `stand`, which matches nothing.
+        assert!(
+            store.search("stand*", 10).unwrap().is_empty(),
+            "* behaved as a prefix operator"
+        );
+        assert_eq!(store.search("standalone*", 10).unwrap().len(), 2);
+
+        // A leading `-` is likewise inert, so this is not an exclusion.
+        assert_eq!(store.search("-standalone", 10).unwrap().len(), 2);
+    }
+
+    /// A punctuation-only query survives the length guard (three chars) and
+    /// reaches FTS5 as a phrase that tokenizes to nothing. Pinned so the
+    /// unification work knows whether it must keep tolerating it.
+    #[test]
+    fn fts_tier_tolerates_a_query_that_tokenizes_to_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        for query in ["***", "%%%", "\"\"\"", "..."] {
+            assert_tier(&store, query, true);
+            assert!(
+                store.search(query, 10).unwrap().is_empty(),
+                "{query} did not come back empty"
+            );
+        }
+    }
+
+    /// Ordering and paging are independent of the tier: pinned first, then
+    /// newest `updated_at`, then newest `seq`; `limit` caps the page and the
+    /// cursor is only handed back when the page came back full.
+    #[test]
+    fn search_page_orders_pinned_first_and_pages_by_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(store.insert(&make_clip(&format!("row {index}"))).unwrap());
+        }
+        store.set_pinned(ids[0], true).unwrap();
+
+        let first = store.search_page("row", None, 2).unwrap();
+        assert_eq!(first.clips.len(), 2);
+        assert_eq!(first.clips[0].id, ids[0], "pinned row did not sort first");
+        assert_eq!(first.clips[1].id, ids[4]);
+        let cursor = first.next_cursor.expect("full page must yield a cursor");
+
+        let second = store.search_page("row", Some(cursor), 10).unwrap();
+        assert_eq!(second.clips.len(), 3);
+        assert_eq!(second.clips[0].id, ids[3]);
+        assert!(
+            second.next_cursor.is_none(),
+            "short page must not yield a cursor"
+        );
+
+        // A zero limit short-circuits before any SQL runs.
+        let empty = store.search_page("row", None, 0).unwrap();
+        assert!(empty.clips.is_empty() && empty.next_cursor.is_none());
+    }
+
+    /// Divergence, pinned as-is: `Store::search_page` is the only read path
+    /// whose expiry filter carves out session-protected rows. `list`,
+    /// `latest_by_recency` and `count` use the same predicate *without* the
+    /// carve-out, and the GUI's in-memory projection
+    /// (`vbuff-gui/src/projection.rs::clip_is_expired`) has no notion of
+    /// session protection either. A session-protected row past its TTL is
+    /// therefore searchable but invisible everywhere else.
+    #[test]
+    fn expiry_filter_in_search_sql_diverges_from_every_other_read_path() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.insert(&make_clip("protected but expired")).unwrap();
+        store.set_session_protected(id, true).unwrap();
+
+        // Expire the row after insert: `insert` itself calls `purge_expired`,
+        // which deletes expired rows regardless of session protection.
+        let past = chrono::Utc::now() - Duration::minutes(1);
+        store
+            .conn
+            .execute(
+                r#"
+                UPDATE clips
+                SET expires_at = ?1,
+                    metadata_json = json_set(metadata_json, '$.expires_at', ?2)
+                WHERE id = ?3
+                "#,
+                params![
+                    past.timestamp_millis(),
+                    past.to_rfc3339(),
+                    id.to_string_repr()
+                ],
+            )
+            .unwrap();
+
+        // search_page: visible, because of the session_protected carve-out.
+        let hits = store.search("protected", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        let expires_at = hits[0].meta.expires_at.expect("expiry must round-trip");
+        assert!(
+            expires_at <= chrono::Utc::now(),
+            "the search path returned a row the GUI projection would drop"
+        );
+
+        // Empty query, no facets: same carve-out, so search is a full listing
+        // that disagrees with `list` on this row.
+        assert_eq!(store.search("", 10).unwrap().len(), 1);
+
+        // Every other read path applies the plain expiry predicate.
+        assert!(store.list(10).unwrap().is_empty());
+        assert!(store.latest_by_recency().unwrap().is_none());
+        assert_eq!(store.count().unwrap(), 0);
+
+        // And the count feeding the FTS/LIKE tier decision is the one without
+        // the carve-out, so the planner under-counts searchable rows.
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
     #[test]
     fn indexed_simhash_returns_exact_and_near_candidates() {
         let store = Store::open_in_memory().unwrap();

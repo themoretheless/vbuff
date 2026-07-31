@@ -432,6 +432,161 @@ mod tests {
         );
     }
 
+    fn hits(clips: &[Clip], raw: &str, at: chrono::DateTime<Utc>) -> usize {
+        let query = parse_natural_query(raw, at).expect("query should parse");
+        search_recall(clips, &query, RecallSearchContext::default()).len()
+    }
+
+    /// Characterizes how the parsed `app:` facet is applied: a case-insensitive
+    /// *substring* test against `ClipMeta::source_app`, not an exact match.
+    #[test]
+    fn app_facet_is_a_case_insensitive_substring_match_for_ascii_names() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let clips = vec![clip("release notes", "Chrome", ContentKind::Url, now)];
+        for raw in [
+            "app:Chrome",
+            "app:chrome",
+            "app:CHROME",
+            "app:chr",
+            "app:ome",
+        ] {
+            assert_eq!(hits(&clips, raw, now), 1, "app facet {raw}");
+        }
+        assert_eq!(hits(&clips, "app:firefox", now), 0);
+        // A clip without a source app never satisfies the facet.
+        let mut anonymous = clips[0].clone();
+        anonymous.meta.source_app = None;
+        assert_eq!(hits(&[anonymous], "app:chrome", now), 0);
+    }
+
+    /// KNOWN BUG, recorded not fixed (theme T1 in
+    /// `docs/solid-dry-review-2026-07-26.md`).
+    ///
+    /// `query.rs::set_once` normalizes the `app:` value with
+    /// `str::to_ascii_lowercase`, which leaves every non-ASCII letter as
+    /// typed, while `matches_filters` above normalizes the clip side with the
+    /// Unicode-aware `str::to_lowercase`. For a non-ASCII application name the
+    /// two normalizations disagree, so a user who types the app name exactly
+    /// as it was captured gets zero results. Only a pre-lowercased spelling
+    /// works. The free-text term does not have this problem because both sides
+    /// of that comparison use `to_lowercase`.
+    #[test]
+    fn app_facet_currently_misses_non_ascii_source_apps_typed_as_captured() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let clips = vec![clip("Заметка о релизе", "Продукт", ContentKind::Text, now)];
+        let exact = parse_natural_query("app:Продукт", now).unwrap();
+        assert_eq!(exact.app.as_deref(), Some("Продукт"));
+        assert_eq!(hits(&clips, "app:Продукт", now), 0);
+        // The only spelling that works today is the already-lowercase one.
+        assert_eq!(hits(&clips, "app:продукт", now), 1);
+        // Contrast: the free-text path folds case correctly for non-ASCII.
+        assert_eq!(hits(&clips, "Заметка", now), 1);
+        assert_eq!(hits(&clips, "заметка", now), 1);
+    }
+
+    /// The behavior the T1 facet registry is expected to deliver: one shared
+    /// normalization for both sides of the `app:` comparison. Ignored because
+    /// it fails today, see the characterization test above for why. Unignore
+    /// (and delete the "currently misses" assertions) once the registry
+    /// normalizes the query value and `source_app` through one function.
+    #[test]
+    #[ignore = "known T1 bug: app: facet folds case with to_ascii_lowercase, source_app with Unicode to_lowercase"]
+    fn app_facet_should_match_a_non_ascii_source_app_typed_as_captured() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let clips = vec![clip("Заметка о релизе", "Продукт", ContentKind::Text, now)];
+        assert_eq!(hits(&clips, "app:Продукт", now), 1);
+        assert_eq!(hits(&clips, "app:ПРОДУКТ", now), 1);
+        assert_eq!(hits(&clips, "app:продукт", now), 1);
+    }
+
+    /// `device:` is the odd facet out: an exact `eq_ignore_ascii_case` against
+    /// `lineage.origin_device`, not a substring test like `app:`.
+    #[test]
+    fn device_facet_is_exact_ascii_case_insensitive_and_never_a_substring() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let mut laptop = clip("note", "editor", ContentKind::Text, now);
+        laptop.meta.lineage.origin_device = Some("MacBook".into());
+        let clips = vec![laptop];
+        assert_eq!(hits(&clips, "device:MacBook", now), 1);
+        assert_eq!(hits(&clips, "device:macbook", now), 1);
+        assert_eq!(hits(&clips, "device:MACBOOK", now), 1);
+        // Substring spellings that `app:` would accept are rejected here.
+        assert_eq!(hits(&clips, "device:mac", now), 0);
+        assert_eq!(hits(&clips, "device:book", now), 0);
+
+        // Non-ASCII device names match only when the spelling is identical:
+        // both sides fold ASCII case only, so nothing is lost on an exact
+        // spelling, but a case difference is not folded.
+        let mut cyrillic = clip("note", "editor", ContentKind::Text, now);
+        cyrillic.meta.lineage.origin_device = Some("Ноутбук".into());
+        let clips = vec![cyrillic];
+        assert_eq!(hits(&clips, "device:Ноутбук", now), 1);
+        assert_eq!(hits(&clips, "device:ноутбук", now), 0);
+    }
+
+    /// `tag:` folds ASCII case on both sides (`set_once` and
+    /// `ClipTags::normalize_label` both use `to_ascii_lowercase`), so it is
+    /// symmetric where `app:` is not, but it still cannot fold non-ASCII case.
+    #[test]
+    fn tag_facet_folds_ascii_case_symmetrically_on_both_sides() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let ascii = clip("note", "editor", ContentKind::Text, now);
+        let cyrillic = clip("другая заметка", "editor", ContentKind::Text, now);
+        let mut tags = ClipTags::default();
+        assert!(tags.add_tag(ascii.id, "Urgent"));
+        assert!(tags.add_tag(cyrillic.id, "Работа"));
+        let clips = vec![ascii, cyrillic];
+        let search = |raw: &str| {
+            let query = parse_natural_query(raw, now).expect("query should parse");
+            search_recall(
+                &clips,
+                &query,
+                RecallSearchContext {
+                    tags: Some(&tags),
+                    ..RecallSearchContext::default()
+                },
+            )
+            .len()
+        };
+        assert_eq!(search("tag:urgent"), 1);
+        assert_eq!(search("tag:URGENT"), 1);
+        assert_eq!(search("tag:Работа"), 1);
+        assert_eq!(search("tag:работа"), 0);
+        // Without a tag registry in the context the facet matches nothing.
+        let query = parse_natural_query("tag:urgent", now).unwrap();
+        assert!(search_recall(&clips, &query, RecallSearchContext::default()).is_empty());
+    }
+
+    /// The whole free-text term is matched as ONE substring, so a facet from
+    /// the store grammar that this parser swallowed as text (see
+    /// `query.rs::tests::foreign_store_grammar_facets_are_swallowed_as_free_text`)
+    /// does not just get ignored: it poisons the text match and the query
+    /// silently returns nothing.
+    #[test]
+    fn a_swallowed_foreign_facet_turns_the_text_term_into_a_dead_literal() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let clips = vec![clip(
+            "release notes on example.com",
+            "Chrome",
+            ContentKind::Url,
+            now,
+        )];
+        assert_eq!(hits(&clips, "release notes", now), 1);
+        assert_eq!(hits(&clips, "release notes host:example.com", now), 0);
+        assert_eq!(hits(&clips, "host:example.com", now), 0);
+    }
+
+    /// Time facets are half-open: `after` is inclusive, `before` exclusive.
+    #[test]
+    fn time_facets_form_a_half_open_window() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
+        let boundary = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+        let clips = vec![clip("note", "editor", ContentKind::Text, boundary)];
+        assert_eq!(hits(&clips, "after:2026-07-20", now), 1);
+        assert_eq!(hits(&clips, "before:2026-07-20", now), 0);
+        assert_eq!(hits(&clips, "before:2026-07-21", now), 1);
+    }
+
     #[test]
     fn miss_suggestions_and_completions_follow_active_constraints() {
         let now = Utc.timestamp_opt(1_000, 0).unwrap();

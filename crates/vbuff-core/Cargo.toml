@@ -14,6 +14,7 @@ regex.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 similar.workspace = true
+unicode-normalization.workspace = true
 url.workspace = true
 hmac.workspace = true
 sha2.workspace = true
