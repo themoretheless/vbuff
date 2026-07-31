@@ -11,10 +11,16 @@ vbuff-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-hmac.workspace = true
-sha2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 url.workspace = true
 blake3.workspace = true
+
+[dev-dependencies]
+# Only for the MAC freeze tests, which recompute each mechanism's preimage the
+# way it was spelled by hand before `vbuff_types::mac` existed. Keeping that
+# second implementation out of the library is the point: the tests must not
+# check the shared primitive against itself.
+hmac.workspace = true
+sha2.workspace = true

@@ -2,15 +2,20 @@ use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use thiserror::Error;
+use vbuff_types::mac::{MacDomain, MacProof, hmac_proof};
 use zeroize::Zeroize;
 
 use crate::integration::ClipAccessFilter;
 
-type HmacSha256 = Hmac<Sha256>;
+/// Frozen framing: the `.` was baked into the domain constant when these
+/// tokens started being issued. It separates unambiguously because the payload
+/// that follows is base64url, whose alphabet excludes `.`. Moving to the NUL
+/// convention would invalidate every outstanding token for up to
+/// `MAX_TOKEN_TTL_MS`; see `docs/domain-separation-convention.md` §6.1.
+const API_TOKEN_DOMAIN: MacDomain = MacDomain::legacy_ascii_separated("vbuff-local-api-v1", b'.');
+
 const MAX_TOKEN_BYTES: usize = 2_048;
 const MAX_TOKEN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
@@ -127,12 +132,9 @@ impl ApiTokenIssuer {
         let signature = URL_SAFE_NO_PAD
             .decode(signature)
             .map_err(|_| ApiTokenError::InvalidToken)?;
-        let mut mac = HmacSha256::new_from_slice(&self.signing_key)
-            .map_err(|_| ApiTokenError::InvalidToken)?;
-        mac.update(b"vbuff-local-api-v1.");
-        mac.update(payload.as_bytes());
-        mac.verify_slice(&signature)
-            .map_err(|_| ApiTokenError::InvalidSignature)?;
+        if !self.token_proof(payload).verify(&signature) {
+            return Err(ApiTokenError::InvalidSignature);
+        }
         let claims: ApiTokenClaims = serde_json::from_slice(
             &URL_SAFE_NO_PAD
                 .decode(payload)
@@ -161,14 +163,18 @@ impl ApiTokenIssuer {
         Ok(claims)
     }
 
+    /// The one statement of what a local API token's MAC covers: the base64url
+    /// payload, and nothing else. [`Self::encode`] and [`Self::verify`] both
+    /// reach their tag through here, so a field can never be added to the
+    /// signed message without also being added to the verified one.
+    fn token_proof(&self, payload: &str) -> MacProof {
+        hmac_proof(API_TOKEN_DOMAIN, &self.signing_key, &[payload.as_bytes()])
+    }
+
     fn encode(&self, claims: &ApiTokenClaims) -> Result<String, ApiTokenError> {
         let payload = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(claims).map_err(|_| ApiTokenError::InvalidToken)?);
-        let mut mac = HmacSha256::new_from_slice(&self.signing_key)
-            .map_err(|_| ApiTokenError::InvalidToken)?;
-        mac.update(b"vbuff-local-api-v1.");
-        mac.update(payload.as_bytes());
-        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(self.token_proof(&payload).finish());
         Ok(format!("v1.{payload}.{signature}"))
     }
 }
@@ -188,7 +194,62 @@ impl Drop for ApiTokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{hex, legacy_mac};
     use vbuff_types::ContentKind;
+
+    /// Freeze test for the local API token MAC. A failure here means every
+    /// token a user has pasted into a script stopped working, for up to
+    /// `MAX_TOKEN_TTL_MS`.
+    #[test]
+    fn api_token_mac_bytes_are_frozen_and_domain_bound() {
+        let issuer = ApiTokenIssuer::from_key([7; 32]);
+        let claims = ApiTokenClaims {
+            token_id: [3; 16],
+            scopes: BTreeSet::from([ApiScope::ReadHistory]),
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+            filter: ClipAccessFilter::default(),
+        };
+        let token = issuer.encode(&claims).unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let tag = issuer.token_proof(payload).finish();
+
+        assert_eq!(
+            hex(&tag),
+            "266ad7f17728e128aeae734dd148f2cdbc0de95d5efdf5b77f92e5e8cad6f05f"
+        );
+        // Byte-identical to the hand-rolled `mac.update(b"vbuff-local-api-v1.")`
+        // pair this replaced.
+        assert_eq!(
+            tag,
+            legacy_mac(
+                b"vbuff-local-api-v1.",
+                &issuer.signing_key,
+                &[payload.as_bytes()]
+            )
+        );
+        assert!(issuer.token_proof(payload).verify(&tag));
+
+        // A callback-domain tag over the identical payload must not pass here,
+        // and vice versa: the two token families share a shape, so only the
+        // domain keeps them apart.
+        let foreign = hmac_proof(
+            MacDomain::legacy_ascii_separated("vbuff-x-callback-v1", b'.'),
+            &issuer.signing_key,
+            &[payload.as_bytes()],
+        )
+        .finish();
+        assert_ne!(foreign, tag);
+        assert!(!issuer.token_proof(payload).verify(&foreign));
+        assert_eq!(
+            issuer.verify(
+                &format!("v1.{payload}.{}", URL_SAFE_NO_PAD.encode(foreign)),
+                ApiScope::ReadHistory,
+                150
+            ),
+            Err(ApiTokenError::InvalidSignature)
+        );
+    }
 
     #[test]
     fn tokens_are_scoped_signed_and_expiring() {
