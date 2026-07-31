@@ -7,6 +7,6 @@ mod secrets;
 pub use consent::EphemeralCountdown;
 pub use posture::{PrivacyPostureInput, PrivacyScore, PrivacyScoreFactor, PrivacyScoreLevel};
 pub use secrets::{
-    DetectorUpdateError, SecretHandling, SecretMask, SensitivityReason, SignedDetectorUpdate,
+    DetectorUpdateError, SecretHandling, SensitivityReason, SignedDetectorUpdate,
     handling_for_secret, sensitivity_reason_for_secret, sensitivity_watermark,
 };

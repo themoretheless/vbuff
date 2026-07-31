@@ -3,10 +3,11 @@ use std::time::Duration;
 use regex::Regex;
 use url::Url;
 use vbuff_types::{
-    CaptureProvenance, ConcealmentSignal, Flavor, ProvenanceConfidence, SensitivityReason,
+    CaptureProvenance, ConcealmentSignal, Flavor, GenerationCoherence, ProvenanceConfidence,
+    SelectionIntent, SensitivityReason,
 };
 
-use crate::secret::{SecretKind, detect_secrets};
+use crate::secret::{self, SecretFinding, SecretKind};
 use crate::trust::{handling_for_secret, sensitivity_reason_for_secret};
 
 /// Clipboard source being evaluated by the capture gate. The vocabulary is
@@ -42,6 +43,8 @@ pub enum DropReason {
     Concealed,
     ConcealmentUnknown,
     ProvenanceUnknown,
+    CoherenceUnknown,
+    IntentUnknown,
     SelfWriteSuppressed,
     PrimaryWithoutIntent,
     NoRealizedFlavor,
@@ -82,6 +85,8 @@ impl DropReason {
             | Self::Concealed
             | Self::ConcealmentUnknown
             | Self::ProvenanceUnknown
+            | Self::CoherenceUnknown
+            | Self::IntentUnknown
             | Self::SelfWriteSuppressed
             | Self::PrimaryWithoutIntent
             | Self::DebounceCollapsed => DropClass::Intentional,
@@ -107,6 +112,8 @@ impl DropReason {
             Self::Concealed => "concealed",
             Self::ConcealmentUnknown => "concealment_unknown",
             Self::ProvenanceUnknown => "provenance_unknown",
+            Self::CoherenceUnknown => "coherence_unknown",
+            Self::IntentUnknown => "intent_unknown",
             Self::SelfWriteSuppressed => "self_write_suppressed",
             Self::PrimaryWithoutIntent => "primary_without_intent",
             Self::NoRealizedFlavor => "no_realized_flavor",
@@ -190,8 +197,12 @@ pub struct CaptureInput<'a> {
     pub flavors: &'a [Flavor],
     pub provenance: &'a CaptureProvenance,
     pub source: SelectionSource,
-    pub primary_intended: bool,
-    pub coherent_generation: bool,
+    /// Deliberate-copy evidence for this selection change. Only consulted
+    /// when `source` is PRIMARY.
+    pub intent: SelectionIntent,
+    /// Owner/generation stability evidence for this read. `Unknown` means the
+    /// backend cannot observe ownership — never treat it as "proven coherent".
+    pub coherence: GenerationCoherence,
     /// OS concealment evidence. `Unknown` means the backend cannot read
     /// concealment markers — never treat it as "proven clear".
     pub concealment: ConcealmentSignal,
@@ -217,6 +228,12 @@ pub enum CaptureDecision {
 
 /// How the capture gate resolves evidence a clipboard backend cannot supply.
 ///
+/// Governs three signals whose `Unknown` state a generic backend can never
+/// leave: provenance, concealment and generation coherence. Selection intent
+/// is deliberately *not* governed here — it fails closed in every mode (see
+/// [`CapturePolicy::decide`]) because unknown intent is only reachable for
+/// PRIMARY, where absence of evidence is itself the hazard.
+///
 /// Unknown provenance only matters when source rules are armed
 /// (`excluded_apps`/`rules` non-empty); without armed rules every mode
 /// behaves identically, which keeps the default user experience unchanged.
@@ -240,8 +257,12 @@ pub struct CapturePolicy {
     pub skip_whitespace_only: bool,
     pub excluded_apps: Vec<String>,
     pub rules: Vec<CaptureRule>,
-    pub otp_ttl: Duration,
+    /// Whether the structural and entropy detectors run. One-time passwords
+    /// are outside this toggle; see `CapturePolicy::actionable_findings`.
     pub detect_secrets: bool,
+    /// Hard ceiling on how long *any* detected secret may live. Per-kind
+    /// lifetimes come from `trust::handling_for_secret`, which is the single
+    /// TTL table for the secret domain; this only ever shortens them.
     pub secret_ttl: Duration,
     pub unknown_evidence: UnknownEvidencePolicy,
 }
@@ -252,7 +273,6 @@ impl Default for CapturePolicy {
             skip_whitespace_only: true,
             excluded_apps: Vec::new(),
             rules: Vec::new(),
-            otp_ttl: Duration::from_secs(90),
             detect_secrets: true,
             secret_ttl: Duration::from_secs(10 * 60),
             unknown_evidence: UnknownEvidencePolicy::default(),
@@ -265,14 +285,46 @@ impl CapturePolicy {
         if input.flavors.is_empty() {
             return CaptureDecision::Skip(DropReason::Empty);
         }
-        if !input.coherent_generation {
-            return CaptureDecision::Skip(DropReason::TornRead);
+        match input.coherence {
+            GenerationCoherence::Torn => return CaptureDecision::Skip(DropReason::TornRead),
+            GenerationCoherence::Unknown
+                if self.unknown_evidence == UnknownEvidencePolicy::Skip =>
+            {
+                return CaptureDecision::Skip(DropReason::CoherenceUnknown);
+            }
+            // Same deliberate compromise as `ConcealmentSignal::Unknown`
+            // below: unknown coherence is the permanent state of the generic
+            // arboard backend, which cannot observe clipboard ownership at
+            // all. Treating it as torn would drop every capture on every
+            // shipping build, so Guard/Allow keep capturing and only an
+            // affirmative `Torn` is counted as a lost read. The uncertainty
+            // is no longer erased — it travels on in the read's own evidence
+            // field instead of being flattened into a claim of coherence.
+            GenerationCoherence::Coherent | GenerationCoherence::Unknown => {}
         }
         if input.self_write {
             return CaptureDecision::Skip(DropReason::SelfWriteSuppressed);
         }
-        if input.source == SelectionSource::Primary && !input.primary_intended {
-            return CaptureDecision::Skip(DropReason::PrimaryWithoutIntent);
+        if input.source == SelectionSource::Primary {
+            match input.intent {
+                SelectionIntent::Incidental => {
+                    return CaptureDecision::Skip(DropReason::PrimaryWithoutIntent);
+                }
+                // Unlike coherence and concealment, unknown intent fails
+                // closed in every mode. PRIMARY changes on every mouse drag,
+                // so "no intent evidence" is exactly the condition this gate
+                // exists to refuse; accepting it would flood the history with
+                // text the user never copied. This drops nothing today — no
+                // backend reports a PRIMARY selection yet, and the only
+                // shipping backend reads CLIPBOARD, where intent is never
+                // consulted — so the cost lands entirely on the future
+                // X11/Wayland backend, which must report intent explicitly
+                // instead of inheriting a default that speaks for it.
+                SelectionIntent::Unknown => {
+                    return CaptureDecision::Skip(DropReason::IntentUnknown);
+                }
+                SelectionIntent::Intended => {}
+            }
         }
         match input.concealment {
             ConcealmentSignal::Concealed => return CaptureDecision::Skip(DropReason::Concealed),
@@ -351,86 +403,63 @@ impl CapturePolicy {
             return CaptureDecision::Skip(DropReason::WhitespaceOnly);
         }
 
-        let otp = input
-            .flavors
-            .iter()
-            .filter(|flavor| flavor.is_realized())
-            .filter_map(Flavor::as_text)
-            .any(is_probable_otp);
-        let secret_finding = self.detect_secrets.then(|| {
-            input
-                .flavors
-                .iter()
-                .filter(|flavor| flavor.is_realized())
-                .filter_map(Flavor::as_text)
-                .flat_map(detect_secrets)
-                .filter(|finding| finding.confidence >= secret_threshold(finding.kind))
-                .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
-        });
-        let secret_kind = secret_finding.flatten().map(|finding| finding.kind);
+        let findings = self.actionable_findings(input.flavors);
         let forced_sensitive = action == CaptureAction::CaptureSensitive;
-        let sensitivity_reason = if otp {
-            Some(SensitivityReason::OneTimePassword)
-        } else if let Some(kind) = secret_kind {
-            Some(sensitivity_reason_for_secret(kind))
-        } else if forced_sensitive {
-            Some(SensitivityReason::CaptureRule)
-        } else {
-            None
-        };
+        // Naming takes the strongest evidence; the safety limits below take
+        // the strictest across *every* finding. Resolving both from a single
+        // "winning" finding is how a clip that looked like an access token
+        // and a one-time password used to inherit the more permissive TTL of
+        // whichever detector happened to win.
+        let sensitivity_reason = secret::strongest_finding(findings.iter().copied())
+            .map(|finding| sensitivity_reason_for_secret(finding.kind))
+            .or_else(|| forced_sensitive.then_some(SensitivityReason::CaptureRule));
         CaptureDecision::Capture {
             action,
             sensitive: sensitivity_reason.is_some(),
             sync_eligible: sensitivity_reason.is_none(),
             ai_allowed: sensitivity_reason.is_none(),
-            memory_only: otp
-                || secret_kind.is_some_and(|kind| handling_for_secret(kind).memory_only),
-            expires_after: if otp {
-                Some(self.otp_ttl.min(self.secret_ttl))
-            } else if let Some(kind) = secret_kind {
-                let handling = handling_for_secret(kind);
-                Some(handling.ttl.min(self.secret_ttl))
-            } else if forced_sensitive {
+            memory_only: findings
+                .iter()
+                .any(|finding| handling_for_secret(finding.kind).memory_only),
+            expires_after: findings
+                .iter()
+                .map(|finding| handling_for_secret(finding.kind).ttl)
+                .min()
                 // A rule-forced sensitive capture is still a secret class:
                 // bound it by the user's secret TTL instead of no expiry.
-                Some(self.secret_ttl)
-            } else {
-                None
-            },
+                .or_else(|| forced_sensitive.then_some(self.secret_ttl))
+                .map(|ttl| ttl.min(self.secret_ttl)),
             sensitivity_reason,
         }
     }
-}
 
-const fn secret_threshold(kind: SecretKind) -> f32 {
-    match kind {
-        SecretKind::HighEntropy => 0.7,
-        _ => 0.9,
+    /// Content findings this gate is allowed to act on.
+    ///
+    /// The `detect_secrets` toggle governs the structural and entropy
+    /// detectors only. One-time passwords stay outside it, as they always
+    /// have: the toggle is about scanning copied text for credentials, and a
+    /// user who turns it off has not asked for their authenticator codes to
+    /// start living in a synced, AI-readable history forever.
+    fn actionable_findings(&self, flavors: &[Flavor]) -> Vec<SecretFinding> {
+        let mut findings = flavors
+            .iter()
+            .filter(|flavor| flavor.is_realized())
+            .filter_map(Flavor::as_text)
+            .flat_map(secret::actionable_secrets)
+            .collect::<Vec<_>>();
+        if !self.detect_secrets {
+            findings.retain(|finding| finding.kind == SecretKind::OneTimePassword);
+        }
+        findings
     }
-}
-
-fn is_probable_otp(text: &str) -> bool {
-    let trimmed = text.trim();
-    if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return true;
-    }
-
-    let lower = trimmed.to_lowercase();
-    let has_marker = ["code", "otp", "verification", "verify", "passcode"]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    has_marker
-        && lower
-            .split(|ch: char| !ch.is_ascii_digit())
-            .any(|part| (4..=8).contains(&part.len()))
 }
 
 /// Apply the capture gate's content-only sensitivity rules to edited text.
+///
+/// Thin alias for [`secret::text_contains_actionable_secret`]: the gate and
+/// the edit path must never be able to answer this question differently.
 pub fn text_requires_sensitive_handling(text: &str) -> bool {
-    is_probable_otp(text)
-        || detect_secrets(text)
-            .into_iter()
-            .any(|finding| finding.confidence >= secret_threshold(finding.kind))
+    secret::text_contains_actionable_secret(text)
 }
 
 #[cfg(test)]
@@ -443,10 +472,10 @@ mod tests {
             flavors,
             provenance,
             source: SelectionSource::Clipboard,
-            primary_intended: true,
-            coherent_generation: true,
             // Tests exercise proven, clear evidence by default; the unknown
             // evidence paths get their own dedicated cases below.
+            intent: SelectionIntent::Intended,
+            coherence: GenerationCoherence::Coherent,
             concealment: ConcealmentSignal::Clear,
             provenance_confidence: ProvenanceConfidence::Proven,
             self_write: false,
@@ -465,7 +494,12 @@ mod tests {
                 sync_eligible: false,
                 ai_allowed: false,
                 memory_only: true,
-                expires_after: Some(Duration::from_secs(90)),
+                // 60s, from the one TTL table. The gate used to carry its own
+                // `otp_ttl` of 90s that no configuration could reach, so the
+                // same code expired after 60s or 90s depending on which OTP
+                // heuristic caught it; the shorter of the two now applies to
+                // both.
+                expires_after: Some(Duration::from_secs(60)),
                 sensitivity_reason: Some(SensitivityReason::OneTimePassword),
             }
         );
@@ -486,7 +520,11 @@ mod tests {
                 sync_eligible: false,
                 ai_allowed: false,
                 memory_only: false,
-                expires_after: Some(Duration::from_secs(5 * 60)),
+                // The token is also high-entropy, and the TTL is now the
+                // strictest across every finding rather than the one attached
+                // to the highest-confidence finding: 2min (entropy) beats the
+                // 5min an access token alone would get.
+                expires_after: Some(Duration::from_secs(2 * 60)),
                 sensitivity_reason: Some(SensitivityReason::AccessToken),
             }
         );
@@ -541,6 +579,138 @@ mod tests {
                     ..
                 } if ttl <= Duration::from_secs(60)
             ));
+        }
+    }
+
+    fn decide_text(policy: &CapturePolicy, text: &str) -> CaptureDecision {
+        let flavors = [Flavor::inline("text/plain", text.as_bytes().to_vec())];
+        let provenance = CaptureProvenance::default();
+        policy.decide(input(&flavors, &provenance))
+    }
+
+    /// `"one-time"` was a marker the detector knew and the gate did not, so
+    /// this clip reached the store unmasked while an identical clip already
+    /// in the store was treated as a secret by the clawback scan.
+    #[test]
+    fn one_time_marker_now_masks_at_capture_too() {
+        assert!(matches!(
+            decide_text(
+                &CapturePolicy::default(),
+                "your one-time password is 483920"
+            ),
+            CaptureDecision::Capture {
+                sensitive: true,
+                sync_eligible: false,
+                ai_allowed: false,
+                memory_only: true,
+                sensitivity_reason: Some(SensitivityReason::OneTimePassword),
+                ..
+            }
+        ));
+    }
+
+    /// The gate's own OTP heuristic was never gated by `detect_secrets`, and
+    /// folding OTP into the detector must not quietly put it behind that
+    /// toggle. Both OTP rules are checked, including the `"one-time"` marker
+    /// the gate never knew about.
+    #[test]
+    fn otp_stays_outside_the_detect_secrets_toggle() {
+        let policy = CapturePolicy {
+            detect_secrets: false,
+            ..CapturePolicy::default()
+        };
+        for sample in [
+            "123456",
+            "your login code is 4821",
+            "one-time password 483920",
+        ] {
+            assert!(
+                matches!(
+                    decide_text(&policy, sample),
+                    CaptureDecision::Capture {
+                        sensitive: true,
+                        sensitivity_reason: Some(SensitivityReason::OneTimePassword),
+                        ..
+                    }
+                ),
+                "{sample:?} must stay sensitive with secret detection disabled"
+            );
+        }
+
+        // The toggle still switches off everything it is meant to.
+        assert!(matches!(
+            decide_text(&policy, "ghp_abcdefghijklmnopqrstuvwxyz123456"),
+            CaptureDecision::Capture {
+                sensitive: false,
+                expires_after: None,
+                ..
+            }
+        ));
+    }
+
+    /// Safety limits come from every matching kind, not from the single
+    /// highest-confidence one. This clip is both an access token (5min, not
+    /// memory-only) and a one-time password (60s, memory-only); resolving it
+    /// through one winner would leak whichever limit the winner lacked.
+    #[test]
+    fn strictest_matching_kind_bounds_ttl_and_memory_only() {
+        assert!(matches!(
+            decide_text(
+                &CapturePolicy::default(),
+                "login code 4821 ghp_abcdefghijklmnopqrstuvwxyz123456"
+            ),
+            CaptureDecision::Capture {
+                sensitive: true,
+                memory_only: true,
+                expires_after: Some(ttl),
+                sensitivity_reason: Some(SensitivityReason::AccessToken),
+                ..
+            } if ttl == Duration::from_secs(60)
+        ));
+    }
+
+    /// The gate used to name a one-time password ahead of everything else,
+    /// so a private key sharing the clip with a code inherited the code's
+    /// longer lifetime instead of its own 30s.
+    #[test]
+    fn a_stronger_finding_no_longer_loses_to_a_one_time_password() {
+        assert!(matches!(
+            decide_text(
+                &CapturePolicy::default(),
+                "-----BEGIN OPENSSH PRIVATE KEY----- login code 4821"
+            ),
+            CaptureDecision::Capture {
+                memory_only: true,
+                expires_after: Some(ttl),
+                sensitivity_reason: Some(SensitivityReason::PrivateKey),
+                ..
+            } if ttl == Duration::from_secs(30)
+        ));
+    }
+
+    /// The gate and the store's clawback scan must reach the same verdict on
+    /// the same text. Bare digit codes were the divergence: masked on the way
+    /// in, invisible to every caller of `detect_secrets` afterwards.
+    #[test]
+    fn capture_and_stored_reclassification_agree_on_the_same_text() {
+        for sample in ["123456", "4821", "your login code is 4821", "verify 12345"] {
+            let captured_sensitive = matches!(
+                decide_text(&CapturePolicy::default(), sample),
+                CaptureDecision::Capture {
+                    sensitive: true,
+                    ..
+                }
+            );
+            let finding = secret::strongest_actionable_secret(sample);
+            assert!(captured_sensitive, "gate missed {sample:?}");
+            assert!(
+                finding.is_some_and(|finding| finding.justifies_reclassification()),
+                "store scan would skip {sample:?} that the gate masked"
+            );
+            assert!(
+                text_requires_sensitive_handling(sample),
+                "edit path {sample:?}"
+            );
         }
     }
 
@@ -633,7 +803,7 @@ mod tests {
         let policy = CapturePolicy::default();
 
         let mut candidate = input(&flavors, &provenance);
-        candidate.coherent_generation = false;
+        candidate.coherence = GenerationCoherence::Torn;
         assert_eq!(
             policy.decide(candidate),
             CaptureDecision::Skip(DropReason::TornRead)
@@ -641,7 +811,7 @@ mod tests {
 
         let mut candidate = input(&flavors, &provenance);
         candidate.source = SelectionSource::Primary;
-        candidate.primary_intended = false;
+        candidate.intent = SelectionIntent::Incidental;
         assert_eq!(
             policy.decide(candidate),
             CaptureDecision::Skip(DropReason::PrimaryWithoutIntent)
@@ -824,6 +994,115 @@ mod tests {
     }
 
     #[test]
+    fn generation_coherence_is_a_three_state_gate() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let provenance = CaptureProvenance::default();
+
+        // An affirmative torn read is a loss in every mode.
+        for mode in [
+            UnknownEvidencePolicy::Guard,
+            UnknownEvidencePolicy::Skip,
+            UnknownEvidencePolicy::Allow,
+        ] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let mut candidate = input(&flavors, &provenance);
+            candidate.coherence = GenerationCoherence::Torn;
+            assert_eq!(
+                policy.decide(candidate),
+                CaptureDecision::Skip(DropReason::TornRead),
+                "mode {mode:?} must still honor an affirmative torn read"
+            );
+        }
+
+        // Unknown coherence only refuses in Skip mode; Guard/Allow keep the
+        // generic backend (which can never prove coherence) usable.
+        let skip_policy = CapturePolicy {
+            unknown_evidence: UnknownEvidencePolicy::Skip,
+            ..CapturePolicy::default()
+        };
+        let mut candidate = input(&flavors, &provenance);
+        candidate.coherence = GenerationCoherence::Unknown;
+        assert_eq!(
+            skip_policy.decide(candidate),
+            CaptureDecision::Skip(DropReason::CoherenceUnknown)
+        );
+        for mode in [UnknownEvidencePolicy::Guard, UnknownEvidencePolicy::Allow] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+            let mut candidate = input(&flavors, &provenance);
+            candidate.coherence = GenerationCoherence::Unknown;
+            assert!(
+                matches!(policy.decide(candidate), CaptureDecision::Capture { .. }),
+                "mode {mode:?} must not drop captures merely because coherence is unprovable"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_intent_is_a_three_state_gate_scoped_to_primary() {
+        let flavors = [Flavor::inline("text/plain", b"ordinary text".to_vec())];
+        let provenance = CaptureProvenance::default();
+
+        for mode in [
+            UnknownEvidencePolicy::Guard,
+            UnknownEvidencePolicy::Skip,
+            UnknownEvidencePolicy::Allow,
+        ] {
+            let policy = CapturePolicy {
+                unknown_evidence: mode,
+                ..CapturePolicy::default()
+            };
+
+            // CLIPBOARD never consults intent, so the fail-closed default
+            // cannot regress the only source a shipping backend reports.
+            for intent in [
+                SelectionIntent::Intended,
+                SelectionIntent::Incidental,
+                SelectionIntent::Unknown,
+            ] {
+                let mut candidate = input(&flavors, &provenance);
+                candidate.intent = intent;
+                assert!(
+                    matches!(policy.decide(candidate), CaptureDecision::Capture { .. }),
+                    "clipboard capture must ignore intent {intent:?} in mode {mode:?}"
+                );
+            }
+
+            // PRIMARY requires positive intent evidence: absence fails closed
+            // in every mode, and is reported apart from an observed refusal.
+            let mut candidate = input(&flavors, &provenance);
+            candidate.source = SelectionSource::Primary;
+            candidate.intent = SelectionIntent::Unknown;
+            assert_eq!(
+                policy.decide(candidate),
+                CaptureDecision::Skip(DropReason::IntentUnknown),
+                "mode {mode:?} must refuse PRIMARY without intent evidence"
+            );
+
+            let mut candidate = input(&flavors, &provenance);
+            candidate.source = SelectionSource::Primary;
+            candidate.intent = SelectionIntent::Incidental;
+            assert_eq!(
+                policy.decide(candidate),
+                CaptureDecision::Skip(DropReason::PrimaryWithoutIntent)
+            );
+
+            let mut candidate = input(&flavors, &provenance);
+            candidate.source = SelectionSource::Primary;
+            candidate.intent = SelectionIntent::Intended;
+            assert!(matches!(
+                policy.decide(candidate),
+                CaptureDecision::Capture { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn new_drop_reasons_are_intentional_and_named_stably() {
         assert_eq!(
             DropReason::ProvenanceUnknown.class(),
@@ -838,8 +1117,17 @@ mod tests {
             DropReason::ConcealmentUnknown.as_str(),
             "concealment_unknown"
         );
+        assert_eq!(DropReason::CoherenceUnknown.class(), DropClass::Intentional);
+        assert_eq!(DropReason::IntentUnknown.class(), DropClass::Intentional);
+        // An affirmative torn read stays a loss: only the refusal to trust
+        // missing evidence is an intentional policy decision.
+        assert_eq!(DropReason::TornRead.class(), DropClass::Loss);
+        assert_eq!(DropReason::CoherenceUnknown.as_str(), "coherence_unknown");
+        assert_eq!(DropReason::IntentUnknown.as_str(), "intent_unknown");
         assert!(DropReason::ProvenanceUnknown.is_recoverable());
         assert!(!DropReason::ConcealmentUnknown.is_recoverable());
         assert!(!DropReason::Concealed.is_recoverable());
+        assert!(!DropReason::CoherenceUnknown.is_recoverable());
+        assert!(!DropReason::IntentUnknown.is_recoverable());
     }
 }

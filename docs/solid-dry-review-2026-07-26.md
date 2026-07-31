@@ -111,7 +111,11 @@
 4. Единый `SessionContext::detect()` один раз в main (T9).
 5. Config: serde-flatten ShareableConfig + serde-енумы (T9).
 6. AppCommand → UiAction (T9); ClipboardBackend::write → WriteOptions (до первого нативного бэкенда).
-7. Три-стейты для generation/intent в CapturedClipboard (T6).
+7. ✅ **Сделано 2026-08-01.** `GenerationCoherence{Coherent,Torn,Unknown}` и `SelectionIntent{Intended,Incidental,Unknown}` в `vbuff-types` (дефолт `Unknown`, как у `ConcealmentSignal`); `CapturedClipboard` и `CaptureInput` переведены, `CaptureForensicEvent` вместо пары взаимно отрицающих булевых (`owner_changed`/`coherent`) хранит одно трёхзначное поле.
+
+   Решения в гейте различаются осознанно и записаны в doc-comment: неизвестная когерентность **не** отбрасывает захват в Guard/Allow (это вечное состояние arboard — отказ убил бы весь захват), а в режиме Skip даёт `coherence_unknown`, ровно как у concealment; неизвестный intent, наоборот, fail-closed во **всех** режимах — он читается только для PRIMARY, где отсутствие сигнала само по себе и есть опасность (выделение мышью), и сегодня не роняет ни одного захвата, потому что PRIMARY не отдаёт ни один бэкенд. Путь явного восстановления пропущенного клипа сравнивает `!= Torn`, а не `== Coherent`, иначе он молча отключился бы на arboard.
+
+   Второй канал evidence убран целиком: `BackendEvidence`/`ClipboardBackend::evidence()` удалены, а стартовая проверка «источник недоказуем» в `src/capture.rs` теперь судит по `provenance_confidence` реального чтения. Статический канал не нёс ни одного факта сверх per-read полей (backend без наблюдения возвращает `Unknown` на каждом чтении), но позволял предупреждению в UI и решению гейта разойтись на одном и том же сигнале.
 
 **Волна C — «Структура» (L, по готовности):**
 1. Решение по поисковым стекам (RFC: GUI на search_page или store-поиск внутренним) + миграция (T1).

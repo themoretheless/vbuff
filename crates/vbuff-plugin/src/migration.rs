@@ -39,6 +39,17 @@ pub struct MigrationPreflight {
     pub pins: usize,
     pub snippets: usize,
     pub images: usize,
+    /// Records carrying a finding the capture gate would act on.
+    ///
+    /// A preflight is a forecast of the import, so it asks the same question
+    /// the capture gate will ask of the same bytes - [`SecretFinding::is_actionable`],
+    /// not "did any detector emit anything at all". A bare non-empty check
+    /// pins the floor at zero, so any future weak-evidence detector would
+    /// silently inflate this count; and it must stay looser than the store's
+    /// reclassification floor, because over-warning before an import the user
+    /// has not started yet is the cheap direction to be wrong in.
+    ///
+    /// [`SecretFinding::is_actionable`]: vbuff_core::secret::SecretFinding::is_actionable
     pub likely_secrets: usize,
     pub total_bytes: u64,
     pub unsupported_records: usize,
@@ -77,7 +88,7 @@ impl MigrationPreflight {
                 if !saw_secret
                     && flavor
                         .as_text()
-                        .is_some_and(|text| !vbuff_core::secret::detect_secrets(text).is_empty())
+                        .is_some_and(vbuff_core::secret::text_contains_actionable_secret)
                 {
                     saw_secret = true;
                 }
@@ -258,6 +269,85 @@ mod tests {
         );
         let changed = vec![record("two", 2, "updated")];
         assert_eq!(tracker.changed(&changed).unwrap().len(), 1);
+    }
+
+    /// The preflight is a forecast, so it must not own a threshold: whatever
+    /// the capture gate would route into the sensitive lane is exactly what
+    /// the preflight counts. Before the floor was named, the preflight asked
+    /// "did any detector emit anything at all", which pins the floor at zero
+    /// and would let a future weak-evidence detector inflate the advisory
+    /// number without anyone editing this file.
+    #[test]
+    fn preflight_forecasts_the_capture_gate_for_every_confidence_band() {
+        let samples = [
+            // Structural findings, well above the floor.
+            ("ghp_abcdefghijklmnopqrstuvwxyz123456", true),
+            // Exactly at the structural floor (0.90, inclusive).
+            ("4111111111111111", true),
+            // The weakest detector, 0.72 against a 0.70 entropy floor: an
+            // opaque blob with no structure to explain it.
+            ("xQ7vR2pL9mK4wZ8tB6nH3jF5cD1aG0uY7eT4iS2", true),
+            // Links and file paths clear the entropy bar arithmetically but
+            // are structure, not randomness, so the detector abstains.
+            (
+                "https://example.com/blog/post?utm_source=Newsletter&id=8fA2",
+                false,
+            ),
+            (
+                "C:\\Users\\denis\\Documents\\Projects\\report-2026-Q3.xlsx",
+                false,
+            ),
+            // No finding at all.
+            ("ordinary clipboard prose with no secrets", false),
+            (
+                "let response = client.post(\"/v1/items\").json(&payload).send()",
+                false,
+            ),
+        ];
+        for (index, (text, expected)) in samples.iter().enumerate() {
+            let preflight =
+                MigrationPreflight::scan(&[record(&index.to_string(), 1, text)]).unwrap();
+            assert_eq!(
+                preflight.likely_secrets == 1,
+                *expected,
+                "preflight miscounted {text}"
+            );
+            assert_eq!(
+                preflight.likely_secrets == 1,
+                vbuff_core::capture::text_requires_sensitive_handling(text),
+                "preflight and capture gate disagree about {text}"
+            );
+        }
+    }
+
+    /// The store may only claw a stored clip back on stronger evidence than
+    /// the preflight warns on. A preflight that over-warns costs a scary
+    /// number before an import the user has not started; a clawback that
+    /// over-fires shreds a clip the user has been living with.
+    #[test]
+    fn preflight_warns_on_weaker_evidence_than_the_store_reclassifies_on() {
+        let entropy_only = "xQ7vR2pL9mK4wZ8tB6nH3jF5cD1aG0uY7eT4iS2";
+        let findings = vbuff_core::secret::detect_secrets(entropy_only);
+
+        assert!(
+            findings
+                .iter()
+                .copied()
+                .any(vbuff_core::secret::SecretFinding::is_actionable)
+        );
+        assert!(
+            !findings
+                .iter()
+                .copied()
+                .any(vbuff_core::secret::SecretFinding::justifies_reclassification),
+            "the entropy detector must not reach the reclassification floor"
+        );
+        assert_eq!(
+            MigrationPreflight::scan(&[record("entropy", 1, entropy_only)])
+                .unwrap()
+                .likely_secrets,
+            1
+        );
     }
 
     #[test]

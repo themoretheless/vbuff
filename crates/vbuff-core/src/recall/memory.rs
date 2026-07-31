@@ -4,7 +4,7 @@ use std::fmt;
 use vbuff_types::validation::{all_zero, is_valid_trimmed_label};
 use vbuff_types::{Clip, ClipId};
 
-use crate::secret::detect_secrets;
+use crate::secret::text_contains_actionable_secret;
 
 const MAX_MACROS: usize = 64;
 const MAX_MACRO_NAME_BYTES: usize = 32;
@@ -417,10 +417,14 @@ fn identity_hash(value: &str, maximum_bytes: usize) -> Option<[u8; 32]> {
     is_valid_trimmed_label(value, maximum_bytes).then(|| *blake3::hash(value.as_bytes()).as_bytes())
 }
 
+/// A query that is itself a secret must never be remembered.
+///
+/// This used to carry its own inline copy of the bare-digit one-time password
+/// rule, because `detect_secrets` did not know it. It does now, so there is
+/// one definition of "looks like a secret" instead of a local variant that
+/// could drift from the capture gate's.
 fn query_looks_sensitive(query: &str) -> bool {
-    let trimmed = query.trim();
-    !detect_secrets(trimmed).is_empty()
-        || ((4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()))
+    text_contains_actionable_secret(query.trim())
 }
 
 #[cfg(test)]
