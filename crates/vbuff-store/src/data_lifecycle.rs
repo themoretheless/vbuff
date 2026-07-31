@@ -27,6 +27,14 @@ const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
 /// residency is bounded even when no restore/reject decision ever arrives.
 const IMPORT_QUARANTINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+fn require_lifecycle_update(changed: usize, row_name: &str) -> Result<()> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt(format!("{row_name} row is missing")))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ArchiveVisibility {
     #[default]
@@ -371,14 +379,15 @@ pub fn export_clips_json(clips: &[Clip], version: ExportSchemaVersion) -> Result
 impl Store {
     pub fn set_archived(&self, id: ClipId, archived: bool) -> Result<()> {
         self.ensure_clip_exists(id)?;
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE clip_annotations SET archived = ?1 WHERE clip_id = ?2",
             params![archived as i64, id.to_string_repr()],
         )?;
-        Ok(())
+        require_lifecycle_update(changed, "clip annotation")
     }
 
     pub fn annotations(&self, id: ClipId) -> Result<ClipAnnotations> {
+        self.ensure_clip_exists(id)?;
         self.conn
             .query_row(
                 r#"
@@ -396,7 +405,7 @@ impl Store {
                 },
             )
             .optional()?
-            .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))
+            .ok_or_else(|| StoreError::Corrupt("clip annotation row is missing".into()))
     }
 
     pub fn list_with_archive(
@@ -405,8 +414,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Clip>> {
         let archive_clause = match visibility {
-            ArchiveVisibility::Active => "AND COALESCE(a.archived, 0) = 0",
-            ArchiveVisibility::Archived => "AND COALESCE(a.archived, 0) = 1",
+            ArchiveVisibility::Active => "AND a.archived = 0",
+            ArchiveVisibility::Archived => "AND a.archived = 1",
             ArchiveVisibility::All => "",
         };
         let sql = format!(
@@ -414,7 +423,7 @@ impl Store {
             SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
                    c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
             FROM clips c
-            LEFT JOIN clip_annotations a ON a.clip_id = c.id
+            JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
             {archive_clause}
             ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC
@@ -444,9 +453,9 @@ impl Store {
                 SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
                        c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
                 FROM clips c
-                LEFT JOIN clip_annotations a ON a.clip_id = c.id
+                JOIN clip_annotations a ON a.clip_id = c.id
                 WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
-                  AND COALESCE(a.archived, 0) = 0
+                  AND a.archived = 0
                 ORDER BY c.updated_at DESC, c.seq DESC
                 LIMIT 1
                 "#,
@@ -534,11 +543,11 @@ impl Store {
                 return Err(StoreError::Maintenance("collection does not exist".into()));
             }
         }
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE clip_annotations SET collection_id = ?1 WHERE clip_id = ?2",
             params![collection_id, id.to_string_repr()],
         )?;
-        Ok(())
+        require_lifecycle_update(changed, "clip annotation")
     }
 
     pub fn collection_retention_preview(
@@ -609,7 +618,30 @@ impl Store {
         let preview = self.collection_retention_preview(collection_id, limit)?;
         let transaction = self.conn.unchecked_transaction()?;
         for id in &preview.clip_ids {
-            transaction.execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
+            crate::ensure_delete_eligible(&transaction, *id, true)?;
+            let deleted = transaction.execute(
+                r#"
+                DELETE FROM clips
+                WHERE id = ?1 AND pinned = 0 AND favorite = 0
+                  AND EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id
+                      AND annotations.collection_id = ?2
+                      AND annotations.legal_hold = 0
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM temp.session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )
+                "#,
+                params![id.to_string_repr(), collection_id],
+            )?;
+            if deleted != 1 {
+                crate::ensure_delete_eligible(&transaction, *id, true)?;
+                return Err(StoreError::Maintenance(
+                    "collection retention eligibility changed".into(),
+                ));
+            }
         }
         transaction.commit()?;
         if !preview.clip_ids.is_empty() {
@@ -774,14 +806,15 @@ impl Store {
             ResidencyTransition::Synced => "ever_synced",
             ResidencyTransition::Exported => "ever_exported",
         };
-        self.conn.execute(
+        let changed = self.conn.execute(
             &format!("UPDATE clip_residency SET {column} = 1 WHERE clip_id = ?1"),
             [id.to_string_repr()],
         )?;
-        Ok(())
+        require_lifecycle_update(changed, "clip residency")
     }
 
     pub fn residency(&self, id: ClipId) -> Result<SensitiveDataResidency> {
+        self.ensure_clip_exists(id)?;
         self.conn
             .query_row(
                 "SELECT ever_on_disk, ever_synced, ever_exported FROM clip_residency WHERE clip_id = ?1",
@@ -795,7 +828,7 @@ impl Store {
                 },
             )
             .optional()?
-            .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))
+            .ok_or_else(|| StoreError::Corrupt("clip residency row is missing".into()))
     }
 
     pub fn set_preferred_flavor(&self, id: ClipId, mime: Option<&str>) -> Result<()> {
@@ -813,20 +846,20 @@ impl Store {
                 "preferred flavor is invalid or unavailable".into(),
             ));
         }
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE clip_annotations SET preferred_mime = ?1 WHERE clip_id = ?2",
             params![mime, id.to_string_repr()],
         )?;
-        Ok(())
+        require_lifecycle_update(changed, "clip annotation")
     }
 
     pub fn set_legal_hold(&self, id: ClipId, held: bool) -> Result<()> {
         self.ensure_clip_exists(id)?;
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE clip_annotations SET legal_hold = ?1 WHERE clip_id = ?2",
             params![held as i64, id.to_string_repr()],
         )?;
-        Ok(())
+        require_lifecycle_update(changed, "clip annotation")
     }
 
     pub fn record_verified_backup(&self, verified_at: DateTime<Utc>, checksum: &str) -> Result<()> {
@@ -865,6 +898,9 @@ impl Store {
         let Some((verified_at, checksum)) = record else {
             return Ok(None);
         };
+        if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StoreError::Corrupt("invalid backup checksum".into()));
+        }
         let verified_at = DateTime::from_timestamp_millis(verified_at)
             .ok_or_else(|| StoreError::Corrupt("invalid backup verification time".into()))?;
         if verified_at > now {
@@ -1002,17 +1038,20 @@ impl Store {
                 .conn
                 .query_row(
                     r#"
-                    SELECT c.id, COALESCE(a.archived, 0)
+                    SELECT c.id, a.archived
                     FROM clips c
                     LEFT JOIN clip_annotations a ON a.clip_id = c.id
                     WHERE c.content_hash = ?1
                       AND (c.expires_at IS NULL OR c.expires_at > ?2)
                     "#,
                     params![clip.content_hash.as_slice(), now_millis()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )
                 .optional()?;
             if let Some((existing_id, archived)) = duplicate {
+                let archived = archived
+                    .ok_or_else(|| StoreError::Corrupt("clip annotation row is missing".into()))?
+                    != 0;
                 if archived {
                     let existing_id = ClipId::parse(&existing_id)
                         .map_err(|_| StoreError::Corrupt("bad duplicate clip id".into()))?;
@@ -1083,31 +1122,18 @@ impl Store {
         let output = export_clips_json(&clips, version)?;
         let transaction = self.conn.unchecked_transaction()?;
         for clip in &clips {
-            transaction.execute(
+            let changed = transaction.execute(
                 "UPDATE clip_residency SET ever_exported = 1 WHERE clip_id = ?1",
                 [clip.id.to_string_repr()],
             )?;
+            require_lifecycle_update(changed, "clip residency")?;
         }
         transaction.commit()?;
         Ok(output)
     }
 
     pub(crate) fn ensure_not_legal_hold(&self, id: ClipId) -> Result<()> {
-        let held = self
-            .conn
-            .query_row(
-                "SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1",
-                [id.to_string_repr()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        match held {
-            None => Err(StoreError::ClipNotFound(id.to_string_repr())),
-            Some(0) => Ok(()),
-            Some(_) => Err(StoreError::Maintenance(
-                "clip is under legal hold; release it before deletion".into(),
-            )),
-        }
+        crate::ensure_delete_eligible(&self.conn, id, false)
     }
 
     fn ensure_clip_exists(&self, id: ClipId) -> Result<()> {
@@ -1319,6 +1345,17 @@ mod tests {
             1
         );
         assert!(store.delete(clip.id).is_err());
+        assert!(
+            store
+                .delete_with_grace(
+                    clip.id,
+                    &[7; 32],
+                    Duration::from_secs(60),
+                    crate::DeletionReason::User,
+                )
+                .is_err()
+        );
+        assert!(store.grace_bin(10).unwrap().is_empty());
         store.set_legal_hold(clip.id, false).unwrap();
         store.delete(clip.id).unwrap();
     }
@@ -1666,6 +1703,75 @@ mod tests {
         assert!(
             store
                 .backup_freshness(now, Duration::from_secs(60))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_lifecycle_sidecars_and_corrupt_backup_checksum_fail_closed() {
+        let store = Store::open_in_memory().unwrap();
+        let clip = clip("missing sidecar");
+        store.insert(&clip).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM clip_residency WHERE clip_id = ?1",
+                [clip.id.to_string_repr()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_residency(clip.id, ResidencyTransition::Exported)
+                .is_err()
+        );
+        assert!(store.residency(clip.id).is_err());
+        assert!(
+            store
+                .export_json(ExportSchemaVersion::V2, ArchiveVisibility::All, 10)
+                .is_err()
+        );
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM clip_annotations WHERE clip_id = ?1",
+                [clip.id.to_string_repr()],
+            )
+            .unwrap();
+        assert!(store.set_archived(clip.id, true).is_err());
+        assert!(store.annotations(clip.id).is_err());
+        assert!(
+            store
+                .apply_batch(&[crate::StoreMutation::Delete { id: clip.id }])
+                .is_err()
+        );
+        assert!(matches!(store.delete(clip.id), Err(StoreError::Corrupt(_))));
+        assert!(
+            store
+                .delete_with_grace(
+                    clip.id,
+                    &[9; 32],
+                    Duration::from_secs(60),
+                    crate::DeletionReason::User,
+                )
+                .is_err()
+        );
+        assert!(store.grace_bin(10).unwrap().is_empty());
+        store.clear_all().unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(store.enforce_cap(0).unwrap(), 0);
+        assert!(store.list(10).unwrap().is_empty());
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO backup_state(singleton, verified_at, checksum) VALUES (1, ?1, ?2)",
+                params![now_millis(), "z".repeat(64)],
+            )
+            .unwrap();
+        assert!(
+            store
+                .backup_freshness(Utc::now(), Duration::from_secs(60))
                 .is_err()
         );
     }

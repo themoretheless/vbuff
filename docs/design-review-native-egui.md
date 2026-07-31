@@ -74,7 +74,7 @@ These images prove deterministic egui layout only. They do not prove native comp
 
 - The generic capture backend cannot prove source identity, concealed/transient hints, or arbitrary phrase secrets. Source-dependent policy and a green native privacy claim remain blocked on native adapters.
 - SQLite remains unencrypted until the SQLCipher and key-provider path is shipped; the UI must not imply otherwise.
-- Automatic paste remains disabled until the destination is confirmed immediately before native injection.
+- Automatic paste is shown only when a global-hotkey summon captured a one-shot macOS/Windows destination; the runtime hides, restores, re-confirms, guards the clipboard, and then injects. Tray/relaunch and other unproven targets remain copy-only.
 - Large-history search still needs a store-backed projection rather than loading a bounded in-memory snapshot.
 - Real screen-reader, keyboard-only, native DPI, tray-loss, lock/idle, and compositor sessions require target-OS evidence before release.
 - A future native hotkey recorder, caret-aware placement, and separate viewport architecture need platform prototypes; they are not simulated in the current UI.

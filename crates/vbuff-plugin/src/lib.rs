@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod bundle;
+pub mod governance;
 pub mod manifest;
 pub mod migration;
 pub mod offline;
@@ -19,6 +20,11 @@ pub use adapter::{
     run_import_adapter,
 };
 pub use bundle::{LockedPlugin, PluginBundle, PluginLock, SignedBundle};
+pub use governance::{
+    ActionBundle, AuthorizedFetch, MarketplaceCategory, MarketplaceExample, MarketplaceMetadata,
+    NetworkFetchPolicy, PluginFailureReport, PluginRuntimeState, PluginSupervisor, PluginTestCase,
+    PluginTestObservation, PluginTestVerdict, SignedActionBundle,
+};
 pub use manifest::{
     ActionCapabilityGrant, ActionPermissionRequest, CapabilityGrant, PluginCapability,
     PluginManifest,

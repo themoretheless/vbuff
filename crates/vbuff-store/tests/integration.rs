@@ -83,6 +83,87 @@ fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
 }
 
 #[test]
+fn migrates_schema_six_to_seven_and_backfills_lifecycle_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("history.db");
+    let mut clip = make_clip("schema six lifecycle migration");
+    clip.pinned = true;
+    clip.favorite = true;
+    {
+        let store = Store::open(&db).unwrap();
+        store.insert(&clip).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = OFF;
+                DROP TRIGGER clips_lifecycle_ai;
+                DROP TABLE clip_annotations;
+                DROP TABLE clip_residency;
+                DROP TABLE collection_policies;
+                DROP TABLE blob_quarantine;
+                DROP TABLE backup_state;
+                DROP TABLE import_quarantine;
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(
+        store.doctor().unwrap().schema_version,
+        vbuff_store::SCHEMA_VERSION
+    );
+    let restored = store.list(1).unwrap().pop().unwrap();
+    assert_eq!(restored.id, clip.id);
+    assert_eq!(restored.content_hash, clip.content_hash);
+    assert_eq!(restored.flavors, clip.flavors);
+    assert_eq!(
+        restored.meta.created_at.timestamp_millis(),
+        clip.meta.created_at.timestamp_millis()
+    );
+    assert_eq!(restored.meta.source_app, clip.meta.source_app);
+    assert_eq!(restored.pinned, clip.pinned);
+    assert_eq!(restored.favorite, clip.favorite);
+    assert_eq!(store.annotations(clip.id).unwrap(), Default::default());
+    assert_eq!(
+        store.residency(clip.id).unwrap(),
+        vbuff_store::SensitiveDataResidency {
+            ever_on_disk: true,
+            ever_synced: false,
+            ever_exported: false,
+        }
+    );
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let lifecycle_tables: i64 = connection
+        .query_row(
+            r#"
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name IN (
+                'collection_policies', 'clip_annotations', 'clip_residency',
+                'blob_quarantine', 'backup_state', 'import_quarantine'
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_tables, 6);
+    let lifecycle_trigger: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'clips_lifecycle_ai'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_trigger, 1);
+}
+
+#[test]
 fn dedup_and_cap_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("history.db");

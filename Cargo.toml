@@ -83,8 +83,8 @@ memory-stats = { version = "1.2", default-features = false, features = ["always_
 
 [patch.crates-io]
 # The crates.io 0.31.10 release still selects vulnerable quick-xml 0.39.
-# Pin the accepted upstream dependency-only fix until the next release.
-wayland-scanner = { git = "https://github.com/Smithay/wayland-rs", rev = "d07c4f91f28b42e5a485823ffd9d8d5a210b1053" }
+# Pin the release-compatible v0.31.x security backport until 0.31.11 ships.
+wayland-scanner = { git = "https://github.com/Smithay/wayland-rs", rev = "d57983bc5edbef9e799ceefb4564ebdddb6f6f96" }
 
 [package]
 name = "vbuff"

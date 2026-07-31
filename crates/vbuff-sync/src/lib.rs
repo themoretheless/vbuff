@@ -16,6 +16,7 @@ pub mod membership;
 pub mod merkle;
 pub mod policy;
 pub mod provenance;
+pub mod team;
 pub mod vault_export;
 pub mod wire;
 
@@ -23,3 +24,11 @@ mod error;
 
 pub use artifact::{EmbeddingArtifact, seal_embedding_if_allowed};
 pub use error::{Result, SyncError};
+pub use team::{
+    BroadcastPriority, CollectionChange, CollectionChangeKind, CollectionChangelog,
+    CollectionForkPlan, ConflictComment, EmergencyBroadcast, ExternalShareGrant, ReadReceiptLedger,
+    ScopedTeamPluginApproval, SharedClipLease, SharedVariableCatalog, SnippetApprovalWorkflow,
+    SnippetPublicationState, SyntheticPolicyCase, SyntheticPolicyDecision, TeamConfigAuditSnapshot,
+    TeamDefaultDenylist, TeamImportValidation, TeamRole, TeamSnippetImport, simulate_team_policy,
+    validate_team_import,
+};

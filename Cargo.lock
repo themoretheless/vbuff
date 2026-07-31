@@ -4863,6 +4863,8 @@ dependencies = [
  "blake3",
  "enigo",
  "global-hotkey",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "prctl",
  "rlimit",
  "serde",
@@ -5202,7 +5204,7 @@ dependencies = [
 [[package]]
 name = "wayland-scanner"
 version = "0.31.10"
-source = "git+https://github.com/Smithay/wayland-rs?rev=d07c4f91f28b42e5a485823ffd9d8d5a210b1053#d07c4f91f28b42e5a485823ffd9d8d5a210b1053"
+source = "git+https://github.com/Smithay/wayland-rs?rev=d57983bc5edbef9e799ceefb4564ebdddb6f6f96#d57983bc5edbef9e799ceefb4564ebdddb6f6f96"
 dependencies = [
  "proc-macro2",
  "quick-xml",

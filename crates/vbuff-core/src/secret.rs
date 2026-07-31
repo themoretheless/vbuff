@@ -63,6 +63,32 @@ pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
     findings
 }
 
+/// Recognize short numeric codes without retaining or returning the match.
+///
+/// A bare 4-8 digit clipboard value is treated conservatively because it is
+/// commonly copied from an authenticator. Embedded values require an explicit
+/// code marker to avoid classifying ordinary invoice and ticket numbers.
+pub fn is_probable_otp(text: &str) -> bool {
+    let trimmed = text.trim();
+    if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let has_marker = lower
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| {
+            matches!(
+                word,
+                "code" | "otp" | "verification" | "verify" | "passcode"
+            )
+        });
+    has_marker
+        && lower
+            .split(|ch: char| !ch.is_ascii_digit())
+            .any(|part| (4..=8).contains(&part.len()))
+}
+
 fn is_recovery_code(token: &str) -> bool {
     let compact_len = token
         .bytes()
@@ -204,6 +230,10 @@ mod tests {
 
     #[test]
     fn otp_and_recovery_codes_require_context() {
+        assert!(is_probable_otp("123456"));
+        assert!(is_probable_otp("verify 1234"));
+        assert!(!is_probable_otp("invoice 123456"));
+        assert!(!is_probable_otp("barcode 123456"));
         assert!(
             detect_secrets("verification code 123456")
                 .iter()

@@ -87,6 +87,23 @@ fn top_docs_share_one_dry_backlog_map() {
 }
 
 #[test]
+fn top_docs_link_every_post_six_hundred_candidate_pass() {
+    for file in TOP_DOCS {
+        let source = read(file);
+        for candidate_file in [
+            "docs/ideas-601-610.md",
+            "docs/ideas-611-620.md",
+            "docs/ideas-621-630.md",
+        ] {
+            assert!(
+                source.contains(candidate_file),
+                "{file} does not link {candidate_file}"
+            );
+        }
+    }
+}
+
+#[test]
 fn top_docs_link_every_complete_implementation_batch() {
     for (ledger_link, expected) in [
         (
@@ -116,6 +133,10 @@ fn top_docs_link_every_complete_implementation_batch() {
         (
             "docs/implementation-batch-301-350.md",
             (301..=350).collect::<Vec<_>>(),
+        ),
+        (
+            "docs/implementation-batch-351-400.md",
+            (351..=400).collect::<Vec<_>>(),
         ),
     ] {
         for file in TOP_DOCS {
@@ -200,6 +221,7 @@ fn research_catalog_has_exact_repository_and_source_ids() {
     for (file, expected) in [
         ("docs/ideas-601-610.md", 601..=610),
         ("docs/ideas-611-620.md", 611..=620),
+        ("docs/ideas-621-630.md", 621..=630),
     ] {
         let candidate_tail = read(file);
         let candidate_lines = candidate_tail
@@ -236,7 +258,10 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("docs/decision-gates-201-250.md"));
     assert!(readme.contains("docs/decision-gates-251-300.md"));
     assert!(readme.contains("docs/decision-gates-301-350.md"));
+    assert!(readme.contains("docs/decision-gates-351-400.md"));
     assert!(readme.contains("docs/limitations.md"));
+    assert!(readme.contains("docs/release-governance.md"));
+    assert!(readme.contains("SECURITY.md"));
     assert!(readme.contains("docs/maintainer-handoff.md"));
     assert!(readme.contains("docs/scope-review.md"));
     assert!(readme.contains("docs/data-contract-v1.md"));
@@ -244,6 +269,7 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(readme.contains("docs/data-contract-v3.md"));
     assert!(readme.contains("docs/ideas-601-610.md"));
     assert!(readme.contains("docs/ideas-611-620.md"));
+    assert!(readme.contains("docs/ideas-621-630.md"));
 
     let architecture = read("architecture.md");
     assert!(architecture.contains("### SOLID/DRY decomposition and small reading slices"));
@@ -260,6 +286,10 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(architecture.contains("data_lifecycle.rs"));
     assert!(architecture.contains("`trust/`"));
     assert!(architecture.contains("`recall/`"));
+    assert!(architecture.contains("desktop_policy/"));
+    assert!(architecture.contains("operations/"));
+    assert!(architecture.contains("governance/"));
+    assert!(architecture.contains("team/"));
 
     let recommendation = read("recommendation.md");
     assert!(recommendation.contains("### Design direction and product cut line"));
@@ -270,6 +300,8 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(recommendation.contains("batch 201-250"));
     assert!(recommendation.contains("batch 251-300"));
     assert!(recommendation.contains("batch 301-350"));
+    assert!(recommendation.contains("batch 351-400"));
+    assert!(recommendation.contains("docs/release-governance.md"));
 
     let plan = read("plan.md");
     assert!(plan.contains("not an implicit scope increase"));
@@ -281,9 +313,74 @@ fn solid_dry_design_and_scope_sections_stay_visible() {
     assert!(plan.contains("Unknown` is a release blocker"));
     assert!(plan.contains("docs/ideas-601-610.md"));
     assert!(plan.contains("docs/ideas-611-620.md"));
+    assert!(plan.contains("docs/ideas-621-630.md"));
     assert!(plan.contains("docs/decision-gates-251-300.md"));
     assert!(plan.contains("docs/decision-gates-301-350.md"));
+    assert!(plan.contains("docs/decision-gates-351-400.md"));
+    assert!(plan.contains("docs/release-governance.md"));
+    assert!(plan.contains("SECURITY.md"));
     assert!(plan.contains("docs/data-contract-v3.md"));
+}
+
+#[test]
+fn release_governance_keeps_hosted_and_support_claims_gated() {
+    let governance = read("docs/release-governance.md");
+    assert!(governance.contains("Hosted roadmap voting remains inactive"));
+    assert!(governance.contains("Product comparisons are evidence records"));
+    assert!(governance.contains("review-before-submit"));
+    assert!(governance.contains("no active LTS channel"));
+    assert!(governance.contains("For every 25 ideas"));
+    assert!(governance.contains("merge, prune, or demote at least 10"));
+
+    let security = read("SECURITY.md");
+    assert!(security.contains("private vulnerability reporting"));
+    assert!(security.contains("three business days"));
+    assert!(security.contains("CVE"));
+    assert!(security.contains("Do not open a public issue with exploit details"));
+
+    let scope = read("docs/scope-review.md");
+    for lane in ["Now", "Next", "Later", "Never"] {
+        assert!(scope.contains(lane));
+    }
+    assert!(scope.contains("every 25 ideas"));
+}
+
+#[test]
+fn batch_351_400_foundations_stay_in_small_reading_slices() {
+    for file in [
+        "crates/vbuff-platform/src/desktop_policy/access.rs",
+        "crates/vbuff-platform/src/desktop_policy/hotkey.rs",
+        "crates/vbuff-platform/src/desktop_policy/linux.rs",
+        "crates/vbuff-platform/src/desktop_policy/mod.rs",
+        "crates/vbuff-platform/src/desktop_policy/permission.rs",
+        "crates/vbuff-platform/src/desktop_policy/profile.rs",
+        "crates/vbuff-platform/src/desktop_policy/theme.rs",
+        "crates/vbuff-sync/src/team/approval.rs",
+        "crates/vbuff-sync/src/team/audit.rs",
+        "crates/vbuff-sync/src/team/import.rs",
+        "crates/vbuff-sync/src/team/mod.rs",
+        "crates/vbuff-sync/src/team/policy.rs",
+        "crates/vbuff-sync/src/team/privacy.rs",
+        "crates/vbuff-sync/src/team/sharing.rs",
+        "crates/vbuff-ipc/src/operations/completion.rs",
+        "crates/vbuff-ipc/src/operations/diagnostics.rs",
+        "crates/vbuff-ipc/src/operations/mod.rs",
+        "crates/vbuff-ipc/src/operations/rate_limit.rs",
+        "crates/vbuff-ipc/src/operations/rpc.rs",
+        "crates/vbuff-ipc/src/operations/runtime.rs",
+        "crates/vbuff-plugin/src/governance/action_bundle.rs",
+        "crates/vbuff-plugin/src/governance/marketplace.rs",
+        "crates/vbuff-plugin/src/governance/mod.rs",
+        "crates/vbuff-plugin/src/governance/network.rs",
+        "crates/vbuff-plugin/src/governance/supervisor.rs",
+        "crates/vbuff-plugin/src/governance/test_harness.rs",
+    ] {
+        let line_count = read(file).lines().count();
+        assert!(
+            line_count <= 220,
+            "{file} has {line_count} lines; split the concern before adding more"
+        );
+    }
 }
 
 #[test]
@@ -381,6 +478,8 @@ fn local_markdown_links_resolve() {
         "docs/ideas-401-500.md",
         "docs/ideas-501-600.md",
         "docs/ideas-601-610.md",
+        "docs/ideas-611-620.md",
+        "docs/ideas-621-630.md",
         "docs/repositories-research-100.md",
         "docs/implementation-batch-001-050.md",
         "docs/implementation-batch-051-100.md",

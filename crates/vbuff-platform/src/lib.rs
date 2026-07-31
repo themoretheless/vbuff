@@ -14,7 +14,9 @@
 pub mod capabilities;
 pub mod cf_html;
 mod clipboard;
+mod confirmed_paste;
 pub mod desktop;
+pub mod desktop_policy;
 mod error;
 pub mod format_map;
 pub mod geometry;
@@ -33,7 +35,7 @@ pub mod windows;
 pub use error::PlatformError;
 pub use traits::{
     CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
-    ClipboardWriteReceipt, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
+    ClipboardWriteReceipt, ConfirmedPasteBackend, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
 };
 
 pub use capabilities::{CapabilityLevel, CapabilitySeverity, FeatureCapability, SecurityPosture};
@@ -41,6 +43,12 @@ pub use cf_html::{CfHtml, CfHtmlError, parse_cf_html};
 pub use desktop::{
     DesktopShell, LinuxTrayFallback, PastePermissionLevel, PastePermissionSelfCheck,
     QuickMenuLabels, ResidentStatus, current_desktop_shell,
+};
+pub use desktop_policy::{
+    EffectiveDesktopPolicy, HotkeyResolution, LayoutAwareAccelerator, LinuxDesktop,
+    ManagedInstallPolicy, NativeTheme, NativeThemeState, PermissionRepairAction,
+    PermissionRepairKind, PermissionRepairPlan, ProfileLocation, ResidentAccessMode,
+    linux_environment_note, permission_repair_plan, resolve_hotkey_conflict,
 };
 pub use format_map::{FormatFamily, FormatKey, canonical_format};
 pub use keymap::{CanonicalAction, KeyBinding, KeymapTarget, canonical_keymap};
@@ -50,6 +58,7 @@ pub use security::{ProcessHardeningReport, harden_current_process};
 pub use tripwire::{ClipboardReadObservation, ScrapeTripwire, TripwireAlert};
 
 pub use clipboard::ArboardClipboard;
+pub use confirmed_paste::ConfirmedPaste;
 pub use hotkey::{GlobalHotkeyBackend, parse_combo};
 pub use paste::EnigoPaste;
 

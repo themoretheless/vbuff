@@ -33,6 +33,8 @@ jobs:
             '' \
             '- Re-rank only against the active milestone and release gates.' \
             '- Record Promote, Keep, Defer, or Cut for every considered item.' \
+            '- Map every disposition to Now, Next, Later, or Never.' \
+            '- Record added, merged, pruned, and demoted idea counts; every 25 additions require at least 10 merges, prunes, or demotions.' \
             '- Do not expand the canonical 1-600 objective from candidate lists.' \
             '- Update docs/scope-review.md with the dated decision record.' \
             '' \

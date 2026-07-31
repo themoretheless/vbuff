@@ -193,6 +193,23 @@ pub trait PasteBackend: Send {
     fn paste(&mut self) -> Result<()>;
 }
 
+/// Captures and re-confirms the application that owned focus before a picker
+/// opened. Implementations must fail closed when that identity cannot be
+/// proven; [`PasteBackend::paste`] is called only after confirmation succeeds.
+pub trait ConfirmedPasteBackend: PasteBackend {
+    /// Forget any target left by an abandoned picker interaction.
+    fn clear_target(&mut self);
+
+    /// Snapshot the currently active application before vbuff takes focus.
+    fn capture_target(&mut self) -> Result<()>;
+
+    /// Ask the desktop to reactivate the captured application.
+    fn restore_target(&mut self) -> Result<()>;
+
+    /// Confirm that the captured application, rather than vbuff, is active.
+    fn target_is_foreground(&mut self) -> Result<bool>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
