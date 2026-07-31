@@ -2958,6 +2958,9 @@ struct StoredMetadata {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     sensitive: bool,
     sensitivity_reason: Option<vbuff_types::SensitivityReason>,
+    /// `None` means the row predates the field, not that sharing was allowed.
+    /// Rows migrated from schema v1 carry a literal `'{}'`, so this is the
+    /// state of every clip captured before the privacy metadata existed.
     sync_eligible: Option<bool>,
     ai_allowed: bool,
 }
@@ -2987,7 +2990,11 @@ impl StoredMetadata {
         meta.expires_at = self.expires_at;
         meta.sensitive = self.sensitive;
         meta.sensitivity_reason = self.sensitivity_reason;
-        meta.sync_eligible = self.sync_eligible.unwrap_or(true);
+        // Fail closed: a row whose provenance metadata predates this field
+        // never proved it may leave the device, and "no record" is not
+        // consent. Costs nothing today (no sync transport is wired) and
+        // avoids a migration once one is.
+        meta.sync_eligible = self.sync_eligible.unwrap_or(false);
         meta.ai_allowed = self.ai_allowed;
     }
 }
@@ -3382,6 +3389,20 @@ mod tests {
         assert_eq!(
             restored.provenance_confidence,
             vbuff_types::ProvenanceConfidence::Proven
+        );
+    }
+
+    #[test]
+    fn metadata_from_before_the_privacy_fields_never_claims_sync_consent() {
+        // Schema v1 rows were migrated with a literal '{}', so this is every
+        // clip captured before the privacy metadata existed.
+        let stored: StoredMetadata = serde_json::from_str("{}").unwrap();
+        let mut meta = ClipMeta::now(ContentKind::Text, 0, None);
+        meta.sync_eligible = true;
+        stored.apply_to(&mut meta);
+        assert!(
+            !meta.sync_eligible,
+            "a row with no record of consent was treated as consenting"
         );
     }
 
