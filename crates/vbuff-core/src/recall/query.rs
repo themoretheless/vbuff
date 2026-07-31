@@ -261,16 +261,12 @@ fn natural_kind(value: &str) -> Option<ContentKind> {
     }
 }
 
+/// Query-facing kind parser: UI synonyms ([`natural_kind`], e.g. "link",
+/// "pictures", "snippets") layered over the canonical case-insensitive
+/// [`ContentKind`] slug vocabulary (`FromStr` in `vbuff-types`).
 fn parse_kind(value: &str) -> Option<ContentKind> {
-    natural_kind(&value.to_ascii_lowercase()).or_else(|| {
-        match value.to_ascii_lowercase().as_str() {
-            "text" => Some(ContentKind::Text),
-            "html" => Some(ContentKind::Html),
-            "rtf" => Some(ContentKind::Rtf),
-            "other" => Some(ContentKind::Other),
-            _ => None,
-        }
-    })
+    let lower = value.to_ascii_lowercase();
+    natural_kind(&lower).or_else(|| lower.parse::<ContentKind>().ok())
 }
 
 fn start_of_day(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -310,6 +306,11 @@ fn fingerprint(query: &NaturalQuery) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Local domain of the query fingerprint ("vbuff-natural-query-v1"), not a
+/// storage format: this numbering feeds only the blake3 hash above and is
+/// never persisted. Do not unify it with
+/// `ContentKind::stored_discriminant` without bumping the fingerprint
+/// domain string, since renumbering silently changes every fingerprint.
 const fn kind_code(kind: ContentKind) -> u8 {
     match kind {
         ContentKind::Text => 0,

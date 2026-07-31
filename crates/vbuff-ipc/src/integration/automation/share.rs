@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{IntegrationContractError, valid_identifier, valid_label};
+use vbuff_types::validation::{is_valid_identifier, is_valid_label};
+
+use super::IntegrationContractError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,13 +96,13 @@ impl ShareDraft {
     }
 
     fn validate(&self) -> Result<(), IntegrationContractError> {
-        if !valid_identifier(&self.draft_id, 128)
+        if !is_valid_identifier(&self.draft_id, 128)
             || self
                 .destination_collection
                 .as_ref()
-                .is_some_and(|collection| !valid_label(collection, 128))
+                .is_some_and(|collection| !is_valid_label(collection, 128))
             || self.tags.len() > 32
-            || self.tags.iter().any(|tag| !valid_label(tag, 64))
+            || self.tags.iter().any(|tag| !is_valid_label(tag, 64))
         {
             return Err(IntegrationContractError::InvalidField);
         }

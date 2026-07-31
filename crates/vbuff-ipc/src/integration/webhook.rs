@@ -4,6 +4,7 @@ use std::fmt;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use vbuff_types::validation::{all_zero, is_valid_identifier};
 use zeroize::Zeroize;
 
 use super::IntegrationContractError;
@@ -71,7 +72,7 @@ pub struct WebhookSigner {
 
 impl WebhookSigner {
     pub fn from_key(key: [u8; 32]) -> Result<Self, IntegrationContractError> {
-        if key.iter().all(|byte| *byte == 0) {
+        if all_zero(&key) {
             return Err(IntegrationContractError::InvalidField);
         }
         Ok(Self { key })
@@ -86,7 +87,7 @@ impl WebhookSigner {
         kind: WebhookEventKind,
         body: &[u8],
     ) -> Result<SignedWebhookEvent, IntegrationContractError> {
-        if !valid_endpoint_id(endpoint_id)
+        if !is_valid_identifier(endpoint_id, 128)
             || event_id == 0
             || ttl_ms == 0
             || ttl_ms > MAX_WEBHOOK_TTL_MS
@@ -182,11 +183,11 @@ impl WebhookReplayWindow {
             .last_event_by_endpoint
             .get(&event.endpoint_hash)
             .copied();
-        if !valid_endpoint_id(expected_endpoint_id)
+        if !is_valid_identifier(expected_endpoint_id, 128)
             || event.endpoint_hash != *blake3::hash(expected_endpoint_id.as_bytes()).as_bytes()
             || now_ms < event.issued_at_ms
-            || event.endpoint_hash.iter().all(|byte| *byte == 0)
-            || event.body_hash.iter().all(|byte| *byte == 0)
+            || all_zero(&event.endpoint_hash)
+            || all_zero(&event.body_hash)
             || event.event_id == 0
             || event.expires_at_ms <= event.issued_at_ms
             || event.expires_at_ms - event.issued_at_ms > MAX_WEBHOOK_TTL_MS
@@ -211,14 +212,6 @@ impl WebhookReplayWindow {
         );
         Ok(())
     }
-}
-
-fn valid_endpoint_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[cfg(test)]

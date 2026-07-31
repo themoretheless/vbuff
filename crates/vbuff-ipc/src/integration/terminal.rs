@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use vbuff_types::validation::{all_zero, is_valid_identifier_with_extra};
 
 use super::IntegrationContractError;
 
@@ -54,8 +55,8 @@ impl Osc52Observation {
             || terminal_app.is_empty()
             || terminal_app.len() > 256
             || terminal_app.chars().any(char::is_control)
-            || remote_host.is_some_and(invalid_identifier)
-            || session.is_some_and(invalid_identifier)
+            || remote_host.is_some_and(|value| !is_valid_identifier_with_extra(value, 256, b":"))
+            || session.is_some_and(|value| !is_valid_identifier_with_extra(value, 256, b":"))
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -108,7 +109,7 @@ impl Osc52Policy {
             || self
                 .allowed_remote_hosts
                 .iter()
-                .any(|host| host.iter().all(|byte| *byte == 0))
+                .any(|host| all_zero(host))
             || (!self.allow_remote && !self.allowed_remote_hosts.is_empty())
         {
             return Err(IntegrationContractError::InvalidField);
@@ -147,14 +148,6 @@ fn valid_observation(observation: &Osc52Observation) -> bool {
         && observation
             .session_hash
             .is_none_or(|hash| hash.iter().any(|byte| *byte != 0))
-}
-
-fn invalid_identifier(value: &str) -> bool {
-    value.is_empty()
-        || value.len() > 256
-        || value.bytes().any(|byte| {
-            !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-        })
 }
 
 #[cfg(test)]

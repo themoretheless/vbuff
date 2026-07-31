@@ -3,10 +3,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use vbuff_types::ContentKind;
+use vbuff_types::validation::is_valid_identifier;
 
 use super::{
     MAX_COLLECTION_BYTES, MAX_DEVICE_COUNT, MAX_DEVICE_ID_BYTES, MAX_NEARBY_AGE_MS,
-    MAX_NEARBY_TARGETS, MAX_PLAN_ITEMS, valid_identifier,
+    MAX_NEARBY_TARGETS, MAX_PLAN_ITEMS,
 };
 use crate::{Result, SyncError};
 
@@ -68,7 +69,7 @@ impl fmt::Debug for DeviceExperiencePolicy {
 
 impl DeviceExperiencePolicy {
     pub fn validate(&self) -> Result<()> {
-        if !valid_identifier(&self.device_id, MAX_DEVICE_ID_BYTES)
+        if !is_valid_identifier(&self.device_id, MAX_DEVICE_ID_BYTES)
             || self
                 .retention_days
                 .is_some_and(|days| days == 0 || days > 3_650)
@@ -114,7 +115,7 @@ impl fmt::Debug for SyncItemSummary {
 
 impl SyncItemSummary {
     pub fn validate(&self) -> Result<()> {
-        if !valid_identifier(&self.item_id, 128)
+        if !is_valid_identifier(&self.item_id, 128)
             || self.collection.as_ref().is_some_and(|collection| {
                 collection.is_empty()
                     || collection.len() > MAX_COLLECTION_BYTES
@@ -189,7 +190,7 @@ impl ReplaySelection {
             || self
                 .item_ids
                 .iter()
-                .any(|item_id| !valid_identifier(item_id, 128))
+                .any(|item_id| !is_valid_identifier(item_id, 128))
             || self.collections.iter().any(|collection| {
                 collection.is_empty()
                     || collection.len() > MAX_COLLECTION_BYTES

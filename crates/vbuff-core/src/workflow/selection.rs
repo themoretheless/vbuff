@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
+use vbuff_types::validation::is_valid_trimmed_label;
 use vbuff_types::{Clip, ClipId, ContentKind};
 
 const MAX_SELECTION: usize = 512;
@@ -213,9 +214,9 @@ impl ExampleFilter {
 pub fn filter_from_example(clip: &Clip, tags: &[String]) -> Option<ExampleFilter> {
     if clip.meta.sensitive
         || tags.len() > MAX_TAGS
-        || tags.iter().any(|tag| {
-            tag.trim().is_empty() || tag.len() > MAX_TAG_BYTES || tag.chars().any(char::is_control)
-        })
+        || tags
+            .iter()
+            .any(|tag| !is_valid_trimmed_label(tag, MAX_TAG_BYTES))
     {
         return None;
     }

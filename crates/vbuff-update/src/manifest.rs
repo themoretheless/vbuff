@@ -4,12 +4,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use url::Url;
+use vbuff_types::validation::{self, is_valid_identifier};
 
 use crate::{Result, UpdateError};
 
 const MAX_ARTIFACTS: usize = 32;
 const MAX_TARGET_LEN: usize = 96;
-const MAX_KEY_ID_LEN: usize = 96;
 const MAX_ARTIFACT_URL_LEN: usize = 2 * 1024;
 const UPDATE_SIGNATURE_DOMAIN: &[u8] = b"vbuff-update-manifest-v1\0";
 const ROTATION_CONFIRMATION_DOMAIN: &[u8] = b"vbuff-update-key-rotation-v1\0";
@@ -136,13 +136,7 @@ impl UpdateManifest {
         }
         let mut targets = BTreeSet::new();
         for artifact in &self.artifacts {
-            if artifact.target.is_empty()
-                || artifact.target.len() > MAX_TARGET_LEN
-                || !artifact
-                    .target
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-            {
+            if !is_valid_identifier(&artifact.target, MAX_TARGET_LEN) {
                 return Err(UpdateError::InvalidManifest(
                     "artifact target is invalid".into(),
                 ));
@@ -373,12 +367,7 @@ impl UpdateVerifier {
 }
 
 fn validate_key_id(key_id: &str) -> Result<()> {
-    if key_id.is_empty()
-        || key_id.len() > MAX_KEY_ID_LEN
-        || !key_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    if !validation::valid_key_id(key_id) {
         return Err(UpdateError::InvalidManifest("key id is invalid".into()));
     }
     Ok(())

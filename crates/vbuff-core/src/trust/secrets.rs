@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, Verifying
 use serde::Serialize;
 use thiserror::Error;
 pub use vbuff_types::SensitivityReason;
+use vbuff_types::validation::is_valid_identifier;
 
 use crate::secret::SecretKind;
 
@@ -184,19 +185,13 @@ fn validate_update_fields(
         || expires_at_ms <= issued_at_ms
         || expires_at_ms.saturating_sub(issued_at_ms) > MAX_UPDATE_LIFETIME_MS
         || detector_ids.windows(2).any(|pair| pair[0] >= pair[1])
-        || detector_ids.iter().any(|id| !valid_detector_id(id))
+        || detector_ids
+            .iter()
+            .any(|id| !is_valid_identifier(id, MAX_DETECTOR_ID_BYTES))
     {
         return Err(DetectorUpdateError::Invalid);
     }
     Ok(())
-}
-
-fn valid_detector_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_DETECTOR_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn update_signing_bytes(

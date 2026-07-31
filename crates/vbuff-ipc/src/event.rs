@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use vbuff_types::ClipId;
+use vbuff_types::validation::is_valid_identifier;
 
 use crate::Capability;
 
@@ -40,13 +41,11 @@ impl EventFilter {
         if self.collection_ids.len() > MAX_FILTER_COLLECTIONS {
             return Err("too_many_collection_filters");
         }
-        if self.collection_ids.iter().any(|collection| {
-            collection.is_empty()
-                || collection.len() > 128
-                || !collection
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        }) {
+        if self
+            .collection_ids
+            .iter()
+            .any(|collection| !is_valid_identifier(collection, 128))
+        {
             return Err("invalid_collection_filter");
         }
         Ok(())

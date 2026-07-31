@@ -83,7 +83,7 @@ pub enum RetentionScope {
 impl RetentionScope {
     pub(crate) const fn database_values(self) -> (i64, bool) {
         match self {
-            Self::Kind(kind) => (kind_to_int(kind), false),
+            Self::Kind(kind) => (kind.stored_discriminant(), false),
             Self::Sensitive => (-1, true),
         }
     }
@@ -97,7 +97,9 @@ impl RetentionScope {
                 "invalid sensitive retention scope".into(),
             ));
         }
-        Ok(Self::Kind(kind_from_int(kind)?))
+        ContentKind::from_stored_discriminant(kind)
+            .map(Self::Kind)
+            .ok_or_else(|| StoreError::Corrupt("invalid retention kind".into()))
     }
 }
 
@@ -337,35 +339,6 @@ fn grace_aad(
     aad.extend_from_slice(&purge_after_ms.to_be_bytes());
     aad.extend_from_slice(&reason.as_i64().to_be_bytes());
     aad
-}
-
-const fn kind_to_int(kind: ContentKind) -> i64 {
-    match kind {
-        ContentKind::Text => 0,
-        ContentKind::Rtf => 1,
-        ContentKind::Html => 2,
-        ContentKind::Image => 3,
-        ContentKind::File => 4,
-        ContentKind::Color => 5,
-        ContentKind::Url => 6,
-        ContentKind::Code => 7,
-        ContentKind::Other => 8,
-    }
-}
-
-fn kind_from_int(value: i64) -> Result<ContentKind> {
-    match value {
-        0 => Ok(ContentKind::Text),
-        1 => Ok(ContentKind::Rtf),
-        2 => Ok(ContentKind::Html),
-        3 => Ok(ContentKind::Image),
-        4 => Ok(ContentKind::File),
-        5 => Ok(ContentKind::Color),
-        6 => Ok(ContentKind::Url),
-        7 => Ok(ContentKind::Code),
-        8 => Ok(ContentKind::Other),
-        _ => Err(StoreError::Corrupt("invalid retention kind".into())),
-    }
 }
 
 #[cfg(test)]

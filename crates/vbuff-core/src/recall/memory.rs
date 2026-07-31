@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use vbuff_types::validation::{all_zero, is_valid_trimmed_label};
 use vbuff_types::{Clip, ClipId};
 
 use crate::secret::detect_secrets;
@@ -98,7 +99,7 @@ impl PinnedAliases {
     pub fn add(&mut self, clip_id: ClipId, pinned: bool, alias: &str) -> bool {
         let alias = normalize_label(alias);
         if !pinned
-            || !valid_label(&alias, MAX_ALIAS_BYTES)
+            || !is_valid_trimmed_label(&alias, MAX_ALIAS_BYTES)
             || self.by_alias.contains_key(&alias)
             || self.by_alias.len() >= MAX_ALIASES
             || self.per_clip.get(&clip_id).copied().unwrap_or_default() >= MAX_ALIASES_PER_CLIP
@@ -253,7 +254,7 @@ impl SearchScopeLock {
             SearchScope::All => true,
             SearchScope::App(value)
             | SearchScope::Device(value)
-            | SearchScope::Collection(value) => valid_label(value, MAX_SCOPE_BYTES),
+            | SearchScope::Collection(value) => is_valid_trimmed_label(value, MAX_SCOPE_BYTES),
         };
         if valid {
             self.scope = (!matches!(scope, SearchScope::All)).then_some(scope);
@@ -318,7 +319,7 @@ impl ClipTags {
 
     fn add(&mut self, clip_id: ClipId, value: &str, collection: bool) -> bool {
         let value = normalize_label(value);
-        if !valid_label(&value, MAX_ALIAS_BYTES) || self.total >= MAX_TAGS {
+        if !is_valid_trimmed_label(&value, MAX_ALIAS_BYTES) || self.total >= MAX_TAGS {
             return false;
         }
         let map = if collection {
@@ -369,7 +370,7 @@ impl fmt::Debug for QueryPinSet {
 
 impl QueryPinSet {
     pub fn set(&mut self, query: [u8; 32], clip_id: ClipId, pinned: bool) -> bool {
-        if query == [0; 32] {
+        if all_zero(&query) {
             return false;
         }
         if pinned {
@@ -412,12 +413,8 @@ fn valid_macro_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn valid_label(value: &str, maximum_bytes: usize) -> bool {
-    !value.trim().is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
-}
-
 fn identity_hash(value: &str, maximum_bytes: usize) -> Option<[u8; 32]> {
-    valid_label(value, maximum_bytes).then(|| *blake3::hash(value.as_bytes()).as_bytes())
+    is_valid_trimmed_label(value, maximum_bytes).then(|| *blake3::hash(value.as_bytes()).as_bytes())
 }
 
 fn query_looks_sensitive(query: &str) -> bool {

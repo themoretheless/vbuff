@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use vbuff_types::validation::is_valid_identifier;
 use zeroize::Zeroizing;
 
 use crate::{Result, SyncError};
@@ -15,12 +16,7 @@ pub struct CollectionVaultId(String);
 impl CollectionVaultId {
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
-        let valid = !id.is_empty()
-            && id.len() <= 128
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-        if !valid {
+        if !is_valid_identifier(&id, 128) {
             return Err(SyncError::Invalid("invalid collection vault id".into()));
         }
         Ok(Self(id))

@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_DEVICE_ID_BYTES, all_zero, valid_identifier};
+use vbuff_types::validation::{all_zero, is_valid_identifier};
+
+use super::MAX_DEVICE_ID_BYTES;
 use crate::clock::HybridLogicalClock;
 use crate::conflict::{ConflictCandidate, ConflictReason, resolve};
 use crate::{Result, SyncError};
@@ -38,8 +40,8 @@ pub fn conflict_timeline(
     left: ConflictCandidate<[u8; 32]>,
     right: ConflictCandidate<[u8; 32]>,
 ) -> Result<Vec<ConflictTimelinePoint>> {
-    if !valid_identifier(&left.clock.node_id, MAX_DEVICE_ID_BYTES)
-        || !valid_identifier(&right.clock.node_id, MAX_DEVICE_ID_BYTES)
+    if !is_valid_identifier(&left.clock.node_id, MAX_DEVICE_ID_BYTES)
+        || !is_valid_identifier(&right.clock.node_id, MAX_DEVICE_ID_BYTES)
         || all_zero(&left.value)
         || all_zero(&right.value)
     {

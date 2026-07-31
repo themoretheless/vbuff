@@ -11,7 +11,8 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use vbuff_core::capture::{CaptureDecision, CaptureInput, CapturePolicy, SelectionSource};
 use vbuff_core::content_hash_from_flavors;
-use vbuff_types::{Body, Clip, ClipId, ConcealmentSignal, ProvenanceConfidence};
+use vbuff_types::validation::is_valid_identifier;
+use vbuff_types::{Body, Clip, ClipId, ConcealmentSignal, ContentKind, ProvenanceConfidence};
 
 use crate::{Result, Store, StoreError, duration_millis_i64, now_millis, raw_to_clip, row_to_clip};
 
@@ -222,7 +223,7 @@ impl RestoreSelection {
         if self
             .import_ids
             .iter()
-            .any(|id| !valid_identifier(id) || !unique.insert(id))
+            .any(|id| !is_valid_identifier(id, MAX_COLLECTION_NAME_BYTES) || !unique.insert(id))
         {
             return Err(StoreError::Maintenance(
                 "restore selection contains an invalid or duplicate id".into(),
@@ -486,7 +487,7 @@ impl Store {
     }
 
     pub fn upsert_collection(&self, record: &CollectionRecord) -> Result<()> {
-        if !valid_identifier(&record.id)
+        if !is_valid_identifier(&record.id, MAX_COLLECTION_NAME_BYTES)
             || record.id.len() > MAX_COLLECTION_ID_BYTES
             || record.name.trim().is_empty()
             || record.name.len() > MAX_COLLECTION_NAME_BYTES
@@ -522,7 +523,9 @@ impl Store {
     pub fn set_collection(&self, id: ClipId, collection_id: Option<&str>) -> Result<()> {
         self.ensure_clip_exists(id)?;
         if let Some(collection_id) = collection_id {
-            if !valid_identifier(collection_id) || collection_id.len() > MAX_COLLECTION_ID_BYTES {
+            if !is_valid_identifier(collection_id, MAX_COLLECTION_NAME_BYTES)
+                || collection_id.len() > MAX_COLLECTION_ID_BYTES
+            {
                 return Err(StoreError::Maintenance("invalid collection id".into()));
             }
             let exists: bool = self.conn.query_row(
@@ -713,7 +716,8 @@ impl Store {
         };
         for (blob_ref, kind, byte_size) in references {
             report.checked += 1;
-            let kind = super::kind_from_int(kind);
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
             if cas.verify(kind, &blob_ref, byte_size).is_ok() {
                 report.healthy += 1;
                 continue;
@@ -724,7 +728,7 @@ impl Store {
                 INSERT OR REPLACE INTO blob_quarantine(hash, kind, quarantined_at, reason)
                 VALUES (?1, ?2, ?3, 'integrity verification failed')
                 "#,
-                params![blob_ref, super::kind_to_int(kind), now_millis()],
+                params![blob_ref, kind.stored_discriminant(), now_millis()],
             )?;
             report.quarantined += 1;
         }
@@ -1037,7 +1041,7 @@ impl Store {
     }
 
     pub fn reject_import(&self, import_id: &str) -> Result<bool> {
-        if !valid_identifier(import_id) {
+        if !is_valid_identifier(import_id, MAX_COLLECTION_NAME_BYTES) {
             return Err(StoreError::Maintenance("invalid import id".into()));
         }
         let deleted = self.conn.execute(
@@ -1151,21 +1155,19 @@ impl Store {
             .conn
             .prepare("SELECT hash, kind FROM blob_refs WHERE refcount > 0")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                super::kind_from_int(row.get::<_, i64>(1)?),
-                row.get::<_, String>(0)?,
-            ))
+            Ok((row.get::<_, i64>(1)?, row.get::<_, String>(0)?))
         })?;
-        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+        // Fail closed on unknown discriminants so orphan sweeps never treat a
+        // corrupt reference as "not live" and delete the file it points at.
+        let mut live = HashSet::new();
+        for row in rows {
+            let (kind, blob_ref) = row?;
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            live.insert((kind, blob_ref));
+        }
+        Ok(live)
     }
-}
-
-fn valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_COLLECTION_NAME_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn valid_mime(value: &str) -> bool {

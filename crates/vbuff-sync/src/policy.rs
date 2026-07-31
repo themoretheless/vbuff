@@ -162,21 +162,13 @@ pub fn seal_if_allowed(
     Ok(Some(seal_to(recipient_public_key, &padded, aad)?))
 }
 
+/// Policy files use the canonical [`ContentKind::slug`] vocabulary, exact
+/// match (the historical local dictionary was byte-for-byte identical to the
+/// canonical slugs, so delegating to `FromStr` is not a contract change).
 fn parse_kind(value: &str) -> Result<ContentKind> {
-    match value {
-        "text" => Ok(ContentKind::Text),
-        "url" => Ok(ContentKind::Url),
-        "color" => Ok(ContentKind::Color),
-        "code" => Ok(ContentKind::Code),
-        "image" => Ok(ContentKind::Image),
-        "file" => Ok(ContentKind::File),
-        "rtf" => Ok(ContentKind::Rtf),
-        "html" => Ok(ContentKind::Html),
-        "other" => Ok(ContentKind::Other),
-        _ => Err(SyncError::Invalid(format!(
-            "unknown content kind {value:?}"
-        ))),
-    }
+    value
+        .parse::<ContentKind>()
+        .map_err(|_| SyncError::Invalid(format!("unknown content kind {value:?}")))
 }
 
 #[cfg(test)]

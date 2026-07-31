@@ -1,4 +1,5 @@
 use vbuff_types::ContentKind;
+use vbuff_types::validation::is_valid_identifier;
 
 use crate::{PluginError, Result};
 
@@ -108,12 +109,7 @@ impl TypedAction {
                 }
             }
             Self::ApplyPipeline { pipeline_id } => {
-                if pipeline_id.is_empty()
-                    || pipeline_id.len() > 128
-                    || !pipeline_id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                    })
-                {
+                if !is_valid_identifier(pipeline_id, 128) {
                     return Err(PluginError::InvalidInput("pipeline id is empty".into()));
                 }
             }

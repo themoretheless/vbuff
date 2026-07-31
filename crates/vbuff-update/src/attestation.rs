@@ -2,11 +2,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
+use vbuff_types::validation;
 
 use crate::{Result, UpdateError};
 
 const ATTESTATION_SIGNATURE_DOMAIN: &[u8] = b"vbuff-build-attestation-v1\0";
-const MAX_KEY_ID_BYTES: usize = 96;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildAttestation {
@@ -89,12 +89,7 @@ fn signing_bytes(key_id: &str, attestation: &BuildAttestation) -> Result<Vec<u8>
 }
 
 fn validate_key_id(key_id: &str) -> Result<()> {
-    let valid = !key_id.is_empty()
-        && key_id.len() <= MAX_KEY_ID_BYTES
-        && key_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    if valid {
+    if validation::valid_key_id(key_id) {
         Ok(())
     } else {
         Err(UpdateError::InvalidManifest(

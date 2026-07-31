@@ -16,9 +16,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use vbuff_types::validation::is_valid_identifier;
+
 use crate::clock::HybridLogicalClock;
 use crate::crypto::{SealedEnvelope, seal_to};
-use crate::device_experience::valid_identifier;
 use crate::{Result, SyncError};
 
 /// Maximum byte length of device, author, and clock-node identifiers.
@@ -262,12 +263,12 @@ fn validate_entry_semantics(
     clock: &HybridLogicalClock,
     previous_clock: Option<&HybridLogicalClock>,
 ) -> Result<()> {
-    if !valid_identifier(added_by, MAX_DEVICE_ID_BYTES) {
+    if !is_valid_identifier(added_by, MAX_DEVICE_ID_BYTES) {
         return Err(SyncError::Invalid(
             "membership author identifier is invalid".into(),
         ));
     }
-    if !valid_identifier(&clock.node_id, MAX_DEVICE_ID_BYTES) {
+    if !is_valid_identifier(&clock.node_id, MAX_DEVICE_ID_BYTES) {
         return Err(SyncError::Invalid(
             "membership clock node identifier is invalid".into(),
         ));
@@ -302,7 +303,7 @@ fn validate_entry_semantics(
     }
     match action {
         MembershipAction::Add(member) => {
-            if !valid_identifier(&member.device_id, MAX_DEVICE_ID_BYTES) {
+            if !is_valid_identifier(&member.device_id, MAX_DEVICE_ID_BYTES) {
                 return Err(SyncError::Invalid("device identifier is invalid".into()));
             }
             if active.contains_key(&member.device_id) {
@@ -311,7 +312,7 @@ fn validate_entry_semantics(
             validate_public_key(&member.public_key)
         }
         MembershipAction::Revoke { device_id } => {
-            if !valid_identifier(device_id, MAX_DEVICE_ID_BYTES) {
+            if !is_valid_identifier(device_id, MAX_DEVICE_ID_BYTES) {
                 return Err(SyncError::Invalid("device identifier is invalid".into()));
             }
             if !active.contains_key(device_id) {

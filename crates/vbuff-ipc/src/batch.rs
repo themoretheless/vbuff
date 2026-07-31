@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use vbuff_types::ClipId;
+use vbuff_types::validation::is_valid_identifier;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -25,13 +26,7 @@ pub struct BatchResponse {
 
 impl BatchRequest {
     pub fn validate(&self, maximum_mutations: usize) -> Result<(), &'static str> {
-        if self.request_id.is_empty()
-            || self.request_id.len() > 128
-            || !self
-                .request_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
+        if !is_valid_identifier(&self.request_id, 128) {
             return Err("request_id_invalid");
         }
         if self.mutations.is_empty() {
