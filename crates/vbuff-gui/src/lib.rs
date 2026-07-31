@@ -17,7 +17,7 @@ mod view;
 
 pub use app::PopupApp;
 pub use experience::{DeliveryCapabilities, DensityMode, HandedMode, UiPreferences};
-pub use state::{AppState, SharedState, StarterPack, UiAction};
+pub use state::{AppState, ClipText, RestoredClip, SharedState, StarterPack, UiAction};
 
 /// Preferred popup size used by the root composition layer.
 pub fn popup_size() -> [f32; 2] {

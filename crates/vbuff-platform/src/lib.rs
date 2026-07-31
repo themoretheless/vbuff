@@ -34,6 +34,7 @@ pub use error::PlatformError;
 pub use traits::{
     CapturedClipboard, ClipboardBackend, ClipboardRetention, ClipboardSelection,
     ClipboardWriteReceipt, ConfirmedPasteBackend, HotkeyBackend, KeyCombo, Modifier, PasteBackend,
+    WriteOptions,
 };
 
 pub use capabilities::{CapabilityLevel, CapabilitySeverity, FeatureCapability, SecurityPosture};

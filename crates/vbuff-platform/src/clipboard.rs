@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use arboard::{Clipboard, ImageData};
 use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime, rgba_required_len};
 
-use crate::traits::{CapturedClipboard, ClipboardBackend};
+use crate::traits::{CapturedClipboard, ClipboardBackend, WriteOptions};
 use crate::{PlatformError, Result};
 
 /// An `arboard`-backed clipboard.
@@ -70,7 +70,12 @@ impl ClipboardBackend for ArboardClipboard {
         })
     }
 
-    fn write(&mut self, flavors: &[Flavor]) -> Result<()> {
+    /// `arboard` has no access to OS clipboard-history retention and cannot
+    /// attach a private sentinel flavor, so it implements only the primitive
+    /// and inherits the trait's fail-closed [`ClipboardBackend::write`]: it
+    /// never claims a retention hint it did not apply, and a write that
+    /// *requires* history exclusion never reaches this method at all.
+    fn place_flavors(&mut self, flavors: &[Flavor], _options: &WriteOptions) -> Result<()> {
         // Prefer text; fall back to image. arboard can only hold one kind at a
         // time via its high-level API, so we pick the richest single flavor.
         if let Some(text) = flavors

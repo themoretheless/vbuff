@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+use vbuff_gui::UiAction;
 use vbuff_platform::{QuickMenuLabels, ResidentStatus, current_desktop_shell};
 use vbuff_types::{CaptureHealth, CapturePauseReason};
 
@@ -158,11 +159,11 @@ impl Tray {
         } else if event.id == self.clear_history_id {
             Some(AppCommand::RequestClearHistory)
         } else if event.id == self.pause_id {
-            Some(AppCommand::TogglePause)
+            Some(UiAction::TogglePause.into())
         } else if event.id == self.autostart_id {
             Some(AppCommand::ToggleAutostart)
         } else if event.id == self.quit_id {
-            Some(AppCommand::Quit)
+            Some(UiAction::Quit.into())
         } else {
             None
         }
