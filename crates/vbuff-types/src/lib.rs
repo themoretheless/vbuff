@@ -1,8 +1,11 @@
 //! Plain data model for vbuff.
 //!
-//! This crate holds only the serializable data types shared by every other
-//! crate (core logic, storage, GUI, platform). It deliberately avoids heavy
-//! dependencies so it can be linked everywhere cheaply.
+//! This crate holds the serializable data types shared by every other crate
+//! (core logic, storage, GUI, platform). It deliberately avoids heavy
+//! dependencies so it can be linked everywhere cheaply. The one exception is
+//! [`mac`], which owns the workspace's single HMAC primitive: it has to sit
+//! below every crate that authenticates something, and its `hmac`/`sha2`
+//! dependencies are already linked by all of them through `vbuff-core`.
 #![forbid(unsafe_code)]
 //!
 //! The central type is [`Clip`]: one logical copy event that may carry several
@@ -11,6 +14,8 @@
 //! over its canonical flavor bytes (see `vbuff-core`).
 
 mod ipc;
+pub mod mac;
+pub mod replay;
 mod rgba;
 mod status;
 pub mod validation;

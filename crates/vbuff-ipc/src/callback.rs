@@ -1,26 +1,28 @@
 //! One-shot tokens for x-callback-style `vbuff://` automation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use thiserror::Error;
 use url::Url;
+use vbuff_types::mac::{MacDomain, MacProof, hmac_proof};
 use zeroize::Zeroize;
 
-type HmacSha256 = Hmac<Sha256>;
+use crate::replay::{MAX_REPLAY_ENTRIES, ReplayGuard};
+
+/// Frozen framing: the `.` was baked into the domain constant when these
+/// tokens started being issued. It is a genuine separator, because the payload
+/// that follows is base64url and `.` is outside that alphabet. Moving to the
+/// NUL convention would invalidate every live token for one `MAX_TTL_MS`
+/// window and buy nothing; see `docs/domain-separation-convention.md` §6.1.
+const CALLBACK_DOMAIN: MacDomain = MacDomain::legacy_ascii_separated("vbuff-x-callback-v1", b'.');
 
 const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_TOKEN_BYTES: usize = 2 * 1024;
 const MAX_CALLBACK_BYTES: usize = 2 * 1024;
 const MAX_TTL_MS: u64 = 10 * 60 * 1_000;
-/// Hard ceiling on live replay entries, mirroring `MAX_REMOTE_REPLAY_ENTRIES`
-/// in `integration::automation::remote`. Reaching it fails closed: a fresh
-/// token is refused rather than silently accepted without a replay record.
-const MAX_CALLBACK_REPLAY_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,13 +159,10 @@ pub enum CallbackError {
 
 pub struct CallbackTokenIssuer {
     key: [u8; 32],
-    /// Nonces of consumed tokens keyed to the expiry of the token that carried
-    /// them, so the window can drop an entry the moment it stops mattering.
-    consumed: BTreeMap<[u8; 16], u64>,
-    /// Highest `now_ms` ever observed by [`Self::verify_and_consume`]. Time is
-    /// clamped to this floor so a rewound caller clock cannot make an already
-    /// evicted token look fresh again (see the eviction argument there).
-    clock_floor_ms: u64,
+    /// Nonces of consumed tokens, each burned until the expiry of the token
+    /// that carried it, so the window drops an entry the moment it stops
+    /// mattering.
+    replay: ReplayGuard<[u8; 16]>,
 }
 
 impl CallbackTokenIssuer {
@@ -176,8 +175,7 @@ impl CallbackTokenIssuer {
     pub fn from_key(key: [u8; 32]) -> Self {
         Self {
             key,
-            consumed: BTreeMap::new(),
-            clock_floor_ms: 0,
+            replay: ReplayGuard::new(MAX_REPLAY_ENTRIES),
         }
     }
 
@@ -205,36 +203,22 @@ impl CallbackTokenIssuer {
 
     /// Verifies a one-shot token and burns its nonce.
     ///
-    /// Retention of the replay window is exactly the validity window of each
-    /// token, never shorter: an entry is stored under the token's
-    /// `expires_at_ms` and dropped only once `now_ms >= expires_at_ms`, which
-    /// is precisely the point where the same token starts failing the
-    /// freshness check with [`CallbackError::Expired`]. So eviction can never
-    /// resurrect a token:
-    ///
-    /// * while `now_ms < expires_at_ms` the entry is still present and the
-    ///   replay is refused with [`CallbackError::Replayed`];
-    /// * once the entry is evicted, `now_ms >= expires_at_ms` held at that
-    ///   moment, and `now_ms` is clamped to a non-decreasing floor, so every
-    ///   later call refuses the token with [`CallbackError::Expired`].
-    ///
-    /// The clamp matters because eviction is the only thing that makes replay
-    /// rejection depend on the clock; without it a caller whose wall clock
-    /// jumped backwards could re-present an already forgotten nonce inside a
-    /// re-opened validity window.
+    /// The nonce is burned until the token's own `expires_at_ms`, which is
+    /// exactly the instant where the freshness check above starts answering
+    /// [`CallbackError::Expired`], so the guard's eviction rule (see
+    /// [`ReplayGuard::advance_to`]) never resurrects a token: inside the window
+    /// the replay is refused with [`CallbackError::Replayed`], and from the
+    /// moment the entry is dropped the clamped clock refuses it as expired.
     ///
     /// Memory is therefore bounded by the issuance rate over `MAX_TTL_MS`, and
-    /// hard-capped by `MAX_CALLBACK_REPLAY_ENTRIES` fail-closed.
+    /// hard-capped by `MAX_REPLAY_ENTRIES` fail-closed.
     pub fn verify_and_consume(
         &mut self,
         token: &str,
         target: &CallbackTarget,
         now_ms: u64,
     ) -> Result<(), CallbackError> {
-        self.clock_floor_ms = self.clock_floor_ms.max(now_ms);
-        let now_ms = self.clock_floor_ms;
-        self.consumed
-            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        let now_ms = self.replay.advance_to(now_ms);
         let claims = decode(&self.key, token)?;
         if now_ms < claims.issued_at_ms || now_ms >= claims.expires_at_ms {
             return Err(CallbackError::Expired);
@@ -242,14 +226,12 @@ impl CallbackTokenIssuer {
         if claims.target_hash != target.binding_hash()? {
             return Err(CallbackError::TargetMismatch);
         }
-        if self.consumed.contains_key(&claims.nonce) {
+        if self.replay.contains(&claims.nonce) {
             return Err(CallbackError::Replayed);
         }
-        if self.consumed.len() >= MAX_CALLBACK_REPLAY_ENTRIES {
-            return Err(CallbackError::ReplayWindowFull);
-        }
-        self.consumed.insert(claims.nonce, claims.expires_at_ms);
-        Ok(())
+        self.replay
+            .burn(claims.nonce, claims.expires_at_ms)
+            .map_err(|_| CallbackError::ReplayWindowFull)
     }
 }
 
@@ -258,7 +240,7 @@ impl std::fmt::Debug for CallbackTokenIssuer {
         formatter
             .debug_struct("CallbackTokenIssuer")
             .field("key", &"[redacted]")
-            .field("consumed", &self.consumed.len())
+            .field("consumed", &self.replay.len())
             .finish()
     }
 }
@@ -269,16 +251,19 @@ impl Drop for CallbackTokenIssuer {
     }
 }
 
+/// The one statement of what a callback token's MAC covers: the base64url
+/// payload, and nothing else. [`encode`] and [`decode`] both reach their tag
+/// through here, so neither can start covering a different message than the
+/// other.
+fn token_proof(key: &[u8; 32], payload: &str) -> MacProof {
+    hmac_proof(CALLBACK_DOMAIN, key, &[payload.as_bytes()])
+}
+
 fn encode(key: &[u8; 32], claims: &CallbackClaims) -> Result<String, CallbackError> {
     let payload = URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(claims).map_err(|_| CallbackError::InvalidToken)?);
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| CallbackError::InvalidToken)?;
-    mac.update(b"vbuff-x-callback-v1.");
-    mac.update(payload.as_bytes());
-    Ok(format!(
-        "v1.{payload}.{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    ))
+    let signature = URL_SAFE_NO_PAD.encode(token_proof(key, &payload).finish());
+    Ok(format!("v1.{payload}.{signature}"))
 }
 
 fn decode(key: &[u8; 32], token: &str) -> Result<CallbackClaims, CallbackError> {
@@ -297,11 +282,9 @@ fn decode(key: &[u8; 32], token: &str) -> Result<CallbackClaims, CallbackError> 
     let signature = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| CallbackError::InvalidToken)?;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| CallbackError::InvalidToken)?;
-    mac.update(b"vbuff-x-callback-v1.");
-    mac.update(payload.as_bytes());
-    mac.verify_slice(&signature)
-        .map_err(|_| CallbackError::InvalidSignature)?;
+    if !token_proof(key, payload).verify(&signature) {
+        return Err(CallbackError::InvalidSignature);
+    }
     serde_json::from_slice(
         &URL_SAFE_NO_PAD
             .decode(payload)
@@ -332,6 +315,87 @@ fn validate_callback_url(value: &str) -> Result<(), CallbackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{hex, legacy_mac};
+
+    /// Freeze test for the callback token MAC.
+    ///
+    /// These bytes are handed out to whoever holds a live token, so the pin is
+    /// not tidiness: if it fails, some edit has silently invalidated every
+    /// token issued in the last `MAX_TTL_MS`.
+    #[test]
+    fn callback_mac_bytes_are_frozen_and_domain_bound() {
+        let key = [9_u8; 32];
+        let claims = CallbackClaims {
+            nonce: [1; 16],
+            target_hash: [2; 32],
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        };
+        let token = encode(&key, &claims).unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let tag = token_proof(&key, payload).finish();
+
+        assert_eq!(
+            hex(&tag),
+            "44cb8d4b9045a626e9fa90c109e0d1f866dd12c0e0d1f2e2587dbe99885bfb8a"
+        );
+        // Byte-identical to the hand-rolled `mac.update(b"vbuff-x-callback-v1.")`
+        // pair this replaced.
+        assert_eq!(
+            tag,
+            legacy_mac(b"vbuff-x-callback-v1.", &key, &[payload.as_bytes()])
+        );
+        assert!(token_proof(&key, payload).verify(&tag));
+
+        // Domain separation is real in both directions: the same label under
+        // the NUL convention, and a different label, both produce tags this
+        // mechanism refuses.
+        for foreign in [
+            hmac_proof(
+                MacDomain::new("vbuff-x-callback-v1"),
+                &key,
+                &[payload.as_bytes()],
+            )
+            .finish(),
+            hmac_proof(
+                MacDomain::legacy_ascii_separated("vbuff-local-api-v1", b'.'),
+                &key,
+                &[payload.as_bytes()],
+            )
+            .finish(),
+        ] {
+            assert_ne!(foreign, tag);
+            assert!(!token_proof(&key, payload).verify(&foreign));
+        }
+    }
+
+    #[test]
+    fn a_token_signed_under_a_foreign_domain_is_rejected_end_to_end() {
+        let key = [9_u8; 32];
+        let target =
+            CallbackTarget::new(TransformAction::Trim, "bear://x-callback-url/create", None)
+                .unwrap();
+        let claims = CallbackClaims {
+            nonce: [4; 16],
+            target_hash: target.binding_hash().unwrap(),
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        };
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let forged = URL_SAFE_NO_PAD.encode(
+            hmac_proof(
+                MacDomain::new("vbuff-x-callback-v1"),
+                &key,
+                &[payload.as_bytes()],
+            )
+            .finish(),
+        );
+        let mut issuer = CallbackTokenIssuer::from_key(key);
+        assert_eq!(
+            issuer.verify_and_consume(&format!("v1.{payload}.{forged}"), &target, 150),
+            Err(CallbackError::InvalidSignature)
+        );
+    }
 
     #[test]
     fn invocation_is_bound_one_shot_and_scheme_safe() {
@@ -384,14 +448,14 @@ mod tests {
         let mut issuer = CallbackTokenIssuer::from_key([3; 32]);
         let token = issuer.issue(&target, 0, 100).unwrap();
         issuer.verify_and_consume(&token, &target, 10).unwrap();
-        assert_eq!(issuer.consumed.len(), 1);
+        assert_eq!(issuer.replay.len(), 1);
 
         // One millisecond before expiry the entry must survive cleanup.
         assert_eq!(
             issuer.verify_and_consume(&token, &target, 99),
             Err(CallbackError::Replayed)
         );
-        assert_eq!(issuer.consumed.len(), 1);
+        assert_eq!(issuer.replay.len(), 1);
 
         // At expiry the entry is dropped, and the token is refused on time
         // instead of on the nonce set, so nothing is weakened by the eviction.
@@ -399,7 +463,7 @@ mod tests {
             issuer.verify_and_consume(&token, &target, 100),
             Err(CallbackError::Expired)
         );
-        assert!(issuer.consumed.is_empty());
+        assert!(issuer.replay.is_empty());
     }
 
     #[test]
@@ -420,7 +484,7 @@ mod tests {
                 issuer.verify_and_consume(&long_lived, &target, step),
                 Err(CallbackError::Replayed)
             );
-            assert_eq!(issuer.consumed.len(), 2);
+            assert_eq!(issuer.replay.len(), 2);
         }
         assert_eq!(
             issuer.verify_and_consume(&long_lived, &target, MAX_TTL_MS - 1),
@@ -437,7 +501,7 @@ mod tests {
 
         let later = issuer.issue(&target, 200, 10).unwrap();
         issuer.verify_and_consume(&later, &target, 200).unwrap();
-        assert_eq!(issuer.consumed.len(), 1);
+        assert_eq!(issuer.replay.len(), 1);
 
         assert_eq!(
             issuer.verify_and_consume(&token, &target, 50),
@@ -450,10 +514,10 @@ mod tests {
         let target = window_target();
         let mut issuer = CallbackTokenIssuer::from_key([5; 32]);
         let token = issuer.issue(&target, 0, 100).unwrap();
-        for index in 0..MAX_CALLBACK_REPLAY_ENTRIES {
+        for index in 0..MAX_REPLAY_ENTRIES {
             let mut nonce = [0_u8; 16];
             nonce[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            issuer.consumed.insert(nonce, 1_000);
+            issuer.replay.burn(nonce, 1_000).unwrap();
         }
         assert_eq!(
             issuer.verify_and_consume(&token, &target, 10),
@@ -463,7 +527,7 @@ mod tests {
         // Once the saturating entries age out, the window accepts again.
         let token = issuer.issue(&target, 1_000, 100).unwrap();
         issuer.verify_and_consume(&token, &target, 1_000).unwrap();
-        assert_eq!(issuer.consumed.len(), 1);
+        assert_eq!(issuer.replay.len(), 1);
     }
 
     #[test]

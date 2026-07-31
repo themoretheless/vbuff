@@ -5,6 +5,7 @@ pub mod artifact;
 pub mod bootstrap;
 pub mod burn;
 pub mod capability;
+pub mod chain;
 pub mod clock;
 pub mod collection_vault;
 pub mod conflict;
