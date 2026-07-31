@@ -18,7 +18,9 @@ use vbuff_core::reliability::{
     RecoveryAction, SupervisorObservation, shed_to_text_preview,
 };
 use vbuff_core::{content_hash_from_flavors, detect_kind};
-use vbuff_platform::{ArboardClipboard, CapturedClipboard, ClipboardBackend};
+use vbuff_platform::{
+    CapturedClipboard, ClipboardBackend, SYSTEM_CLIPBOARD_BACKEND, system_clipboard,
+};
 use vbuff_types::{
     CaptureHealth, Clip, ClipId, ClipMeta, GenerationCoherence, NoticeLevel, ProvenanceConfidence,
 };
@@ -193,18 +195,26 @@ fn run_worker(
     supervisor: Arc<Mutex<CaptureSupervisor>>,
 ) -> WorkerExit {
     heartbeat.beat();
-    let mut clipboard = match ArboardClipboard::new() {
+    // Opened through the platform seam rather than by naming a backend here:
+    // the paste coordinator holds a second handle on the same backend, and the
+    // two must not be able to drift apart. The failure policy below stays local
+    // - the seam reports what it opened and decides nothing.
+    let mut clipboard = match system_clipboard() {
         Ok(clipboard) => clipboard,
         Err(error) => {
             diagnostics.capture_health(CaptureHealth::ClipboardUnavailable);
-            tracing::error!("clipboard backend unavailable: {error}");
+            tracing::error!(
+                backend = SYSTEM_CLIPBOARD_BACKEND,
+                "clipboard backend unavailable: {error}"
+            );
             return WorkerExit::BackendUnavailable;
         }
     };
 
-    // The generic arboard adapter cannot prove a lossless snapshot/restore of
-    // every native flavor or exclude a probe from OS clipboard history. An
-    // active startup probe would therefore mutate user data to test itself.
+    // The generic adapter this build ships cannot prove a lossless
+    // snapshot/restore of every native flavor or exclude a probe from OS
+    // clipboard history. An active startup probe would therefore mutate user
+    // data to test itself.
     diagnostics.capture_health(CaptureHealth::Watching);
     let policy = capture_policy(&config);
     let initial_interval = Duration::from_millis(config.poll_interval_ms.max(50));
@@ -985,10 +995,11 @@ mod tests {
         );
     }
 
-    /// The shipping backend proves nothing: `ArboardClipboard::read` returns
-    /// `..CapturedClipboard::default()`. Pin what that default now is, and
-    /// pin that it still captures — making the unknowns visible must not
-    /// turn into refusing the only backend that exists.
+    /// The backend this build ships proves nothing: the `read` behind
+    /// `system_clipboard()` returns `..CapturedClipboard::default()`. Pin what
+    /// that default now is, and pin that it still captures — making the
+    /// unknowns visible must not turn into refusing the only backend that
+    /// exists.
     #[test]
     fn generic_backend_read_reports_unknown_evidence_and_still_captures() {
         let read = CapturedClipboard {

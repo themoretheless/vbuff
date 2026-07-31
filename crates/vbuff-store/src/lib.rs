@@ -139,6 +139,142 @@ pub struct SensitiveClawbackReport {
     pub reclassified: usize,
 }
 
+/// The single wording every path uses when a legal hold blocks a deletion.
+const LEGAL_HOLD_BLOCKED: &str = "clip is under legal hold; release it before deletion";
+
+/// Which "do not delete me" promises a deletion path honours, and how it
+/// reports a row it may not touch.
+///
+/// Every removal of a row from `clips` goes through [`Store::delete_clip_row`]
+/// or [`Store::delete_clips_where`] carrying one of the constants below, and
+/// the selection queries that *preview* a deletion reuse the same predicate
+/// via [`DeleteGuards::sql`]. The paths genuinely differ - that is the product
+/// contract in `docs/data-contract-v3.md`, not drift - so the differences live
+/// in named fields here instead of in re-typed SQL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteGuards {
+    /// Refuse to remove a clip under legal hold. False on exactly one path:
+    /// the documented "hard privacy expiry retains precedence" exemption.
+    legal_hold: bool,
+    /// Keep clips this session protected (a paste is in flight against them).
+    session_protected: bool,
+    /// Keep pinned clips.
+    pinned: bool,
+    /// Keep favorites.
+    favorite: bool,
+    /// The caller named this exact clip, so a guard that blocks the delete is
+    /// an error it must see. Background sweeps instead leave the row in place
+    /// and account for it, because failing a maintenance tick over one
+    /// protected row would stall every other eviction behind it.
+    explicit: bool,
+}
+
+impl DeleteGuards {
+    /// One clip the user asked to delete by id: [`Store::delete`], the
+    /// `Delete` batch mutation and [`Store::delete_with_grace`]. A pin or a
+    /// favorite is not a veto here - the user picked this exact row - but a
+    /// legal hold is, and the error says so.
+    pub(crate) const EXPLICIT: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: true,
+    };
+
+    /// Automatic eviction: retention rules, the count cap and collection
+    /// policies. Every protection applies and a protected row is silently
+    /// left behind rather than failing the sweep.
+    pub(crate) const SWEEP: Self = Self {
+        legal_hold: true,
+        session_protected: true,
+        pinned: true,
+        favorite: true,
+        explicit: false,
+    };
+
+    /// [`Store::clear`]: drop the history the user can see. Pinned rows and
+    /// this session's protected rows survive; favorites do not, because a
+    /// favorite is a sort hint while a pin is a keep-this promise.
+    pub(crate) const CLEAR: Self = Self {
+        legal_hold: true,
+        session_protected: true,
+        pinned: true,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// [`Store::clear_all`]: the explicit "delete everything" command. Pin,
+    /// favorite and session protection all yield to it; only a legal hold
+    /// survives.
+    pub(crate) const CLEAR_ALL: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// Integrity quarantine in [`Store::audit_content_hashes`]. This is not an
+    /// eviction, so pin, favorite and session protection do not apply - but a
+    /// legal hold does: quarantine keeps only id/kind/byte_size/sensitive, so
+    /// running it on a held clip would destroy exactly the bytes the hold
+    /// promised to keep. Held collisions are reported instead.
+    pub(crate) const QUARANTINE: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// [`Store::purge_expired`]: the hard privacy TTL, and the one documented
+    /// path that outranks a legal hold ("hard privacy expiry retains
+    /// precedence", `docs/data-contract-v3.md`). A hold must not be able to
+    /// convert a time-boxed capture into indefinite retention. Nothing else
+    /// may clear `legal_hold`.
+    pub(crate) const HARD_PRIVACY_EXPIRY: Self = Self {
+        legal_hold: false,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// The `AND ...` predicate keeping guarded rows alive.
+    ///
+    /// Written against the `clips` table under its own name, so it composes
+    /// with any statement that reaches clip rows as `clips`: the bulk
+    /// `DELETE`s, the retention candidate query, and the collection retention
+    /// preview all share this one text.
+    pub(crate) fn sql(self) -> String {
+        let mut predicate = String::new();
+        if self.pinned {
+            predicate.push_str(" AND clips.pinned = 0");
+        }
+        if self.favorite {
+            predicate.push_str(" AND clips.favorite = 0");
+        }
+        if self.session_protected {
+            predicate.push_str(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )",
+            );
+        }
+        if self.legal_hold {
+            predicate.push_str(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
+                  )",
+            );
+        }
+        predicate
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchCursor {
     pub pinned: bool,
@@ -163,6 +299,10 @@ pub struct ContentAuditReport {
     pub checked: usize,
     pub repaired: usize,
     pub quarantined: usize,
+    /// Rows whose hash collides with another clip but that are under legal
+    /// hold. Quarantine would remove the row, so the audit reports them
+    /// instead: an operator has to release the hold before they can be fixed.
+    pub held: usize,
 }
 
 #[derive(Serialize)]
@@ -910,10 +1050,9 @@ impl Store {
         if limit == 0 {
             return Ok(0);
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
+            SELECT {projection}
             FROM clips
             WHERE normalized_hash IS NULL
               AND kind IN (0, 1, 2, 5, 6, 7)
@@ -921,15 +1060,14 @@ impl Store {
             ORDER BY updated_at DESC, seq DESC
             LIMIT ?1
             "#,
-        )?;
+            projection = clip_projection("clips"),
+        ))?;
         let rows = statement.query_map([limit as i64], row_to_clip)?;
-        let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let clips = self.hydrated_clips(rows)?;
         drop(statement);
 
-        let mut pending = Vec::with_capacity(raw.len());
-        for row in raw {
-            let mut clip = raw_to_clip(row)?;
-            self.hydrate_clip(&mut clip)?;
+        let mut pending = Vec::with_capacity(clips.len());
+        for clip in clips {
             let fingerprint = clip
                 .primary_text()
                 .and_then(lifecycle::normalized_text_fingerprint)
@@ -1225,24 +1363,22 @@ impl Store {
         if fingerprint.len() != 32 {
             return Ok(Vec::new());
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
+            SELECT {projection}
             FROM clips
             WHERE normalized_hash = ?1
               AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
             ORDER BY updated_at DESC, seq DESC
             LIMIT ?2
             "#,
-        )?;
+            projection = clip_projection("clips"),
+        ))?;
         let rows = statement.query_map(
             params![fingerprint, limit.clamp(1, 512) as i64],
             row_to_clip,
         )?;
-        let mut clips = collect_clips(rows)?;
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.hydrated_clips(rows)
     }
 
     /// Return the newest exact-dedup events for one canonical clip.
@@ -1490,25 +1626,30 @@ impl Store {
             remaining_candidates,
             ..RetentionReport::default()
         };
-        let mut deleted_any = false;
         for (id, grace_window) in candidates {
             let id = ClipId::parse(&id)
                 .map_err(|_| StoreError::Corrupt("bad ulid in retention query".into()))?;
             if grace_window.is_zero() {
-                report.hard_deleted += self
-                    .conn
-                    .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
-                deleted_any = true;
+                // `SWEEP` re-checks the protections the candidate query already
+                // applied: between selection and deletion a clip can be pinned,
+                // protected or put on hold, and the sweep must lose that race.
+                report.hard_deleted += self.delete_clip_row(&self.conn, id, DeleteGuards::SWEEP)?;
             } else if let Some(key) = grace_key {
-                self.delete_with_grace_inner(id, key, grace_window, DeletionReason::Retention)?;
-                report.encrypted += 1;
-                deleted_any = true;
+                if self
+                    .delete_with_grace_inner(
+                        id,
+                        key,
+                        grace_window,
+                        DeletionReason::Retention,
+                        DeleteGuards::SWEEP,
+                    )?
+                    .is_some()
+                {
+                    report.encrypted += 1;
+                }
             } else {
                 report.deferred_without_key += 1;
             }
-        }
-        if deleted_any {
-            self.scrub_deleted_pages()?;
         }
         Ok(report)
     }
@@ -1538,10 +1679,11 @@ impl Store {
                 .borrow()
                 .use_fts(row_count, &parsed.text);
         let started = Instant::now();
-        let mut sql = String::from(
+        // `c.seq` is column 11, past the shared projection: it feeds the
+        // pagination cursor, not the `Clip`.
+        let mut sql = format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
+            SELECT {projection}, c.seq
             FROM clips c
             LEFT JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ? OR EXISTS (
@@ -1551,6 +1693,7 @@ impl Store {
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
               AND COALESCE(a.archived, 0) = 0
             "#,
+            projection = clip_projection("c"),
         );
         let mut values = vec![Value::Integer(now_millis())];
 
@@ -1664,16 +1807,17 @@ impl Store {
         } else {
             String::new()
         };
+        // The fingerprint lands at column 11, past the shared projection.
         let sql = format!(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite, {column}
+            SELECT {projection}, {column}
             FROM clips
             WHERE {column} IS NOT NULL
               AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0
               {band_filter}
             ORDER BY updated_at DESC, seq DESC
-            "#
+            "#,
+            projection = clip_projection("clips"),
         );
         let mut statement = self.conn.prepare(&sql)?;
         let values = if max_distance < 4 {
@@ -1690,10 +1834,11 @@ impl Store {
         let mut matches = Vec::new();
         for row in rows {
             let (raw, candidate) = row?;
+            // Hydrated one at a time on purpose: the band filter is only a
+            // prefilter, so most scanned rows are discarded here and never
+            // need their CAS payload read.
             if hamming_distance(fingerprint, candidate) <= max_distance {
-                let mut clip = raw_to_clip(raw)?;
-                self.hydrate_clip(&mut clip)?;
-                matches.push(clip);
+                matches.push(self.hydrated_clip(raw)?);
                 if matches.len() == limit {
                     break;
                 }
@@ -1707,6 +1852,23 @@ impl Store {
             self.hydrate_clip(clip)?;
         }
         Ok(())
+    }
+
+    /// Decode and hydrate one row of the [`clip_projection`] SELECT list.
+    pub(crate) fn hydrated_clip(&self, raw: RawRow) -> Result<Clip> {
+        let mut clip = raw_to_clip(raw)?;
+        self.hydrate_clip(&mut clip)?;
+        Ok(clip)
+    }
+
+    /// Decode and hydrate a whole [`clip_projection`] result set.
+    pub(crate) fn hydrated_clips(
+        &self,
+        rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawRow>>,
+    ) -> Result<Vec<Clip>> {
+        let mut clips = collect_clips(rows)?;
+        self.hydrate_clips(&mut clips)?;
+        Ok(clips)
     }
 
     fn hydrate_clip(&self, clip: &mut Clip) -> Result<()> {
@@ -2107,20 +2269,19 @@ impl Store {
 
     /// Recompute a rolling sample and repair or quarantine hash mismatches.
     pub fn audit_content_hashes(&self, limit: usize) -> Result<ContentAuditReport> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            SELECT {projection}
             FROM clips c
             LEFT JOIN content_audit a ON a.clip_id = c.id
             ORDER BY COALESCE(a.checked_at, 0) ASC, c.seq ASC
             LIMIT ?1
             "#,
-        )?;
+            projection = clip_projection("c"),
+        ))?;
         let rows = statement.query_map(params![limit as i64], row_to_clip)?;
-        let mut candidates = collect_clips(rows)?;
+        let candidates = self.hydrated_clips(rows)?;
         drop(statement);
-        self.hydrate_clips(&mut candidates)?;
 
         let mut report = ContentAuditReport::default();
         let transaction = self.conn.unchecked_transaction()?;
@@ -2146,6 +2307,25 @@ impl Store {
                 )
                 .optional()?;
             if let Some(conflict_id) = conflict {
+                // Quarantine removes the live row and keeps only
+                // id/kind/byte_size/sensitive, so it destroys exactly what a
+                // legal hold promises to keep. Attempt the removal through the
+                // shared primitive and let it make that call.
+                if self.delete_clip_row(&transaction, clip.id, DeleteGuards::QUARANTINE)? == 0 {
+                    // Only the hold can block `QUARANTINE`. Record the row as
+                    // checked anyway: the audit orders by `checked_at`, so
+                    // leaving it unmarked would park the rolling window on a
+                    // clip nothing is allowed to fix.
+                    transaction.execute(
+                        r#"
+                        INSERT INTO content_audit(clip_id, checked_at) VALUES (?1, ?2)
+                        ON CONFLICT(clip_id) DO UPDATE SET checked_at = excluded.checked_at
+                        "#,
+                        params![clip.id.to_string_repr(), now_millis()],
+                    )?;
+                    report.held += 1;
+                    continue;
+                }
                 let row_json = serde_json::to_string(&QuarantineRecord {
                     id: clip.id.to_string_repr(),
                     kind: clip.meta.kind,
@@ -2164,14 +2344,6 @@ impl Store {
                         format!("content hash conflicts with {conflict_id}"),
                         row_json,
                     ],
-                )?;
-                transaction.execute(
-                    "DELETE FROM clips WHERE id = ?1",
-                    params![clip.id.to_string_repr()],
-                )?;
-                transaction.execute(
-                    "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-                    params![clip.id.to_string_repr()],
                 )?;
                 report.quarantined += 1;
             } else {
@@ -2225,30 +2397,38 @@ impl Store {
         window: Duration,
         reason: DeletionReason,
     ) -> Result<String> {
-        self.ensure_not_legal_hold(id)?;
         self.purge_grace_bin()?;
-        self.delete_with_grace_inner(id, key, window, reason)
+        self.delete_with_grace_inner(id, key, window, reason, DeleteGuards::EXPLICIT)?
+            .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))
     }
 
+    /// Seal one clip into the grace bin and remove its live row.
+    ///
+    /// `guards` is what separates the two callers: the public API deletes a
+    /// clip the user named ([`DeleteGuards::EXPLICIT`]), while retention
+    /// evicts on a schedule and must lose to every protection
+    /// ([`DeleteGuards::SWEEP`]). Returns `None` when a guard kept the row -
+    /// the sealed record is discarded with the rolled-back transaction.
     fn delete_with_grace_inner(
         &self,
         id: ClipId,
         key: &[u8; 32],
         window: Duration,
         reason: DeletionReason,
-    ) -> Result<String> {
+        guards: DeleteGuards,
+    ) -> Result<Option<String>> {
         let window_ms = duration_millis_i64(window)?;
         if window_ms == 0 || window > Duration::from_secs(7 * 24 * 60 * 60) {
             return Err(StoreError::Maintenance(
                 "grace-bin window must be between 1 ms and 7 days".into(),
             ));
         }
-        let mut clip = self
+        // `load_clip_by_id` hydrates, which matters here: the CAS payloads have
+        // to be inline before their live reference is removed, so the encrypted
+        // recovery record stays self-contained.
+        let clip = self
             .load_clip_by_id(id)?
             .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))?;
-        // Hydrate CAS payloads before their live reference is removed so the
-        // encrypted recovery record is self-contained.
-        self.hydrate_clip(&mut clip)?;
         let deleted_at = now_millis();
         let purge_after = deleted_at
             .checked_add(window_ms)
@@ -2273,18 +2453,11 @@ impl Store {
                 ciphertext,
             ],
         )?;
-        let deleted =
-            transaction.execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
-        if deleted != 1 {
-            return Err(StoreError::ClipNotFound(id.to_string_repr()));
+        if self.delete_clip_row(&transaction, id, guards)? != 1 {
+            return Ok(None);
         }
-        transaction.execute(
-            "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-            [id.to_string_repr()],
-        )?;
         transaction.commit()?;
-        self.scrub_deleted_pages()?;
-        Ok(recovery_id)
+        Ok(Some(recovery_id))
     }
 
     /// List unexpired encrypted recovery records without decrypting content.
@@ -2391,21 +2564,15 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite
-                FROM clips WHERE id = ?1
-                "#,
+                &format!(
+                    "SELECT {projection} FROM clips WHERE id = ?1",
+                    projection = clip_projection("clips"),
+                ),
                 [id.to_string_repr()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(raw)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        raw.map(|raw| self.hydrated_clip(raw)).transpose()
     }
 
     fn retention_candidates(
@@ -2416,32 +2583,26 @@ impl Store {
     ) -> Result<Vec<String>> {
         rule.validate()?;
         let (kind, sensitive) = rule.scope.database_values();
+        // Same protections the eviction itself applies, so the preview and the
+        // delete can never disagree about which rows are eligible.
+        let guards = DeleteGuards::SWEEP.sql();
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         if let Some(max_age) = rule.max_age {
             let cutoff = now
                 .checked_sub(duration_millis_i64(max_age)?)
                 .ok_or_else(|| StoreError::Maintenance("retention cutoff overflow".into()))?;
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare(&format!(
                 r#"
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
-                  )
-                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                SELECT clips.id FROM clips
+                WHERE ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
-                  AND updated_at < ?3
+                  AND updated_at < ?3{guards}
                 ORDER BY updated_at ASC, seq ASC
                 LIMIT ?4
                 "#,
-            )?;
+            ))?;
             let rows = statement.query_map(
                 params![sensitive as i64, kind, cutoff, limit as i64],
                 |row| row.get::<_, String>(0),
@@ -2456,25 +2617,16 @@ impl Store {
         if let Some(max_items) = rule.max_items
             && candidates.len() < limit
         {
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare(&format!(
                 r#"
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
-                  )
-                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                SELECT clips.id FROM clips
+                WHERE ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
-                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
+                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0)){guards}
                 ORDER BY updated_at DESC, seq DESC
                 LIMIT ?3 OFFSET ?4
                 "#,
-            )?;
+            ))?;
             let rows = statement.query_map(
                 params![
                     sensitive as i64,
@@ -2494,10 +2646,84 @@ impl Store {
         Ok(candidates)
     }
 
+    /// Remove one clip row: the single row-scoped deletion primitive.
+    ///
+    /// Every public single-clip deletion funnels through here, so the legal
+    /// hold decision, the `session_protected` bookkeeping and the WAL dirty
+    /// marker cannot be forgotten by a new caller. `conn` is the caller's
+    /// transaction where there is one, so the marker rolls back with it.
+    ///
+    /// Returns the number of rows removed: `0` when a guard kept the row and
+    /// `guards.explicit` is false.
+    fn delete_clip_row(
+        &self,
+        conn: &Connection,
+        id: ClipId,
+        guards: DeleteGuards,
+    ) -> Result<usize> {
+        if guards.legal_hold {
+            if guards.explicit {
+                // Explicit deletes must say why nothing happened; this also
+                // keeps `ClipNotFound` for an id that is already gone.
+                self.ensure_not_legal_hold(id)?;
+            } else if self.legal_hold_active(id)? {
+                return Ok(0);
+            }
+        }
+        let deleted = conn.execute(
+            &format!("DELETE FROM clips WHERE clips.id = ?1{}", guards.sql()),
+            [id.to_string_repr()],
+        )?;
+        if deleted > 0 {
+            conn.execute(
+                "DELETE FROM temp.session_protected WHERE clip_id = ?1",
+                [id.to_string_repr()],
+            )?;
+            self.scrub_deleted_pages_on(conn)?;
+        }
+        Ok(deleted)
+    }
+
+    /// Remove every clip matching `scope`: the single bulk deletion primitive.
+    ///
+    /// `scope` is the caller's own predicate over `clips`; the protections in
+    /// `guards` are appended here so no bulk path can forget one. When
+    /// `order_limit` is present it caps the sweep, and it is applied to the
+    /// *guarded* set so a protected row can never consume the budget.
+    fn delete_clips_where(
+        &self,
+        scope: &str,
+        order_limit: Option<&str>,
+        values: &[Value],
+        guards: DeleteGuards,
+    ) -> Result<usize> {
+        let predicate = format!("{scope}{}", guards.sql());
+        let sql = match order_limit {
+            None => format!("DELETE FROM clips WHERE {predicate}"),
+            Some(tail) => format!(
+                "DELETE FROM clips WHERE clips.id IN (
+                    SELECT clips.id FROM clips WHERE {predicate} {tail}
+                 )"
+            ),
+        };
+        let deleted = self.conn.execute(&sql, params_from_iter(values.iter()))?;
+        if deleted > 0 {
+            if !guards.session_protected {
+                // Only a sweep allowed to remove a protected row can leave an
+                // orphaned `session_protected` entry behind.
+                self.conn.execute(
+                    "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
+                    [],
+                )?;
+            }
+            self.scrub_deleted_pages()?;
+        }
+        Ok(deleted)
+    }
+
     /// Apply all mutations in one SQLite transaction or roll every one back.
     pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction()?;
-        let mut deleted = false;
         for mutation in mutations {
             let (id, changed) = match *mutation {
                 StoreMutation::SetPinned { id, pinned } => (
@@ -2514,97 +2740,34 @@ impl Store {
                         params![favorite as i64, id.to_string_repr()],
                     )?,
                 ),
-                StoreMutation::Delete { id } => {
-                    let held: bool = transaction.query_row(
-                        "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1), 0)",
-                        [id.to_string_repr()],
-                        |row| row.get(0),
-                    )?;
-                    if held {
-                        return Err(StoreError::Maintenance(
-                            "clip is under legal hold; release it before deletion".into(),
-                        ));
-                    }
-                    deleted = true;
-                    let changed = transaction
-                        .execute("DELETE FROM clips WHERE id = ?1", [id.to_string_repr()])?;
-                    transaction.execute(
-                        "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-                        [id.to_string_repr()],
-                    )?;
-                    (id, changed)
-                }
+                StoreMutation::Delete { id } => (
+                    id,
+                    self.delete_clip_row(&transaction, id, DeleteGuards::EXPLICIT)?,
+                ),
             };
             if changed != 1 {
                 return Err(StoreError::ClipNotFound(id.to_string_repr()));
             }
         }
         transaction.commit()?;
-        if deleted {
-            self.scrub_deleted_pages()?;
-        }
         Ok(mutations.len())
     }
 
     /// Delete a single clip by id.
     pub fn delete(&self, id: ClipId) -> Result<()> {
-        self.ensure_not_legal_hold(id)?;
-        let deleted = self.conn.execute(
-            "DELETE FROM clips WHERE id = ?1",
-            params![id.to_string_repr()],
-        )?;
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id = ?1",
-            params![id.to_string_repr()],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clip_row(&self.conn, id, DeleteGuards::EXPLICIT)?;
         Ok(())
     }
 
     /// Delete every non-pinned, non-session-protected clip.
     pub fn clear(&self) -> Result<()> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE pinned = 0
-              AND NOT EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM session_protected AS protected
-                WHERE protected.clip_id = clips.id
-              )
-            "#,
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clips_where("1 = 1", None, &[], DeleteGuards::CLEAR)?;
         Ok(())
     }
 
     /// Delete every clip, including pinned ones.
     pub fn clear_all(&self) -> Result<()> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE NOT EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
-            )
-            "#,
-            [],
-        )?;
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clips_where("1 = 1", None, &[], DeleteGuards::CLEAR_ALL)?;
         Ok(())
     }
 
@@ -2625,22 +2788,17 @@ impl Store {
     }
 
     /// Delete clips whose hard privacy TTL elapsed, including pinned rows.
+    ///
+    /// This is the one deletion path that outranks a legal hold - see
+    /// [`DeleteGuards::HARD_PRIVACY_EXPIRY`]. A hold must not be able to turn
+    /// a time-boxed capture into indefinite retention.
     pub fn purge_expired(&self) -> Result<usize> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE expires_at IS NOT NULL AND expires_at <= ?1
-            "#,
-            params![now_millis()],
-        )?;
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
-        Ok(deleted)
+        self.delete_clips_where(
+            "clips.expires_at IS NOT NULL AND clips.expires_at <= ?1",
+            None,
+            &[Value::Integer(now_millis())],
+            DeleteGuards::HARD_PRIVACY_EXPIRY,
+        )
     }
 
     /// Persist one capture-path outcome without retaining clipboard content.
@@ -2687,29 +2845,12 @@ impl Store {
             return Ok(0);
         }
         let overflow = total - max_history;
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips WHERE id IN (
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND NOT EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 1
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                ORDER BY updated_at ASC, seq ASC
-                LIMIT ?1
-            )
-            "#,
-            params![overflow as i64],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
-        Ok(deleted)
+        self.delete_clips_where(
+            "1 = 1",
+            Some("ORDER BY clips.updated_at ASC, clips.seq ASC LIMIT ?1"),
+            &[Value::Integer(overflow as i64)],
+            DeleteGuards::SWEEP,
+        )
     }
 
     /// Mark the WAL as needing a scrub after one or more deletions.
@@ -2720,7 +2861,13 @@ impl Store {
     /// runs later, from [`Store::scrub_wal_if_dirty`], so a busy checkpoint
     /// can no longer turn an already-committed delete into a spurious error.
     fn scrub_deleted_pages(&self) -> Result<()> {
-        self.conn.execute(
+        self.scrub_deleted_pages_on(&self.conn)
+    }
+
+    /// Same marker, written through the caller's transaction so it rolls back
+    /// with the deletion that raised it.
+    fn scrub_deleted_pages_on(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
             "UPDATE maintenance_state SET value = value + 1 WHERE key = 'pending_wal_scrub'",
             [],
         )?;
@@ -2879,6 +3026,37 @@ fn collect_clips(
         out.push(raw_to_clip(row?)?);
     }
     Ok(out)
+}
+
+/// Columns of the canonical clip projection, in the order [`row_to_clip`]
+/// reads them.
+///
+/// Every query that decodes a [`Clip`] builds its SELECT list from here, so a
+/// schema change moves this array instead of ten hand-written column lists
+/// that only a runtime panic would tell you had drifted.
+const CLIP_COLUMNS: [&str; 11] = [
+    "id",
+    "content_hash",
+    "flavors",
+    "kind",
+    "created_at",
+    "updated_at",
+    "byte_size",
+    "source_app",
+    "metadata_json",
+    "pinned",
+    "favorite",
+];
+
+/// Render [`CLIP_COLUMNS`] qualified by the table name or alias the query
+/// reaches clip rows through (`"clips"`, or a join alias such as `"c"`).
+///
+/// Queries that need extra columns append them after this list: [`RawRow`]
+/// reads by position, so anything beyond index 10 is the caller's own.
+fn clip_projection(alias: &str) -> String {
+    CLIP_COLUMNS
+        .map(|column| format!("{alias}.{column}"))
+        .join(", ")
 }
 
 /// Intermediate row representation before JSON decoding.
@@ -4949,6 +5127,46 @@ mod tests {
     }
 
     #[test]
+    fn rolling_audit_never_quarantines_a_clip_under_legal_hold() {
+        // Regression: the audit used to delete the colliding row outright, so
+        // a maintenance tick could destroy a clip the user was promised would
+        // survive until the hold is released. `quarantined_clips` only keeps
+        // id/kind/byte_size/sensitive, so the content really was gone.
+        let store = Store::open_in_memory().unwrap();
+        let canonical = make_clip("canonical bytes");
+        let held = make_clip("different bytes");
+        store.insert(&canonical).unwrap();
+        store.insert(&held).unwrap();
+        store.set_legal_hold(held.id, true).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET flavors = ?1 WHERE id = ?2",
+                params![
+                    serde_clip::flavors_to_json(&canonical.flavors).unwrap(),
+                    held.id.to_string_repr(),
+                ],
+            )
+            .unwrap();
+
+        let report = store.audit_content_hashes(10).unwrap();
+
+        assert_eq!(report.quarantined, 0, "a held clip must not be removed");
+        assert_eq!(report.held, 1, "the skip must be reported, not silent");
+        assert!(
+            store.get_clip(held.id).unwrap().is_some(),
+            "held clip disappeared from the store"
+        );
+        let quarantined: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM quarantined_clips", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(quarantined, 0);
+    }
+
+    #[test]
     fn capture_metrics_saturate_at_sqlite_integer_max() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -5126,5 +5344,157 @@ mod tests {
         assert_eq!(report.hard_deleted, 0);
         assert_eq!(store.count().unwrap(), 1);
         assert_eq!(store.grace_bin(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_deletion_path_leaves_a_clip_under_legal_hold_alone() {
+        // The point of routing every removal through `delete_clip_row` /
+        // `delete_clips_where` is that this list cannot silently gain a hole.
+        // A new public deletion that skips the primitives fails here.
+        let store = Store::open_in_memory().unwrap();
+        let held = make_clip("held by legal hold");
+        store.insert(&held).unwrap();
+        store.set_legal_hold(held.id, true).unwrap();
+        // A second, unheld clip so the sweeps have something they may delete.
+        let disposable = store.insert(&make_clip("disposable")).unwrap();
+
+        // Explicit paths report the hold instead of pretending to succeed.
+        assert!(store.delete(held.id).is_err(), "delete");
+        assert!(
+            store
+                .apply_batch(&[StoreMutation::Delete { id: held.id }])
+                .is_err(),
+            "apply_batch"
+        );
+        assert!(
+            store
+                .delete_with_grace(
+                    held.id,
+                    &[7; 32],
+                    std::time::Duration::from_secs(60),
+                    DeletionReason::User,
+                )
+                .is_err(),
+            "delete_with_grace"
+        );
+
+        // Sweeps leave the row and carry on with everything else.
+        store.clear().unwrap();
+        assert!(store.get_clip(held.id).unwrap().is_some(), "clear");
+        store.insert(&make_clip("refill one")).unwrap();
+        store.clear_all().unwrap();
+        assert!(store.get_clip(held.id).unwrap().is_some(), "clear_all");
+
+        store.insert(&make_clip("refill two")).unwrap();
+        assert_eq!(store.enforce_cap(1).unwrap(), 1);
+        assert!(store.get_clip(held.id).unwrap().is_some(), "enforce_cap");
+
+        store
+            .set_retention_rule(&RetentionRule {
+                scope: RetentionScope::Kind(ContentKind::Text),
+                max_age: None,
+                max_items: Some(0),
+                grace_window: std::time::Duration::ZERO,
+            })
+            .unwrap();
+        let retention = store.enforce_retention(None).unwrap();
+        assert_eq!(retention.hard_deleted, 0, "retention");
+        assert_eq!(retention.deferred_without_key, 0, "retention");
+        assert!(store.get_clip(held.id).unwrap().is_some(), "retention");
+
+        store
+            .upsert_collection(&CollectionRecord {
+                id: "held-collection".into(),
+                name: "held".into(),
+                retention: CollectionRetentionPolicy {
+                    max_age_days: None,
+                    max_items: Some(0),
+                    max_bytes: None,
+                },
+            })
+            .unwrap();
+        store
+            .set_collection(held.id, Some("held-collection"))
+            .unwrap();
+        let preview = store
+            .enforce_collection_retention("held-collection", 10)
+            .unwrap();
+        assert!(preview.clip_ids.is_empty(), "collection retention preview");
+        assert!(
+            store.get_clip(held.id).unwrap().is_some(),
+            "collection retention"
+        );
+
+        // The disposable clip really was removed along the way, so the checks
+        // above are not passing because nothing ever deleted anything.
+        assert!(store.get_clip(disposable).unwrap().is_none());
+
+        // Release the hold and the very same sweep takes the clip: the hold
+        // was the reason it survived, not an inert query that matched nothing.
+        store.set_legal_hold(held.id, false).unwrap();
+        let released = store
+            .enforce_collection_retention("held-collection", 10)
+            .unwrap();
+        assert_eq!(released.clip_ids, vec![held.id]);
+        assert!(store.get_clip(held.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn clip_projection_is_the_single_source_of_column_order() {
+        // `RawRow` reads by position, so the order here is load-bearing:
+        // swapping two entries would mis-decode every clip in the store, and
+        // three callers append their own column at index 11.
+        assert_eq!(CLIP_COLUMNS.len(), 11);
+        assert_eq!(
+            clip_projection("c"),
+            "c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at, \
+             c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite"
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("projection pin");
+        store.insert(&clip).unwrap();
+        let raw = store
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM clips", clip_projection("clips")),
+                [],
+                row_to_clip,
+            )
+            .unwrap();
+        let decoded = raw_to_clip(raw).unwrap();
+        assert_eq!(decoded.id, clip.id);
+        assert_eq!(decoded.content_hash, clip.content_hash);
+        assert_eq!(decoded.meta.kind, clip.meta.kind);
+        assert_eq!(decoded.meta.byte_size, clip.meta.byte_size);
+        assert_eq!(decoded.flavors, clip.flavors);
+    }
+
+    #[test]
+    fn hard_privacy_expiry_is_the_one_path_that_outranks_a_legal_hold() {
+        // Deliberate divergence, not an oversight: `docs/data-contract-v3.md`
+        // states "hard privacy expiry retains precedence". A hold must not be
+        // able to convert a time-boxed capture into indefinite retention.
+        // Expressed as `DeleteGuards::HARD_PRIVACY_EXPIRY`; this test is what
+        // stops a later "consistency" cleanup from quietly flipping it.
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("time boxed and held");
+        clip.meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+        let id = store.insert(&clip).unwrap();
+        store.set_legal_hold(id, true).unwrap();
+        store.set_pinned(id, true).unwrap();
+        store.set_session_protected(id, true).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET expires_at = ?1 WHERE id = ?2",
+                params![now_millis() - 1, id.to_string_repr()],
+            )
+            .unwrap();
+
+        assert_eq!(store.purge_expired().unwrap(), 1);
+        assert!(store.get_clip(id).unwrap().is_none());
+        // The orphaned session-protection entry is swept with it.
+        assert!(!store.session_protected(id).unwrap());
     }
 }
