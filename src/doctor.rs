@@ -4,6 +4,7 @@ use serde::Serialize;
 use vbuff_platform::lifecycle::SessionContext;
 use vbuff_platform::{ProcessHardeningReport, SecurityPosture};
 use vbuff_store::{Store, StoreDoctorReport, StoreOpenProfile};
+use vbuff_types::SecurityPostureLevel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DoctorFormat {
@@ -26,8 +27,11 @@ struct DoctorOutput {
     store: StoreDoctorReport,
 }
 
+/// Health is the store plus the one shared security verdict
+/// ([`SecurityPosture::level`]), so `doctor` can never call a machine healthy
+/// while the GUI badge reports the same posture as degraded.
 fn doctor_ok(store_present: bool, store: &StoreDoctorReport, posture: &SecurityPosture) -> bool {
-    store_present && store.is_healthy() && posture.required_capabilities_satisfied()
+    store_present && store.is_healthy() && posture.level() == SecurityPostureLevel::Protected
 }
 
 pub(crate) fn requested() -> Option<DoctorFormat> {
@@ -55,7 +59,13 @@ pub(crate) fn run(
         (Store::open_in_memory()?, StoreOpenProfile::default())
     };
     let store_report = store.doctor()?;
+    // `vbuff doctor` is its own short-lived process, so it takes its own
+    // snapshot of its own environment - that is the point of running it. What
+    // it must not do is take two: the posture below and the `session` field
+    // printed to the user are derived from this single value.
+    let session = SessionContext::current();
     let security_posture = SecurityPosture::detect(
+        session,
         strict_mode,
         process_hardening.core_dumps_blocked,
         process_hardening.ptrace_blocked,
@@ -67,7 +77,7 @@ pub(crate) fn run(
         store_present,
         version: env!("CARGO_PKG_VERSION"),
         target_os: std::env::consts::OS,
-        session: SessionContext::detect(),
+        session: session.clone(),
         process_hardening,
         security_posture,
         store_open,
@@ -126,10 +136,11 @@ mod tests {
         let store_report = store.doctor().unwrap();
         assert!(store_report.is_healthy());
 
-        let satisfied = SecurityPosture::detect(false, true, true);
+        let session = SessionContext::current();
+        let satisfied = SecurityPosture::detect(session, false, true, true);
         assert!(doctor_ok(true, &store_report, &satisfied));
 
-        let failing = SecurityPosture::detect(false, false, true);
+        let failing = SecurityPosture::detect(session, false, false, true);
         assert!(!doctor_ok(true, &store_report, &failing));
         assert!(!doctor_ok(false, &store_report, &satisfied));
     }
@@ -138,7 +149,8 @@ mod tests {
     fn doctor_output_schema_is_stable_and_content_free() {
         let store = Store::open_in_memory().unwrap();
         let store_report = store.doctor().unwrap();
-        let security_posture = SecurityPosture::detect(false, false, false);
+        let session = SessionContext::current();
+        let security_posture = SecurityPosture::detect(session, false, false, false);
         let output = DoctorOutput {
             ok: doctor_ok(true, &store_report, &security_posture),
             capture_allowed: true,
@@ -146,7 +158,7 @@ mod tests {
             store_present: true,
             version: "test",
             target_os: "test",
-            session: SessionContext::detect(),
+            session: session.clone(),
             process_hardening: ProcessHardeningReport::default(),
             security_posture,
             store_open: StoreOpenProfile::default(),
@@ -157,5 +169,22 @@ mod tests {
         assert!(json.contains("\"required_capabilities_ok\""));
         assert!(json.contains("\"severity\""));
         assert!(!json.contains("clipboard_content"));
+    }
+
+    /// The reported session and the reported capabilities come from the same
+    /// snapshot, so `doctor` cannot print a non-Wayland session next to a
+    /// Wayland capability list (or the reverse) on any host.
+    #[test]
+    fn reported_session_and_capabilities_share_one_snapshot() {
+        let session = SessionContext::current();
+        let posture = SecurityPosture::detect(session, false, false, false);
+        let wayland_rows = posture
+            .capabilities
+            .iter()
+            .any(|capability| capability.feature.starts_with("wayland_"));
+        assert_eq!(
+            wayland_rows,
+            session.display_server == vbuff_platform::lifecycle::DisplayServer::Wayland
+        );
     }
 }

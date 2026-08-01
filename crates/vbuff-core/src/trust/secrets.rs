@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, Verifying
 use serde::Serialize;
 use thiserror::Error;
 pub use vbuff_types::SensitivityReason;
+use vbuff_types::validation::is_valid_identifier;
 
 use crate::secret::SecretKind;
 
@@ -13,42 +14,47 @@ const MAX_DETECTORS: usize = 512;
 const MAX_DETECTOR_ID_BYTES: usize = 128;
 const MAX_UPDATE_LIFETIME_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SecretMask {
-    Full,
-    LastFour,
-    Grouped,
-}
-
+/// Fail-closed handling for a detected secret.
+///
+/// Both fields are read by the capture gate. There used to be two more -
+/// `mask: SecretMask` and `sync_allowed: bool` - and neither was ever read
+/// outside this file's own tests. `sync_allowed` was a constant `false`
+/// dressed up as a decision, while the real rule ("anything sensitive is
+/// sync-ineligible") is enforced by the capture gate and by the store's
+/// `tighten_sensitive`. `SecretMask` claimed a per-kind masking vocabulary
+/// (`LastFour`, `Grouped`) that nothing implements: the shipping masked
+/// preview comes from `SensitivityReason::watermark()` in `vbuff-types`.
+/// Both were removed rather than wired, because wiring them would have meant
+/// inventing a second masking system to justify the field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct SecretHandling {
     pub ttl: Duration,
-    pub mask: SecretMask,
     pub memory_only: bool,
-    pub sync_allowed: bool,
 }
 
+/// The single TTL table for the secret domain.
+///
+/// `CapturePolicy` used to carry a second, disagreeing lifetime for one-time
+/// passwords (`otp_ttl`, 90s) that was never wired to configuration, so the
+/// same OTP expired after 60s or 90s depending on which of the two OTP
+/// heuristics happened to catch it. The knob is gone and this table is
+/// authoritative; the user's `secret_ttl` only ever shortens these.
 pub const fn handling_for_secret(kind: SecretKind) -> SecretHandling {
     match kind {
-        SecretKind::PrivateKey => handling(30, SecretMask::Full, true),
-        SecretKind::CloudCredential | SecretKind::AccessToken => {
-            handling(5 * 60, SecretMask::LastFour, false)
-        }
-        SecretKind::JsonWebToken => handling(2 * 60, SecretMask::Full, false),
-        SecretKind::PaymentCard => handling(10 * 60, SecretMask::LastFour, false),
-        SecretKind::OneTimePassword => handling(60, SecretMask::Grouped, true),
-        SecretKind::RecoveryCode => handling(30, SecretMask::Full, true),
-        SecretKind::HighEntropy => handling(2 * 60, SecretMask::Full, false),
+        SecretKind::PrivateKey => handling(30, true),
+        SecretKind::CloudCredential | SecretKind::AccessToken => handling(5 * 60, false),
+        SecretKind::JsonWebToken => handling(2 * 60, false),
+        SecretKind::PaymentCard => handling(10 * 60, false),
+        SecretKind::OneTimePassword => handling(60, true),
+        SecretKind::RecoveryCode => handling(30, true),
+        SecretKind::HighEntropy => handling(2 * 60, false),
     }
 }
 
-const fn handling(seconds: u64, mask: SecretMask, memory_only: bool) -> SecretHandling {
+const fn handling(seconds: u64, memory_only: bool) -> SecretHandling {
     SecretHandling {
         ttl: Duration::from_secs(seconds),
-        mask,
         memory_only,
-        sync_allowed: false,
     }
 }
 
@@ -184,19 +190,13 @@ fn validate_update_fields(
         || expires_at_ms <= issued_at_ms
         || expires_at_ms.saturating_sub(issued_at_ms) > MAX_UPDATE_LIFETIME_MS
         || detector_ids.windows(2).any(|pair| pair[0] >= pair[1])
-        || detector_ids.iter().any(|id| !valid_detector_id(id))
+        || detector_ids
+            .iter()
+            .any(|id| !is_valid_identifier(id, MAX_DETECTOR_ID_BYTES))
     {
         return Err(DetectorUpdateError::Invalid);
     }
     Ok(())
-}
-
-fn valid_detector_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_DETECTOR_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn update_signing_bytes(
@@ -233,10 +233,8 @@ mod tests {
         let otp = handling_for_secret(SecretKind::OneTimePassword);
         let card = handling_for_secret(SecretKind::PaymentCard);
         assert!(otp.ttl < card.ttl);
-        assert_eq!(otp.mask, SecretMask::Grouped);
-        assert_eq!(card.mask, SecretMask::LastFour);
         assert!(otp.memory_only);
-        assert!(!card.sync_allowed);
+        assert!(!card.memory_only);
         assert_eq!(
             sensitivity_watermark(SensitivityReason::Entropy),
             "Masked: high entropy"

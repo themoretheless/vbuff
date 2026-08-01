@@ -14,7 +14,8 @@ use global_hotkey::GlobalHotKeyEvent;
 use vbuff_core::capture::SelfWriteLedger;
 use vbuff_core::onboarding::DefaultProfile;
 use vbuff_core::workflow::plain_text_clone;
-use vbuff_gui::{DeliveryCapabilities, PopupApp, SharedState};
+use vbuff_gui::{DeliveryCapabilities, PopupApp, SharedState, UiAction};
+use vbuff_platform::lifecycle::SessionContext;
 use vbuff_platform::{GlobalHotkeyBackend, HotkeyBackend, PastePermissionLevel};
 use vbuff_types::{
     CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CapturePauseReason, ClientIntent,
@@ -56,6 +57,9 @@ pub(crate) struct AppServices {
     pub(crate) paused: Arc<AtomicBool>,
     pub(crate) config: Config,
     pub(crate) self_writes: Arc<std::sync::Mutex<SelfWriteLedger>>,
+    /// The process session snapshot taken once in `main`; the event loop
+    /// passes it on rather than detecting the session a second time.
+    pub(crate) session: &'static SessionContext,
     pub(crate) strict_capture_blocked: bool,
     pub(crate) automatic_pause_reason: Option<CapturePauseReason>,
     pub(crate) hotkey_registered: bool,
@@ -168,6 +172,7 @@ impl Runtime {
             paused,
             config,
             self_writes,
+            session,
             strict_capture_blocked,
             automatic_pause_reason,
             hotkey_registered,
@@ -206,7 +211,7 @@ impl Runtime {
             });
         }
 
-        let paste = PasteCoordinator::system(self_writes);
+        let paste = PasteCoordinator::system(self_writes, session);
         let permission = paste.permission_check();
         if let Ok(mut state) = shared.lock() {
             state
@@ -239,6 +244,10 @@ impl Runtime {
         }
 
         let mut popup = PopupApp::new(Arc::clone(&shared));
+        // The GUI has no platform dependency of its own, so it is told what
+        // session it is running in instead of reading the environment behind
+        // the platform layer's back.
+        popup.set_session_environment(session.environment_label());
         popup.set_preferences(config.ui_preferences());
         popup.set_delivery_capabilities(DeliveryCapabilities {
             automatic_paste: false,
@@ -426,16 +435,8 @@ impl Runtime {
 
     fn handle(&mut self, command: AppCommand, ctx: &egui::Context) {
         match command {
+            AppCommand::Ui(action) => self.handle_ui_action(action, ctx),
             AppCommand::Show => self.show_popup(ctx, ShowOrigin::Unverified),
-            AppCommand::Paste(id) => self.start_paste(id, ctx),
-            AppCommand::PasteText { text, sensitive } => {
-                let sensitive = edited_text_requires_sensitive_write(&text, sensitive);
-                let flavors = [vbuff_types::Flavor::inline(
-                    "text/plain;charset=utf-8",
-                    text.into_bytes(),
-                )];
-                self.start_paste_flavors(&flavors, sensitive, ctx);
-            }
             #[cfg(feature = "tray")]
             AppCommand::CopyLatest => match self.history.latest() {
                 Ok(Some(clip)) => match self.paste.copy(&clip.flavors, clip.meta.sensitive) {
@@ -457,13 +458,34 @@ impl Runtime {
                     tracing::warn!("reading latest clip failed: {error}");
                 }
             },
-            AppCommand::SetPinned(id, pinned) => {
+            #[cfg(feature = "tray")]
+            AppCommand::RequestClearHistory => {
+                self.popup.request_clear_history_confirmation(ctx);
+            }
+            #[cfg(feature = "tray")]
+            AppCommand::ToggleAutostart => self.toggle_autostart(),
+        }
+    }
+
+    fn handle_ui_action(&mut self, action: UiAction, ctx: &egui::Context) {
+        match action {
+            UiAction::Paste(id) => self.start_paste(id, ctx),
+            UiAction::PasteText { text, sensitive } => {
+                let text = text.into_string();
+                let sensitive = edited_text_requires_sensitive_write(&text, sensitive);
+                let flavors = [vbuff_types::Flavor::inline(
+                    "text/plain;charset=utf-8",
+                    text.into_bytes(),
+                )];
+                self.start_paste_flavors(&flavors, sensitive, ctx);
+            }
+            UiAction::SetPinned(id, pinned) => {
                 if let Err(error) = self.history.set_pinned(id, pinned) {
                     self.notice(NoticeLevel::Error, "Couldn't update the pinned state");
                     tracing::warn!("updating pin failed: {error}");
                 }
             }
-            AppCommand::SetSessionProtected(id, protected) => {
+            UiAction::SetSessionProtected(id, protected) => {
                 if let Err(error) = self.history.set_session_protected(id, protected) {
                     self.notice(
                         NoticeLevel::Error,
@@ -481,7 +503,7 @@ impl Runtime {
                     );
                 }
             }
-            AppCommand::CreatePlainTextClone(id) => {
+            UiAction::CreatePlainTextClone(id) => {
                 let memory_only = self.history.is_memory_only(id);
                 let result = self
                     .history
@@ -506,15 +528,18 @@ impl Runtime {
                     }
                 }
             }
-            AppCommand::Delete(id) => match self.history.delete(id) {
+            UiAction::Delete(id) => match self.history.delete(id) {
                 Ok(()) => self.notice(NoticeLevel::Info, "Clip deleted"),
                 Err(error) => {
                     self.notice(NoticeLevel::Error, "Couldn't delete the clip");
                     tracing::warn!("deleting clip failed: {error}");
                 }
             },
-            AppCommand::RestoreClip(clip) => {
-                match self.history.restore(*clip, self.config.max_history) {
+            UiAction::RestoreClip(clip) => {
+                match self
+                    .history
+                    .restore(clip.into_clip(), self.config.max_history)
+                {
                     Ok(()) => self.notice(NoticeLevel::Info, "Clip restored"),
                     Err(error) => {
                         self.notice(NoticeLevel::Error, "Couldn't restore the clip");
@@ -522,11 +547,7 @@ impl Runtime {
                     }
                 }
             }
-            #[cfg(feature = "tray")]
-            AppCommand::RequestClearHistory => {
-                self.popup.request_clear_history_confirmation(ctx);
-            }
-            AppCommand::ClearHistory => match self.history.clear_history() {
+            UiAction::ClearHistory => match self.history.clear_history() {
                 Ok(()) => {
                     self.notice(
                         NoticeLevel::Info,
@@ -538,8 +559,8 @@ impl Runtime {
                     tracing::warn!("clearing history failed: {error}");
                 }
             },
-            AppCommand::TogglePause => self.toggle_pause(),
-            AppCommand::RecoverSkipped => {
+            UiAction::TogglePause => self.toggle_pause(),
+            UiAction::RecoverSkipped => {
                 if self.diagnostics.request_skipped_recovery() {
                     self.notice(NoticeLevel::Info, "Keeping the current clipboard locally");
                 } else {
@@ -549,7 +570,7 @@ impl Runtime {
                     );
                 }
             }
-            AppCommand::InstallStarterPack(pack) => {
+            UiAction::InstallStarterPack(pack) => {
                 let clips = crate::seed_pack::clips(pack);
                 match self.history.insert_many(&clips, self.config.max_history) {
                     Ok(()) => self.notice(NoticeLevel::Info, "Starter examples added locally"),
@@ -559,9 +580,9 @@ impl Runtime {
                     }
                 }
             }
-            AppCommand::ApplyDefaultProfile(profile) => self.apply_default_profile(profile),
-            AppCommand::SetLaunchAtLogin(enabled) => self.set_autostart(enabled),
-            AppCommand::SetUiPreferences {
+            UiAction::ApplyDefaultProfile(profile) => self.apply_default_profile(profile),
+            UiAction::SetLaunchAtLogin(enabled) => self.set_autostart(enabled),
+            UiAction::SetUiPreferences {
                 preferences,
                 reduced_motion_changed,
             } => {
@@ -575,20 +596,18 @@ impl Runtime {
                     tracing::warn!("saving interface settings failed: {error}");
                 }
             }
-            AppCommand::DismissHealthAlert => {
+            UiAction::DismissHealthAlert => {
                 if let Ok(mut state) = self.shared.lock() {
                     state.health_alert = None;
                 }
             }
-            AppCommand::DismissSizeBudgetAlert => {
+            UiAction::DismissSizeBudgetAlert => {
                 if let Ok(mut state) = self.shared.lock() {
                     state.size_budget_alert = None;
                 }
             }
-            #[cfg(feature = "tray")]
-            AppCommand::ToggleAutostart => self.toggle_autostart(),
-            AppCommand::DismissNotice => self.clear_notice(),
-            AppCommand::DismissHotkeyCoachmark => {
+            UiAction::DismissNotice => self.clear_notice(),
+            UiAction::DismissHotkeyCoachmark => {
                 self.config.hotkey_coachmark_seen = true;
                 if let Ok(mut state) = self.shared.lock() {
                     state.show_hotkey_coachmark = false;
@@ -600,11 +619,11 @@ impl Runtime {
             // Hide only ever hides the popup; the process exits solely via
             // an explicit Quit. The dismissed popup releases its confirmed
             // paste target so the next summon has to re-confirm it.
-            AppCommand::Hide => {
+            UiAction::Hide => {
                 self.paste.cancel_target();
                 self.popup.request_hide(ctx);
             }
-            AppCommand::Quit => {
+            UiAction::Quit => {
                 self.paste.cancel_target();
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

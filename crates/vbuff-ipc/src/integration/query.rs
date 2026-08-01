@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use vbuff_types::ContentKind;
+use vbuff_types::validation::is_valid_identifier;
 
 use super::IntegrationContractError;
 
@@ -139,14 +140,9 @@ pub fn rank_launcher_candidates(
         || request.query.contains('\0')
         || !(1..=100).contains(&request.limit)
         || candidates.len() > 10_000
-        || candidates.iter().any(|candidate| {
-            candidate.clip_id.is_empty()
-                || candidate.clip_id.len() > 128
-                || !candidate
-                    .clip_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        })
+        || candidates
+            .iter()
+            .any(|candidate| !is_valid_identifier(&candidate.clip_id, 128))
     {
         return Err(IntegrationContractError::InvalidField);
     }

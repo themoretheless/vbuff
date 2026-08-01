@@ -11,9 +11,16 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use vbuff_core::capture::{CaptureDecision, CaptureInput, CapturePolicy, SelectionSource};
 use vbuff_core::content_hash_from_flavors;
-use vbuff_types::{Body, Clip, ClipId, ConcealmentSignal, ProvenanceConfidence};
+use vbuff_types::validation::is_valid_identifier;
+use vbuff_types::{
+    Body, Clip, ClipId, ConcealmentSignal, ContentKind, GenerationCoherence, ProvenanceConfidence,
+    SelectionIntent,
+};
 
-use crate::{Result, Store, StoreError, duration_millis_i64, now_millis, raw_to_clip, row_to_clip};
+use crate::{
+    DeleteGuards, LEGAL_HOLD_BLOCKED, Result, Store, StoreError, clip_projection,
+    duration_millis_i64, now_millis, raw_to_clip, row_to_clip,
+};
 
 const MAX_COLLECTION_ID_BYTES: usize = 96;
 const MAX_COLLECTION_NAME_BYTES: usize = 160;
@@ -230,7 +237,7 @@ impl RestoreSelection {
         if self
             .import_ids
             .iter()
-            .any(|id| !valid_identifier(id) || !unique.insert(id))
+            .any(|id| !is_valid_identifier(id, MAX_COLLECTION_NAME_BYTES) || !unique.insert(id))
         {
             return Err(StoreError::Maintenance(
                 "restore selection contains an invalid or duplicate id".into(),
@@ -420,8 +427,7 @@ impl Store {
         };
         let sql = format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            SELECT {projection}
             FROM clips c
             JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
@@ -429,18 +435,14 @@ impl Store {
             ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC
             LIMIT ?2
             "#,
+            projection = clip_projection("c"),
         );
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(
             params![now_millis(), limit.min(MAX_EXPORT_CLIPS) as i64],
             row_to_clip,
         )?;
-        let mut clips = Vec::new();
-        for row in rows {
-            clips.push(raw_to_clip(row?)?);
-        }
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.hydrated_clips(rows)
     }
 
     /// Return the newest active clip by actual recency, independent of the
@@ -449,9 +451,9 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                r#"
-                SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                       c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+                &format!(
+                    r#"
+                SELECT {projection}
                 FROM clips c
                 JOIN clip_annotations a ON a.clip_id = c.id
                 WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
@@ -459,16 +461,13 @@ impl Store {
                 ORDER BY c.updated_at DESC, c.seq DESC
                 LIMIT 1
                 "#,
+                    projection = clip_projection("c"),
+                ),
                 [now_millis()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(row)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        row.map(|row| self.hydrated_clip(row)).transpose()
     }
 
     /// Fetch one non-expired clip by id from the authoritative repository.
@@ -476,26 +475,23 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite
+                &format!(
+                    r#"
+                SELECT {projection}
                 FROM clips
                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)
                 "#,
+                    projection = clip_projection("clips"),
+                ),
                 params![id.to_string_repr(), now_millis()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(row)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        row.map(|row| self.hydrated_clip(row)).transpose()
     }
 
     pub fn upsert_collection(&self, record: &CollectionRecord) -> Result<()> {
-        if !valid_identifier(&record.id)
+        if !is_valid_identifier(&record.id, MAX_COLLECTION_NAME_BYTES)
             || record.id.len() > MAX_COLLECTION_ID_BYTES
             || record.name.trim().is_empty()
             || record.name.len() > MAX_COLLECTION_NAME_BYTES
@@ -531,7 +527,9 @@ impl Store {
     pub fn set_collection(&self, id: ClipId, collection_id: Option<&str>) -> Result<()> {
         self.ensure_clip_exists(id)?;
         if let Some(collection_id) = collection_id {
-            if !valid_identifier(collection_id) || collection_id.len() > MAX_COLLECTION_ID_BYTES {
+            if !is_valid_identifier(collection_id, MAX_COLLECTION_NAME_BYTES)
+                || collection_id.len() > MAX_COLLECTION_ID_BYTES
+            {
                 return Err(StoreError::Maintenance("invalid collection id".into()));
             }
             let exists: bool = self.conn.query_row(
@@ -557,19 +555,18 @@ impl Store {
     ) -> Result<CollectionRetentionPreview> {
         let policy = self.collection_policy(collection_id)?;
         let bounded_limit = limit.min(10_000);
-        let mut statement = self.conn.prepare(
+        // Same protections `enforce_collection_retention` applies row by row,
+        // so the preview cannot promise a deletion the sweep will refuse.
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.updated_at, c.byte_size
-            FROM clips c
-            JOIN clip_annotations a ON a.clip_id = c.id
-            WHERE a.collection_id = ?1 AND a.legal_hold = 0
-              AND c.pinned = 0 AND c.favorite = 0
-              AND NOT EXISTS (
-                SELECT 1 FROM session_protected p WHERE p.clip_id = c.id
-              )
-            ORDER BY c.updated_at DESC, c.seq DESC
+            SELECT clips.id, clips.updated_at, clips.byte_size
+            FROM clips
+            JOIN clip_annotations a ON a.clip_id = clips.id
+            WHERE a.collection_id = ?1{guards}
+            ORDER BY clips.updated_at DESC, clips.seq DESC
             "#,
-        )?;
+            guards = DeleteGuards::SWEEP.sql(),
+        ))?;
         let rows = statement.query_map([collection_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -618,48 +615,42 @@ impl Store {
         let preview = self.collection_retention_preview(collection_id, limit)?;
         let transaction = self.conn.unchecked_transaction()?;
         for id in &preview.clip_ids {
-            crate::ensure_delete_eligible(&transaction, *id, true)?;
-            let deleted = transaction.execute(
-                r#"
-                DELETE FROM clips
-                WHERE id = ?1 AND pinned = 0 AND favorite = 0
-                  AND EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id
-                      AND annotations.collection_id = ?2
-                      AND annotations.legal_hold = 0
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM temp.session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                "#,
+            // The protections come from the one `DeleteGuards` set every
+            // deletion path shares; the collection predicate is this sweep's
+            // own, and it is re-checked here because the preview ran before
+            // this transaction opened and the clip may have left the
+            // collection since.
+            transaction.execute(
+                &format!(
+                    r#"
+                    DELETE FROM clips
+                    WHERE clips.id = ?1
+                      AND EXISTS (
+                        SELECT 1 FROM clip_annotations AS annotations
+                        WHERE annotations.clip_id = clips.id
+                          AND annotations.collection_id = ?2
+                      ){guards}
+                    "#,
+                    guards = DeleteGuards::SWEEP.sql(),
+                ),
                 params![id.to_string_repr(), collection_id],
             )?;
-            if deleted != 1 {
-                crate::ensure_delete_eligible(&transaction, *id, true)?;
-                return Err(StoreError::Maintenance(
-                    "collection retention eligibility changed".into(),
-                ));
-            }
         }
         transaction.commit()?;
-        if !preview.clip_ids.is_empty() {
-            self.scrub_deleted_pages()?;
-        }
         Ok(preview)
     }
 
     pub fn attachment_manifest(&self, id: ClipId) -> Result<AttachmentManifest> {
+        // Deliberately unhydrated: the manifest describes how flavors are
+        // *stored*, so it must see the `Spilled` bodies rather than the
+        // payloads `hydrated_clip` would inline in their place.
         let (raw, derived_index_present) = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite,
-                       item_text != ''
-                FROM clips WHERE id = ?1
-                "#,
+                &format!(
+                    "SELECT {projection}, item_text != '' FROM clips WHERE id = ?1",
+                    projection = clip_projection("clips"),
+                ),
                 [id.to_string_repr()],
                 |row| Ok((row_to_clip(row)?, row.get::<_, i64>(11)? != 0)),
             )
@@ -745,7 +736,8 @@ impl Store {
         };
         for (blob_ref, kind, byte_size) in references {
             report.checked += 1;
-            let kind = super::kind_from_int(kind);
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
             if cas.verify(kind, &blob_ref, byte_size).is_ok() {
                 report.healthy += 1;
                 continue;
@@ -756,7 +748,7 @@ impl Store {
                 INSERT OR REPLACE INTO blob_quarantine(hash, kind, quarantined_at, reason)
                 VALUES (?1, ?2, ?3, 'integrity verification failed')
                 "#,
-                params![blob_ref, super::kind_to_int(kind), now_millis()],
+                params![blob_ref, kind.stored_discriminant(), now_millis()],
             )?;
             report.quarantined += 1;
         }
@@ -1076,7 +1068,7 @@ impl Store {
     }
 
     pub fn reject_import(&self, import_id: &str) -> Result<bool> {
-        if !valid_identifier(import_id) {
+        if !is_valid_identifier(import_id, MAX_COLLECTION_NAME_BYTES) {
             return Err(StoreError::Maintenance("invalid import id".into()));
         }
         let deleted = self.conn.execute(
@@ -1132,8 +1124,50 @@ impl Store {
         Ok(output)
     }
 
+    /// Strict form used by explicit deletes: a missing clip is `ClipNotFound`
+    /// and a held clip is an error the caller must show the user.
+    ///
+    /// A clip row with no annotation row is neither: every clip is inserted
+    /// with its annotation sidecar in the same transaction, so a clip that has
+    /// lost it is a corrupt store, and deleting through a hold that can no
+    /// longer be read would be exactly the wrong way to fail.
     pub(crate) fn ensure_not_legal_hold(&self, id: ClipId) -> Result<()> {
-        crate::ensure_delete_eligible(&self.conn, id, false)
+        let held = self
+            .conn
+            .query_row(
+                "SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1",
+                [id.to_string_repr()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match held {
+            None if self.clip_row_exists(id)? => Err(StoreError::Corrupt(
+                "clip annotation row is missing".into(),
+            )),
+            None => Err(StoreError::ClipNotFound(id.to_string_repr())),
+            Some(0) => Ok(()),
+            Some(_) => Err(StoreError::Maintenance(LEGAL_HOLD_BLOCKED.into())),
+        }
+    }
+
+    fn clip_row_exists(&self, id: ClipId) -> Result<bool> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+            [id.to_string_repr()],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Lenient form used by background sweeps: a clip that is already gone is
+    /// not held, because there is nothing left to protect.
+    pub(crate) fn legal_hold_active(&self, id: ClipId) -> Result<bool> {
+        let held: i64 = self.conn.query_row(
+            "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1), 0)",
+            [id.to_string_repr()],
+            |row| row.get(0),
+        )?;
+        Ok(held != 0)
     }
 
     fn ensure_clip_exists(&self, id: ClipId) -> Result<()> {
@@ -1177,21 +1211,19 @@ impl Store {
             .conn
             .prepare("SELECT hash, kind FROM blob_refs WHERE refcount > 0")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                super::kind_from_int(row.get::<_, i64>(1)?),
-                row.get::<_, String>(0)?,
-            ))
+            Ok((row.get::<_, i64>(1)?, row.get::<_, String>(0)?))
         })?;
-        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+        // Fail closed on unknown discriminants so orphan sweeps never treat a
+        // corrupt reference as "not live" and delete the file it points at.
+        let mut live = HashSet::new();
+        for row in rows {
+            let (kind, blob_ref) = row?;
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            live.insert((kind, blob_ref));
+        }
+        Ok(live)
     }
-}
-
-fn valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_COLLECTION_NAME_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn valid_mime(value: &str) -> bool {
@@ -1217,8 +1249,10 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
         flavors: &clip.flavors,
         provenance: &clip.meta.provenance,
         source: SelectionSource::Clipboard,
-        primary_intended: true,
-        coherent_generation: true,
+        // An import never observed a clipboard read at all, so it has no
+        // intent or coherence evidence to report.
+        intent: SelectionIntent::Unknown,
+        coherence: GenerationCoherence::Unknown,
         concealment: ConcealmentSignal::Unknown,
         provenance_confidence: ProvenanceConfidence::Unknown,
         self_write: false,
@@ -1250,15 +1284,11 @@ fn sanitize_import_privacy(mut clip: Clip) -> Result<Clip> {
     // evidence the capturing backend did not supply.
     clip.meta.provenance_confidence = ProvenanceConfidence::Unknown;
     if sensitive {
-        clip.meta.sensitive = true;
         clip.meta.sensitivity_reason = sensitivity_reason.or(clip.meta.sensitivity_reason);
         let detected_expiry = expires_after
             .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
             .map(|ttl| Utc::now() + ttl);
-        clip.meta.expires_at = match (clip.meta.expires_at, detected_expiry) {
-            (Some(imported), Some(detected)) => Some(imported.min(detected)),
-            (imported, detected) => imported.or(detected),
-        };
+        crate::tighten_sensitive(&mut clip.meta, detected_expiry);
     }
     Ok(clip)
 }
@@ -1444,8 +1474,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut declared = clip("no detectable secret here");
         declared.meta.sensitive = true;
-        declared.meta.sensitivity_reason =
-            Some(vbuff_types::SensitivityReason::CaptureRule);
+        declared.meta.sensitivity_reason = Some(vbuff_types::SensitivityReason::CaptureRule);
         declared.meta.sync_eligible = false;
 
         assert!(store.stage_import(&declared, "backup.json").is_err());
@@ -1476,8 +1505,12 @@ mod tests {
     #[test]
     fn stale_import_quarantine_entries_are_purged_and_become_unavailable() {
         let store = Store::open_in_memory().unwrap();
-        let fresh_id = store.stage_import(&clip("fresh import"), "backup.json").unwrap();
-        let stale_id = store.stage_import(&clip("stale import"), "backup.json").unwrap();
+        let fresh_id = store
+            .stage_import(&clip("fresh import"), "backup.json")
+            .unwrap();
+        let stale_id = store
+            .stage_import(&clip("stale import"), "backup.json")
+            .unwrap();
         // Age one entry beyond the quarantine TTL.
         store
             .conn

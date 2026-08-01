@@ -187,6 +187,19 @@ pub struct CapabilityView {
     pub severity: CapabilityViewSeverity,
 }
 
+/// Which OS selection a snapshot came from.
+///
+/// Owned here because both the platform backends (which read the selection)
+/// and the capture gate (which reasons about it) need the same vocabulary,
+/// and neither crate depends on the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    #[default]
+    Clipboard,
+    Primary,
+}
+
 /// Classification of one content-free capture decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

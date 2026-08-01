@@ -9,6 +9,13 @@ description = "Plain data model shared across vbuff crates."
 serde.workspace = true
 ulid.workspace = true
 chrono.workspace = true
+# Only for `mac`, the one MAC primitive every crate's HMAC mechanisms share.
+# Most consumers already link both through vbuff-core, but vbuff-platform does
+# not (it depends on vbuff-core only for tests), so for that crate these are
+# genuinely new production dependencies. Accepted deliberately: one audited MAC
+# builder is worth more than keeping a leaf crate two crates lighter.
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

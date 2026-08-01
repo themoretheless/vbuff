@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use egui::{Color32, Key, RichText, Stroke, TextureHandle, ViewportCommand};
 use vbuff_core::compose::{MergeTemplate, PasteStack, PasteStackItemId, merge_text};
 use vbuff_core::feedback::FeedbackEnvironment;
@@ -39,8 +39,8 @@ use crate::experience::{
     snap_ui_scale_percent,
 };
 use crate::navigation::PopupSurface;
-use crate::projection::{FilteredClip, clip_is_expired, filter_clips};
-use crate::state::{SharedState, StarterPack, UiAction};
+use crate::projection::{FilteredClip, ProjectionCache, clip_is_expired};
+use crate::state::{ClipText, RestoredClip, SharedState, StarterPack, UiAction};
 use crate::view::{relative_time, short_app_name};
 
 const QUERY_COMPLETION_ACCEPT_KEYS: [Key; 2] = [Key::Tab, Key::ArrowRight];
@@ -172,8 +172,15 @@ pub struct PopupApp {
     action_flyout: Option<ClipId>,
     undo_slot: Option<UndoSlot>,
     expanded_duplicates: HashSet<ClipId>,
+    /// Memoized history projection; see [`ProjectionCache`] for the key.
+    projection_cache: ProjectionCache,
     last_announcement_revision: u64,
     preview_clip_id: Option<ClipId>,
+    /// Content-free session label supplied by the composition layer. The GUI
+    /// deliberately does not probe the environment itself: the platform layer
+    /// owns session detection, and a second reading here is exactly how the
+    /// feedback report and `doctor` would start naming different sessions.
+    session_environment: String,
 }
 
 impl PopupApp {
@@ -217,8 +224,10 @@ impl PopupApp {
             action_flyout: None,
             undo_slot: None,
             expanded_duplicates: HashSet::new(),
+            projection_cache: ProjectionCache::default(),
             last_announcement_revision: 0,
             preview_clip_id: None,
+            session_environment: "unknown".into(),
         }
     }
 
@@ -319,6 +328,13 @@ impl PopupApp {
         self.delivery = capabilities;
     }
 
+    /// Name the session the composition layer detected, for feedback reports.
+    ///
+    /// Must stay content-free: it is copied verbatim into an issue draft.
+    pub fn set_session_environment(&mut self, environment: impl Into<String>) {
+        self.session_environment = environment.into();
+    }
+
     /// Open the popup directly on the composition scratchpad.
     pub fn request_compose_view(&mut self, ctx: &egui::Context) {
         self.show(ctx);
@@ -345,13 +361,23 @@ impl PopupApp {
     }
 
     /// Build the current filtered view of clips.
-    fn filtered(&self, clips: &[Clip]) -> Vec<FilteredClip> {
-        filter_clips(
+    ///
+    /// `now` is passed in rather than read here so that one frame's projection
+    /// and its clip index agree on a single instant, and so the memoization in
+    /// [`ProjectionCache`] has an explicit clock to key on.
+    fn filtered(
+        &mut self,
+        clips: &[Clip],
+        revision: u64,
+        now: DateTime<Utc>,
+    ) -> Arc<[FilteredClip]> {
+        self.projection_cache.projection(
             clips,
+            revision,
             &self.query,
             &self.history_scope,
             &self.expanded_duplicates,
-            Utc::now(),
+            now,
         )
     }
 }
@@ -515,7 +541,11 @@ impl eframe::App for PopupApp {
         };
 
         // 4. Compute the filtered list and preserve selection by stable id.
-        let filtered = self.filtered(&clips);
+        // One clock for the whole frame: the projection and the clip index
+        // below both drop expired clips, and reading the wall clock twice let
+        // a clip expire between them and vanish from one but not the other.
+        let projection_now = Utc::now();
+        let filtered = self.filtered(&clips, revision, projection_now);
         let total = filtered.len();
         if let Some(previous_id) = self.preview_clip_id {
             self.selected = filtered
@@ -770,7 +800,6 @@ impl eframe::App for PopupApp {
         }
 
         // 6. Render the panel.
-        let projection_now = Utc::now();
         let clip_by_id: HashMap<ClipId, &Clip> = clips
             .iter()
             .filter(|clip| !clip_is_expired(clip, projection_now))
@@ -2384,7 +2413,7 @@ impl PopupApp {
                                         .clicked()
                                         {
                                             self.actions.push_back(UiAction::PasteText {
-                                                text: text.clone(),
+                                                text: ClipText::new(text.clone()),
                                                 sensitive: false,
                                             });
                                         }
@@ -2477,7 +2506,7 @@ impl PopupApp {
                 .clicked()
             {
                 self.actions.push_back(UiAction::PasteText {
-                    text: merged.clone(),
+                    text: ClipText::new(merged.clone()),
                     sensitive: false,
                 });
             }
@@ -2496,7 +2525,7 @@ impl PopupApp {
             version: env!("CARGO_PKG_VERSION").into(),
             os: std::env::consts::OS.into(),
             architecture: std::env::consts::ARCH.into(),
-            session: std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+            session: self.session_environment.clone(),
             capabilities: capabilities
                 .iter()
                 .map(|capability| {
@@ -2709,7 +2738,7 @@ impl PopupApp {
                 .clicked()
             {
                 self.actions.push_back(UiAction::PasteText {
-                    text: output,
+                    text: ClipText::new(output),
                     sensitive: false,
                 });
             }
@@ -2839,7 +2868,7 @@ impl PopupApp {
                             self.actions.push_back(UiAction::Paste(clip.id));
                         } else {
                             self.actions.push_back(UiAction::PasteText {
-                                text: output,
+                                text: ClipText::new(output),
                                 sensitive: clip.meta.sensitive,
                             });
                         }
@@ -2974,7 +3003,9 @@ impl PopupApp {
             UndoAction::Stack { item_id, .. } => {
                 let _ = self.paste_stack.remove(item_id);
             }
-            UndoAction::Delete(clip) => self.actions.push_back(UiAction::RestoreClip(clip)),
+            UndoAction::Delete(clip) => self
+                .actions
+                .push_back(UiAction::RestoreClip(RestoredClip::new(clip))),
         }
     }
 
@@ -4003,7 +4034,10 @@ mod tests {
         app.apply_undo();
 
         let actions = app.take_actions();
-        assert_eq!(actions, vec![UiAction::RestoreClip(Box::new(clip))]);
+        assert_eq!(
+            actions,
+            vec![UiAction::RestoreClip(RestoredClip::new(Box::new(clip)))]
+        );
         assert!(!format!("{actions:?}").contains("private deleted value"));
     }
 

@@ -1,8 +1,11 @@
 //! Plain data model for vbuff.
 //!
-//! This crate holds only the serializable data types shared by every other
-//! crate (core logic, storage, GUI, platform). It deliberately avoids heavy
-//! dependencies so it can be linked everywhere cheaply.
+//! This crate holds the serializable data types shared by every other crate
+//! (core logic, storage, GUI, platform). It deliberately avoids heavy
+//! dependencies so it can be linked everywhere cheaply. The one exception is
+//! [`mac`], which owns the workspace's single HMAC primitive: it has to sit
+//! below every crate that authenticates something, and its `hmac`/`sha2`
+//! dependencies are already linked by all of them through `vbuff-core`.
 #![forbid(unsafe_code)]
 //!
 //! The central type is [`Clip`]: one logical copy event that may carry several
@@ -11,8 +14,11 @@
 //! over its canonical flavor bytes (see `vbuff-core`).
 
 mod ipc;
+pub mod mac;
+pub mod replay;
 mod rgba;
 mod status;
+pub mod validation;
 
 use std::fmt;
 
@@ -29,7 +35,7 @@ pub use status::{
     CapabilityView, CapabilityViewLevel, CapabilityViewSeverity, CaptureBudgetAlert, CaptureHealth,
     CapturePauseReason, CaptureSessionStats, ClipboardHealthDigest, CommandNotice, NoticeLevel,
     PrivacyDecisionLevel, PrivacyEventSummary, PrivacyLedgerSummary, SecurityPostureLevel,
-    SecurityPostureSummary, SloMetricState, SloStatusSummary,
+    SecurityPostureSummary, SelectionSource, SloMetricState, SloStatusSummary,
 };
 
 /// A ULID-based identifier for a clip.
@@ -136,6 +142,121 @@ impl ContentKind {
             ContentKind::Other => "Other",
         }
     }
+
+    /// Every kind, in stored-discriminant order.
+    ///
+    /// This is the single authoritative enumeration of all kinds; iterate it
+    /// instead of hand-writing variant lists. Adding a variant fails
+    /// compilation in [`Self::stored_discriminant`] and [`Self::slug`]
+    /// (exhaustive matches, no wildcard), and the `content_kind_all_covers_every_variant`
+    /// test guard then forces this list to be extended.
+    pub const ALL: &'static [ContentKind] = &[
+        ContentKind::Text,
+        ContentKind::Rtf,
+        ContentKind::Html,
+        ContentKind::Image,
+        ContentKind::File,
+        ContentKind::Color,
+        ContentKind::Url,
+        ContentKind::Code,
+        ContentKind::Other,
+    ];
+
+    /// The stable integer persisted for this kind (SQLite `clips.kind` and
+    /// every other stored surface that records a content kind numerically).
+    ///
+    /// # Stability contract
+    ///
+    /// These numbers are an on-disk database format, not an implementation
+    /// detail:
+    ///
+    /// - never change the number of an existing variant;
+    /// - never reuse a number after removing a variant;
+    /// - a new variant takes the next unused number.
+    ///
+    /// The mapping intentionally differs from the Rust declaration order: it
+    /// preserves the order in which kinds were first persisted. SQL that
+    /// hard-codes a kind (for example `kind = 7` for [`ContentKind::Code`] in
+    /// the snippet FTS triggers) relies on these exact values.
+    pub const fn stored_discriminant(self) -> i64 {
+        match self {
+            ContentKind::Text => 0,
+            ContentKind::Rtf => 1,
+            ContentKind::Html => 2,
+            ContentKind::Image => 3,
+            ContentKind::File => 4,
+            ContentKind::Color => 5,
+            ContentKind::Url => 6,
+            ContentKind::Code => 7,
+            ContentKind::Other => 8,
+        }
+    }
+
+    /// Decode a discriminant read back from storage.
+    ///
+    /// Fail-closed: unknown values return `None` instead of degrading to
+    /// [`ContentKind::Other`]. `Other` is a real stored value (8), not a
+    /// fallback; silently mapping unknown numbers onto it would mask database
+    /// corruption. Callers decide how to surface the failure (skip the row,
+    /// report corruption, and so on).
+    ///
+    /// Implemented as a scan over [`Self::ALL`] so there is no numeric
+    /// wildcard that could silently swallow a newly added variant.
+    pub fn from_stored_discriminant(value: i64) -> Option<Self> {
+        ContentKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.stored_discriminant() == value)
+    }
+
+    /// The stable lowercase ASCII slug for this kind, used in on-disk paths
+    /// (content-addressed storage shard directories) and policy files.
+    ///
+    /// Same stability contract as [`Self::stored_discriminant`]: slugs are a
+    /// persisted format; never rename one.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            ContentKind::Text => "text",
+            ContentKind::Url => "url",
+            ContentKind::Color => "color",
+            ContentKind::Code => "code",
+            ContentKind::Image => "image",
+            ContentKind::File => "file",
+            ContentKind::Rtf => "rtf",
+            ContentKind::Html => "html",
+            ContentKind::Other => "other",
+        }
+    }
+}
+
+/// Error returned when parsing an unrecognized [`ContentKind`] slug.
+///
+/// Deliberately carries no copy of the rejected input so it can never leak
+/// clipboard-adjacent data through logs or error chains.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseContentKindError;
+
+impl fmt::Display for ParseContentKindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown content kind slug")
+    }
+}
+
+impl std::error::Error for ParseContentKindError {}
+
+impl std::str::FromStr for ContentKind {
+    type Err = ParseContentKindError;
+
+    /// Parses the canonical [`slug`](ContentKind::slug) form, exact match
+    /// (lowercase, no surrounding whitespace). Callers that accept user input
+    /// should normalize case themselves before parsing.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ContentKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.slug() == s)
+            .ok_or(ParseContentKindError)
+    }
 }
 
 /// Non-secret explanation for why a clip is masked and restricted.
@@ -219,6 +340,50 @@ pub enum ConcealmentSignal {
     /// The backend affirmatively observed no concealment marker.
     Clear,
     /// The backend cannot read concealment markers. Fail-closed default.
+    #[default]
+    Unknown,
+}
+
+/// Whether one clipboard read saw a single, stable clipboard generation.
+///
+/// Three states for the same reason as [`ConcealmentSignal`]: the legacy
+/// boolean had no way to say "this backend cannot observe owner/generation
+/// identity", so that case was reported as `true` — an affirmative claim of
+/// coherence nobody verified, which then travelled on into the capture gate
+/// and the forensic ring as if it were evidence.
+/// [`GenerationCoherence::Unknown`] keeps "held stable" and "nobody could
+/// look" apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationCoherence {
+    /// The backend held the clipboard owner/generation stable while every
+    /// flavor was materialized.
+    Coherent,
+    /// The backend observed the owner or generation change mid-read: the
+    /// flavor set may splice two different copies.
+    Torn,
+    /// The backend cannot observe owner/generation identity. Fail-closed
+    /// default.
+    #[default]
+    Unknown,
+}
+
+/// Whether a selection change carried evidence of deliberate user intent.
+///
+/// Only consulted for [`SelectionSource::Primary`]: the X11/Wayland PRIMARY
+/// selection changes on every mouse drag, so capturing it without positive
+/// intent evidence records text the user never copied. The legacy boolean
+/// reported "no evidence either way" as `true`, i.e. as an observed intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionIntent {
+    /// The backend observed a deliberate copy: the selection settled and an
+    /// intent signal (gesture, key, ownership dwell) was seen.
+    Intended,
+    /// The backend affirmatively observed no intent signal — an incidental
+    /// selection.
+    Incidental,
+    /// The backend cannot observe intent signals. Fail-closed default.
     #[default]
     Unknown,
 }
@@ -587,6 +752,8 @@ mod tests {
             ProvenanceConfidence::Unknown
         );
         assert_eq!(ConcealmentSignal::default(), ConcealmentSignal::Unknown);
+        assert_eq!(GenerationCoherence::default(), GenerationCoherence::Unknown);
+        assert_eq!(SelectionIntent::default(), SelectionIntent::Unknown);
         assert_eq!(
             serde_json::to_string(&ProvenanceConfidence::Proven).unwrap(),
             r#""proven""#
@@ -599,6 +766,121 @@ mod tests {
             serde_json::from_str::<ConcealmentSignal>(r#""clear""#).unwrap(),
             ConcealmentSignal::Clear
         );
+        assert_eq!(
+            serde_json::to_string(&GenerationCoherence::Torn).unwrap(),
+            r#""torn""#
+        );
+        assert_eq!(
+            serde_json::from_str::<GenerationCoherence>(r#""coherent""#).unwrap(),
+            GenerationCoherence::Coherent
+        );
+        assert_eq!(
+            serde_json::to_string(&SelectionIntent::Incidental).unwrap(),
+            r#""incidental""#
+        );
+        assert_eq!(
+            serde_json::from_str::<SelectionIntent>(r#""intended""#).unwrap(),
+            SelectionIntent::Intended
+        );
+    }
+
+    #[test]
+    fn content_kind_discriminant_roundtrips_for_every_kind() {
+        for &kind in ContentKind::ALL {
+            assert_eq!(
+                ContentKind::from_stored_discriminant(kind.stored_discriminant()),
+                Some(kind)
+            );
+        }
+    }
+
+    #[test]
+    fn content_kind_discriminants_and_slugs_are_pinned_database_format() {
+        // These exact pairs are the on-disk format (SQLite `clips.kind`,
+        // retention rows, CAS shard directories). Renumbering or renaming is
+        // a breaking schema change; this test must only ever gain lines.
+        let pinned: [(ContentKind, i64, &str); 9] = [
+            (ContentKind::Text, 0, "text"),
+            (ContentKind::Rtf, 1, "rtf"),
+            (ContentKind::Html, 2, "html"),
+            (ContentKind::Image, 3, "image"),
+            (ContentKind::File, 4, "file"),
+            (ContentKind::Color, 5, "color"),
+            (ContentKind::Url, 6, "url"),
+            (ContentKind::Code, 7, "code"),
+            (ContentKind::Other, 8, "other"),
+        ];
+        for (kind, number, slug) in pinned {
+            assert_eq!(kind.stored_discriminant(), number);
+            assert_eq!(kind.slug(), slug);
+        }
+    }
+
+    #[test]
+    fn content_kind_unknown_discriminant_fails_closed() {
+        for value in [-1, 9, 42, 255, i64::MIN, i64::MAX] {
+            assert_eq!(ContentKind::from_stored_discriminant(value), None);
+        }
+    }
+
+    #[test]
+    fn content_kind_slug_roundtrips_via_from_str() {
+        for &kind in ContentKind::ALL {
+            assert_eq!(kind.slug().parse::<ContentKind>(), Ok(kind));
+        }
+    }
+
+    #[test]
+    fn content_kind_from_str_rejects_unknown_and_non_canonical() {
+        for input in ["", "TEXT", "texts", " text", "text ", "unknown", "7"] {
+            assert_eq!(
+                input.parse::<ContentKind>(),
+                Err(ParseContentKindError),
+                "input {input:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn content_kind_all_covers_every_variant() {
+        // Compile-time anchor: adding a ContentKind variant makes this match
+        // non-exhaustive and fails the build, forcing ALL (and thereby the
+        // discriminant and slug codecs) to be extended in the same change.
+        for &kind in ContentKind::ALL {
+            match kind {
+                ContentKind::Text
+                | ContentKind::Url
+                | ContentKind::Color
+                | ContentKind::Code
+                | ContentKind::Image
+                | ContentKind::File
+                | ContentKind::Rtf
+                | ContentKind::Html
+                | ContentKind::Other => {}
+            }
+        }
+        // Every variant appears in ALL exactly once.
+        for probe in [
+            ContentKind::Text,
+            ContentKind::Url,
+            ContentKind::Color,
+            ContentKind::Code,
+            ContentKind::Image,
+            ContentKind::File,
+            ContentKind::Rtf,
+            ContentKind::Html,
+            ContentKind::Other,
+        ] {
+            assert_eq!(
+                ContentKind::ALL
+                    .iter()
+                    .filter(|kind| **kind == probe)
+                    .count(),
+                1,
+                "{probe:?} must appear in ContentKind::ALL exactly once"
+            );
+        }
+        assert_eq!(ContentKind::ALL.len(), 9);
     }
 
     #[test]
@@ -607,7 +889,10 @@ mod tests {
         let json = serde_json::to_value(&meta).unwrap();
         // Simulate a database row written before the field existed.
         let mut older = json.clone();
-        older.as_object_mut().unwrap().remove("provenance_confidence");
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance_confidence");
         let restored: ClipMeta = serde_json::from_value(older).unwrap();
         assert_eq!(
             restored.provenance_confidence,

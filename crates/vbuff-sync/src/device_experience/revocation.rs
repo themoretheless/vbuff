@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_DEVICE_ID_BYTES, MAX_PLAN_ITEMS, valid_identifier};
+use vbuff_types::validation::is_valid_identifier;
+
+use super::{MAX_DEVICE_ID_BYTES, MAX_PLAN_ITEMS};
 use crate::crypto::{SealedEnvelope, seal_to};
 use crate::{Result, SyncError};
 
@@ -33,10 +35,10 @@ pub fn sealed_revocation_tombstones(
     issued_at_ms: u64,
     recipient_public_key: &[u8; 32],
 ) -> Result<SealedEnvelope> {
-    if !valid_identifier(target_device_id, MAX_DEVICE_ID_BYTES)
+    if !is_valid_identifier(target_device_id, MAX_DEVICE_ID_BYTES)
         || item_ids.is_empty()
         || item_ids.len() > MAX_PLAN_ITEMS
-        || item_ids.iter().any(|item| !valid_identifier(item, 128))
+        || item_ids.iter().any(|item| !is_valid_identifier(item, 128))
     {
         return Err(SyncError::Invalid("invalid revocation plan".into()));
     }

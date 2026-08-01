@@ -25,6 +25,7 @@ use vbuff_core::fingerprint::{
     fingerprint_bands, hamming_distance, simhash64,
 };
 use vbuff_core::intelligence::{AiGate, AiOperation};
+use vbuff_types::validation::is_valid_identifier;
 use vbuff_types::{
     CaptureGeneration, CaptureLineage, CaptureProvenance, Clip, ClipId, ClipMeta,
     ClipboardHealthDigest, ContentKind, Flavor, SensitivityReason,
@@ -63,6 +64,14 @@ pub const DATA_CONTRACT_V2_SCHEMA_VERSION: i64 = 6;
 
 /// The current schema version, stored in `PRAGMA user_version`.
 pub const SCHEMA_VERSION: i64 = 7;
+
+/// Discriminant of [`ContentKind::Code`] as it appears in SQL text (the FTS
+/// code-mirror predicate `kind = 7`). Sourced from the canonical codec so it
+/// cannot drift from [`ContentKind::stored_discriminant`]. The v7 trigger
+/// bodies in `Store::apply_migrations` keep the literal spelled out because
+/// trigger text persists verbatim in `sqlite_master` of existing databases;
+/// `schema_bakes_canonical_code_discriminant` pins the two together.
+const CODE_KIND_SQL: i64 = ContentKind::Code.stored_discriminant();
 
 /// Hard expiry ceiling applied at insert time to sensitive clips that carry
 /// no TTL of their own, so persistable secret classes never live in the
@@ -130,6 +139,148 @@ pub struct SensitiveClawbackReport {
     pub reclassified: usize,
 }
 
+/// The single wording every path uses when a legal hold blocks a deletion.
+const LEGAL_HOLD_BLOCKED: &str = "clip is under legal hold; release it before deletion";
+
+/// Which "do not delete me" promises a deletion path honours, and how it
+/// reports a row it may not touch.
+///
+/// Every removal of a row from `clips` goes through [`Store::delete_clip_row`]
+/// or [`Store::delete_clips_where`] carrying one of the constants below, and
+/// the selection queries that *preview* a deletion reuse the same predicate
+/// via [`DeleteGuards::sql`]. The paths genuinely differ - that is the product
+/// contract in `docs/data-contract-v3.md`, not drift - so the differences live
+/// in named fields here instead of in re-typed SQL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteGuards {
+    /// Refuse to remove a clip under legal hold. False on exactly one path:
+    /// the documented "hard privacy expiry retains precedence" exemption.
+    legal_hold: bool,
+    /// Keep clips this session protected (a paste is in flight against them).
+    session_protected: bool,
+    /// Keep pinned clips.
+    pinned: bool,
+    /// Keep favorites.
+    favorite: bool,
+    /// The caller named this exact clip, so a guard that blocks the delete is
+    /// an error it must see. Background sweeps instead leave the row in place
+    /// and account for it, because failing a maintenance tick over one
+    /// protected row would stall every other eviction behind it.
+    explicit: bool,
+}
+
+impl DeleteGuards {
+    /// One clip the user asked to delete by id: [`Store::delete`], the
+    /// `Delete` batch mutation and [`Store::delete_with_grace`]. A pin or a
+    /// favorite is not a veto here - the user picked this exact row - but a
+    /// legal hold is, and the error says so.
+    pub(crate) const EXPLICIT: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: true,
+    };
+
+    /// Automatic eviction: retention rules, the count cap and collection
+    /// policies. Every protection applies and a protected row is silently
+    /// left behind rather than failing the sweep.
+    pub(crate) const SWEEP: Self = Self {
+        legal_hold: true,
+        session_protected: true,
+        pinned: true,
+        favorite: true,
+        explicit: false,
+    };
+
+    /// [`Store::clear`]: drop the history the user can see. Pinned rows and
+    /// this session's protected rows survive; favorites do not, because a
+    /// favorite is a sort hint while a pin is a keep-this promise.
+    pub(crate) const CLEAR: Self = Self {
+        legal_hold: true,
+        session_protected: true,
+        pinned: true,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// [`Store::clear_all`]: the explicit "delete everything" command. Pin,
+    /// favorite and session protection all yield to it; only a legal hold
+    /// survives.
+    pub(crate) const CLEAR_ALL: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// Integrity quarantine in [`Store::audit_content_hashes`]. This is not an
+    /// eviction, so pin, favorite and session protection do not apply - but a
+    /// legal hold does: quarantine keeps only id/kind/byte_size/sensitive, so
+    /// running it on a held clip would destroy exactly the bytes the hold
+    /// promised to keep. Held collisions are reported instead.
+    pub(crate) const QUARANTINE: Self = Self {
+        legal_hold: true,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// [`Store::purge_expired`]: the hard privacy TTL, and the one documented
+    /// path that outranks a legal hold ("hard privacy expiry retains
+    /// precedence", `docs/data-contract-v3.md`). A hold must not be able to
+    /// convert a time-boxed capture into indefinite retention. Nothing else
+    /// may clear `legal_hold`.
+    pub(crate) const HARD_PRIVACY_EXPIRY: Self = Self {
+        legal_hold: false,
+        session_protected: false,
+        pinned: false,
+        favorite: false,
+        explicit: false,
+    };
+
+    /// The `AND ...` predicate keeping guarded rows alive.
+    ///
+    /// Written against the `clips` table under its own name, so it composes
+    /// with any statement that reaches clip rows as `clips`: the bulk
+    /// `DELETE`s, the retention candidate query, and the collection retention
+    /// preview all share this one text.
+    pub(crate) fn sql(self) -> String {
+        let mut predicate = String::new();
+        if self.pinned {
+            predicate.push_str(" AND clips.pinned = 0");
+        }
+        if self.favorite {
+            predicate.push_str(" AND clips.favorite = 0");
+        }
+        if self.session_protected {
+            predicate.push_str(
+                " AND NOT EXISTS (
+                    SELECT 1 FROM session_protected AS protected
+                    WHERE protected.clip_id = clips.id
+                  )",
+            );
+        }
+        if self.legal_hold {
+            // Stated as "an unheld annotation row exists" rather than "no held
+            // row exists": every clip is inserted with its annotation sidecar
+            // in the same transaction, so a clip missing one is a corrupt
+            // store, and the `NOT EXISTS` form would read that as "not held"
+            // and delete it. Fail closed and leave the row for the integrity
+            // check to report.
+            predicate.push_str(
+                " AND EXISTS (
+                    SELECT 1 FROM clip_annotations AS annotations
+                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
+                  )",
+            );
+        }
+        predicate
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchCursor {
     pub pinned: bool,
@@ -154,6 +305,10 @@ pub struct ContentAuditReport {
     pub checked: usize,
     pub repaired: usize,
     pub quarantined: usize,
+    /// Rows whose hash collides with another clip but that are under legal
+    /// hold. Quarantine would remove the row, so the audit reports them
+    /// instead: an operator has to release the hold before they can be fixed.
+    pub held: usize,
 }
 
 #[derive(Serialize)]
@@ -749,15 +904,10 @@ impl Store {
                 ],
             )?;
         }
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             r#"
             UPDATE clips
-            SET preview = '[sensitive]', item_text = '',
-                simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
-                simhash_b2 = NULL, simhash_b3 = NULL,
-                dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                dhash_b2 = NULL, dhash_b3 = NULL,
-                normalized_hash = NULL
+            SET {SENSITIVE_SCRUB_SET}
             WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1;
             DELETE FROM clip_facets
             WHERE clip_id IN (
@@ -769,8 +919,8 @@ impl Store {
                 SELECT content_hash FROM clips
                 WHERE COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1
             );
-            "#,
-        )?;
+            "#
+        ))?;
         conn.execute(
             r#"
             UPDATE clips SET item_text = preview
@@ -783,22 +933,22 @@ impl Store {
             r#"
             SELECT (SELECT COUNT(*) FROM clip_fts_prose) = (SELECT COUNT(*) FROM clips)
                AND (SELECT COUNT(*) FROM clip_fts_code) =
-                   (SELECT COUNT(*) FROM clips WHERE kind = 7)
+                   (SELECT COUNT(*) FROM clips WHERE kind = ?1)
             "#,
-            [],
+            params![CODE_KIND_SQL],
             |row| row.get(0),
         )?;
         if !fts_in_sync {
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 r#"
                 DELETE FROM clip_fts_prose;
                 DELETE FROM clip_fts_code;
                 INSERT INTO clip_fts_prose(rowid, item_text)
                     SELECT seq, item_text FROM clips;
                 INSERT INTO clip_fts_code(rowid, item_text)
-                    SELECT seq, item_text FROM clips WHERE kind = 7;
-                "#,
-            )?;
+                    SELECT seq, item_text FROM clips WHERE kind = {CODE_KIND_SQL};
+                "#
+            ))?;
         }
         conn.execute_batch(
             r#"
@@ -853,8 +1003,9 @@ impl Store {
         let transaction = self.conn.unchecked_transaction()?;
         let count = pending.len();
         for (id, kind, item_text, flavors_json) in pending {
-            let simhash = (kind != kind_to_int(ContentKind::Image)).then(|| simhash64(&item_text));
-            let dhash = if kind == kind_to_int(ContentKind::Image) {
+            let image_kind = ContentKind::Image.stored_discriminant();
+            let simhash = (kind != image_kind).then(|| simhash64(&item_text));
+            let dhash = if kind == image_kind {
                 let flavors = serde_clip::flavors_from_json(&flavors_json)?;
                 let byte_size = flavors.iter().map(|flavor| flavor.body.byte_size()).sum();
                 let clip = Clip {
@@ -906,10 +1057,9 @@ impl Store {
         if limit == 0 {
             return Ok(0);
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                   byte_size, source_app, metadata_json, pinned, favorite
+            SELECT {projection}
             FROM clips
             WHERE normalized_hash IS NULL
               AND kind IN (0, 1, 2, 5, 6, 7)
@@ -918,15 +1068,14 @@ impl Store {
             ORDER BY updated_at DESC, seq DESC
             LIMIT ?2
             "#,
-        )?;
+            projection = clip_projection("clips"),
+        ))?;
         let rows = statement.query_map(params![now_millis(), limit as i64], row_to_clip)?;
-        let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let clips = self.hydrated_clips(rows)?;
         drop(statement);
 
-        let mut pending = Vec::with_capacity(raw.len());
-        for row in raw {
-            let mut clip = raw_to_clip(row)?;
-            self.hydrate_clip(&mut clip)?;
+        let mut pending = Vec::with_capacity(clips.len());
+        for clip in clips {
             let fingerprint = clip
                 .primary_text()
                 .and_then(lifecycle::normalized_text_fingerprint)
@@ -1003,17 +1152,8 @@ impl Store {
             };
         }
         if effective_meta.sensitive {
-            effective_meta.sync_eligible = false;
-            effective_meta.ai_allowed = false;
-            // Sensitive rows without an explicit TTL still expire: a hard
-            // ceiling keeps persistable secret classes from living in the
-            // plaintext database indefinitely. This covers both the fresh
-            // INSERT and the dedup-bump path below.
-            if effective_meta.expires_at.is_none() {
-                let ceiling = chrono::Duration::from_std(SENSITIVE_TTL_CEILING)
-                    .unwrap_or_else(|_| chrono::Duration::days(1));
-                effective_meta.expires_at = Some(chrono::Utc::now() + ceiling);
-            }
+            // Covers both the fresh INSERT and the dedup-bump path below.
+            tighten_sensitive(&mut effective_meta, None);
         }
         let metadata_json = serde_json::to_string(&StoredMetadata::from(&effective_meta))?;
         let expires_at = effective_meta
@@ -1159,7 +1299,7 @@ impl Store {
                 clip.id.to_string_repr(),
                 clip.content_hash.as_slice(),
                 flavors_json,
-                kind_to_int(clip.meta.kind),
+                clip.meta.kind.stored_discriminant(),
                 created,
                 updated,
                 clip.meta.byte_size as i64,
@@ -1231,10 +1371,9 @@ impl Store {
         if fingerprint.len() != 32 {
             return Ok(Vec::new());
         }
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            SELECT {projection}
             FROM clips AS c
             JOIN clip_annotations AS a ON a.clip_id = c.id
             WHERE c.normalized_hash = ?1 AND a.archived = 0
@@ -1243,14 +1382,13 @@ impl Store {
             ORDER BY c.updated_at DESC, c.seq DESC
             LIMIT ?3
             "#,
-        )?;
+            projection = clip_projection("c"),
+        ))?;
         let rows = statement.query_map(
             params![fingerprint, now_millis(), limit.clamp(1, 512) as i64],
             row_to_clip,
         )?;
-        let mut clips = collect_clips(rows)?;
-        self.hydrate_clips(&mut clips)?;
-        Ok(clips)
+        self.hydrated_clips(rows)
     }
 
     /// Return the newest exact-dedup events for one canonical clip.
@@ -1501,39 +1639,30 @@ impl Store {
             remaining_candidates,
             ..RetentionReport::default()
         };
-        let mut deleted_any = false;
         for (id, grace_window) in candidates {
             let id = ClipId::parse(&id)
                 .map_err(|_| StoreError::Corrupt("bad ulid in retention query".into()))?;
             if grace_window.is_zero() {
-                let changed = self.conn.execute(
-                    r#"
-                    DELETE FROM clips
-                    WHERE id = ?1 AND pinned = 0 AND favorite = 0
-                      AND EXISTS (
-                        SELECT 1 FROM clip_annotations AS annotations
-                        WHERE annotations.clip_id = clips.id
-                          AND annotations.legal_hold = 0
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM session_protected AS protected
-                        WHERE protected.clip_id = clips.id
-                      )
-                    "#,
-                    [id.to_string_repr()],
-                )?;
-                report.hard_deleted += changed;
-                deleted_any |= changed > 0;
+                // `SWEEP` re-checks the protections the candidate query already
+                // applied: between selection and deletion a clip can be pinned,
+                // protected or put on hold, and the sweep must lose that race.
+                report.hard_deleted += self.delete_clip_row(&self.conn, id, DeleteGuards::SWEEP)?;
             } else if let Some(key) = grace_key {
-                self.delete_with_grace_inner(id, key, grace_window, DeletionReason::Retention)?;
-                report.encrypted += 1;
-                deleted_any = true;
+                if self
+                    .delete_with_grace_inner(
+                        id,
+                        key,
+                        grace_window,
+                        DeletionReason::Retention,
+                        DeleteGuards::SWEEP,
+                    )?
+                    .is_some()
+                {
+                    report.encrypted += 1;
+                }
             } else {
                 report.deferred_without_key += 1;
             }
-        }
-        if deleted_any {
-            self.scrub_deleted_pages()?;
         }
         Ok(report)
     }
@@ -1563,10 +1692,11 @@ impl Store {
                 .borrow()
                 .use_fts(row_count, &parsed.text);
         let started = Instant::now();
-        let mut sql = String::from(
+        // `c.seq` is column 11, past the shared projection: it feeds the
+        // pagination cursor, not the `Clip`.
+        let mut sql = format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.seq
+            SELECT {projection}, c.seq
             FROM clips c
             JOIN clip_annotations a ON a.clip_id = c.id
             WHERE (c.expires_at IS NULL OR c.expires_at > ? OR EXISTS (
@@ -1576,6 +1706,7 @@ impl Store {
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
               AND a.archived = 0
             "#,
+            projection = clip_projection("c"),
         );
         let mut values = vec![Value::Integer(now_millis())];
 
@@ -1689,10 +1820,10 @@ impl Store {
         } else {
             String::new()
         };
+        // The fingerprint lands at column 11, past the shared projection.
         let sql = format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite, c.{column}
+            SELECT {projection}, c.{column}
             FROM clips AS c
             JOIN clip_annotations AS a ON a.clip_id = c.id
             WHERE c.{column} IS NOT NULL
@@ -1701,7 +1832,8 @@ impl Store {
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
               {band_filter}
             ORDER BY c.updated_at DESC, c.seq DESC
-            "#
+            "#,
+            projection = clip_projection("c"),
         );
         let mut statement = self.conn.prepare(&sql)?;
         let mut values = vec![Value::Integer(now_millis())];
@@ -1718,10 +1850,11 @@ impl Store {
         let mut matches = Vec::new();
         for row in rows {
             let (raw, candidate) = row?;
+            // Hydrated one at a time on purpose: the band filter is only a
+            // prefilter, so most scanned rows are discarded here and never
+            // need their CAS payload read.
             if hamming_distance(fingerprint, candidate) <= max_distance {
-                let mut clip = raw_to_clip(raw)?;
-                self.hydrate_clip(&mut clip)?;
-                matches.push(clip);
+                matches.push(self.hydrated_clip(raw)?);
                 if matches.len() == limit {
                     break;
                 }
@@ -1735,6 +1868,23 @@ impl Store {
             self.hydrate_clip(clip)?;
         }
         Ok(())
+    }
+
+    /// Decode and hydrate one row of the [`clip_projection`] SELECT list.
+    pub(crate) fn hydrated_clip(&self, raw: RawRow) -> Result<Clip> {
+        let mut clip = raw_to_clip(raw)?;
+        self.hydrate_clip(&mut clip)?;
+        Ok(clip)
+    }
+
+    /// Decode and hydrate a whole [`clip_projection`] result set.
+    pub(crate) fn hydrated_clips(
+        &self,
+        rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawRow>>,
+    ) -> Result<Vec<Clip>> {
+        let mut clips = collect_clips(rows)?;
+        self.hydrate_clips(&mut clips)?;
+        Ok(clips)
     }
 
     fn hydrate_clip(&self, clip: &mut Clip) -> Result<()> {
@@ -1914,11 +2064,13 @@ impl Store {
         )?;
         let missing_code = query_count(
             &self.conn,
-            r#"
+            &format!(
+                r#"
             SELECT COUNT(*) FROM clips AS c
             LEFT JOIN clip_fts_code AS f ON f.rowid = c.seq
-            WHERE c.kind = 7 AND f.rowid IS NULL
-            "#,
+            WHERE c.kind = {CODE_KIND_SQL} AND f.rowid IS NULL
+            "#
+            ),
         )?;
         let orphan_prose = query_count(
             &self.conn,
@@ -1930,11 +2082,13 @@ impl Store {
         )?;
         let orphan_code = query_count(
             &self.conn,
-            r#"
+            &format!(
+                r#"
             SELECT COUNT(*) FROM clip_fts_code AS f
-            LEFT JOIN clips AS c ON c.seq = f.rowid AND c.kind = 7
+            LEFT JOIN clips AS c ON c.seq = f.rowid AND c.kind = {CODE_KIND_SQL}
             WHERE c.seq IS NULL
-            "#,
+            "#
+            ),
         )?;
         let dirty: i64 = self.conn.query_row(
             "SELECT value FROM maintenance_state WHERE key = 'fts_dirty'",
@@ -1981,6 +2135,16 @@ impl Store {
     }
 
     /// Reclassify a bounded set of historical structural secrets.
+    ///
+    /// This runs unattended from idle maintenance and is destructive: a
+    /// matched row loses its search projection, its similarity hashes, its
+    /// facets and its embeddings, and gains a forced expiry. It therefore
+    /// asks [`MIN_RECLASSIFY_CONFIDENCE`], not the capture-time floor - the
+    /// weakest detector (`HighEntropy`) fires on ordinary URLs and Windows
+    /// paths, and retroactively shredding a clip the user has been living
+    /// with is not a mistake worth making on that evidence.
+    ///
+    /// [`MIN_RECLASSIFY_CONFIDENCE`]: vbuff_core::secret::MIN_RECLASSIFY_CONFIDENCE
     pub fn clawback_sensitive(
         &self,
         limit: usize,
@@ -2032,30 +2196,26 @@ impl Store {
         };
         for (_, id, metadata_json, item_text) in candidates {
             let detected = vbuff_core::secret::detect_secrets(&item_text)
-                .iter()
-                .any(|finding| finding.confidence >= 0.9);
+                .into_iter()
+                .any(vbuff_core::secret::SecretFinding::justifies_reclassification);
             if !detected {
                 continue;
             }
             let mut metadata: StoredMetadata = serde_json::from_str(&metadata_json)?;
-            metadata.sensitive = true;
-            metadata.sync_eligible = Some(false);
-            metadata.ai_allowed = false;
-            metadata.expires_at = Some(expires_at);
+            // The clawback TTL is a proposal, not an override: a row that
+            // already expires sooner keeps its shorter lifetime.
+            tighten_sensitive(&mut metadata, Some(expires_at));
+            let row_expiry = metadata.expires_at.unwrap_or(expires_at);
             transaction.execute(
-                r#"
-                UPDATE clips SET metadata_json = ?1, expires_at = ?2,
-                    preview = '[sensitive]', item_text = '',
-                    simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL,
-                    simhash_b2 = NULL, simhash_b3 = NULL,
-                    dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL,
-                    dhash_b2 = NULL, dhash_b3 = NULL,
-                    normalized_hash = NULL
+                &format!(
+                    r#"
+                UPDATE clips SET metadata_json = ?1, expires_at = ?2, {SENSITIVE_SCRUB_SET}
                 WHERE id = ?3
-                "#,
+                "#
+                ),
                 params![
                     serde_json::to_string(&metadata)?,
-                    expires_at.timestamp_millis(),
+                    row_expiry.timestamp_millis(),
                     id
                 ],
             )?;
@@ -2098,7 +2258,9 @@ impl Store {
         let dead = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for (blob_ref, kind) in &dead {
-            cas.remove(kind_from_int(*kind), blob_ref)?;
+            let kind = ContentKind::from_stored_discriminant(*kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            cas.remove(kind, blob_ref)?;
         }
         self.conn
             .execute("DELETE FROM blob_refs WHERE refcount = 0", [])?;
@@ -2106,12 +2268,18 @@ impl Store {
             .conn
             .prepare("SELECT hash, kind FROM blob_refs WHERE refcount > 0")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                kind_from_int(row.get::<_, i64>(1)?),
-                row.get::<_, String>(0)?,
-            ))
+            Ok((row.get::<_, i64>(1)?, row.get::<_, String>(0)?))
         })?;
-        let live = rows.collect::<rusqlite::Result<HashSet<_>>>()?;
+        // Fail closed on unknown discriminants: guessing a kind here would
+        // both look for the blob under the wrong directory and let orphan
+        // removal delete a file that a corrupt row still references.
+        let mut live = HashSet::new();
+        for row in rows {
+            let (kind, blob_ref) = row?;
+            let kind = ContentKind::from_stored_discriminant(kind)
+                .ok_or_else(|| StoreError::Corrupt("unknown content kind in blob_refs".into()))?;
+            live.insert((kind, blob_ref));
+        }
         drop(statement);
         let orphans = cas.remove_orphans(&live)?;
         Ok(dead.len() + orphans)
@@ -2119,20 +2287,19 @@ impl Store {
 
     /// Recompute a rolling sample and repair or quarantine hash mismatches.
     pub fn audit_content_hashes(&self, limit: usize) -> Result<ContentAuditReport> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at,
-                   c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite
+            SELECT {projection}
             FROM clips c
             LEFT JOIN content_audit a ON a.clip_id = c.id
             ORDER BY COALESCE(a.checked_at, 0) ASC, c.seq ASC
             LIMIT ?1
             "#,
-        )?;
+            projection = clip_projection("c"),
+        ))?;
         let rows = statement.query_map(params![limit as i64], row_to_clip)?;
-        let mut candidates = collect_clips(rows)?;
+        let candidates = self.hydrated_clips(rows)?;
         drop(statement);
-        self.hydrate_clips(&mut candidates)?;
 
         let mut report = ContentAuditReport::default();
         let transaction = self.conn.unchecked_transaction()?;
@@ -2158,6 +2325,25 @@ impl Store {
                 )
                 .optional()?;
             if let Some(conflict_id) = conflict {
+                // Quarantine removes the live row and keeps only
+                // id/kind/byte_size/sensitive, so it destroys exactly what a
+                // legal hold promises to keep. Attempt the removal through the
+                // shared primitive and let it make that call.
+                if self.delete_clip_row(&transaction, clip.id, DeleteGuards::QUARANTINE)? == 0 {
+                    // Only the hold can block `QUARANTINE`. Record the row as
+                    // checked anyway: the audit orders by `checked_at`, so
+                    // leaving it unmarked would park the rolling window on a
+                    // clip nothing is allowed to fix.
+                    transaction.execute(
+                        r#"
+                        INSERT INTO content_audit(clip_id, checked_at) VALUES (?1, ?2)
+                        ON CONFLICT(clip_id) DO UPDATE SET checked_at = excluded.checked_at
+                        "#,
+                        params![clip.id.to_string_repr(), now_millis()],
+                    )?;
+                    report.held += 1;
+                    continue;
+                }
                 let row_json = serde_json::to_string(&QuarantineRecord {
                     id: clip.id.to_string_repr(),
                     kind: clip.meta.kind,
@@ -2176,14 +2362,6 @@ impl Store {
                         format!("content hash conflicts with {conflict_id}"),
                         row_json,
                     ],
-                )?;
-                transaction.execute(
-                    "DELETE FROM clips WHERE id = ?1",
-                    params![clip.id.to_string_repr()],
-                )?;
-                transaction.execute(
-                    "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-                    params![clip.id.to_string_repr()],
                 )?;
                 report.quarantined += 1;
             } else {
@@ -2237,32 +2415,38 @@ impl Store {
         window: Duration,
         reason: DeletionReason,
     ) -> Result<String> {
-        self.ensure_not_legal_hold(id)?;
         self.purge_grace_bin()?;
-        self.delete_with_grace_inner(id, key, window, reason)
+        self.delete_with_grace_inner(id, key, window, reason, DeleteGuards::EXPLICIT)?
+            .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))
     }
 
+    /// Seal one clip into the grace bin and remove its live row.
+    ///
+    /// `guards` is what separates the two callers: the public API deletes a
+    /// clip the user named ([`DeleteGuards::EXPLICIT`]), while retention
+    /// evicts on a schedule and must lose to every protection
+    /// ([`DeleteGuards::SWEEP`]). Returns `None` when a guard kept the row -
+    /// the sealed record is discarded with the rolled-back transaction.
     fn delete_with_grace_inner(
         &self,
         id: ClipId,
         key: &[u8; 32],
         window: Duration,
         reason: DeletionReason,
-    ) -> Result<String> {
+        guards: DeleteGuards,
+    ) -> Result<Option<String>> {
         let window_ms = duration_millis_i64(window)?;
         if window_ms == 0 || window > Duration::from_secs(7 * 24 * 60 * 60) {
             return Err(StoreError::Maintenance(
                 "grace-bin window must be between 1 ms and 7 days".into(),
             ));
         }
-        let require_retention_guards = reason != DeletionReason::User;
-        ensure_delete_eligible(&self.conn, id, require_retention_guards)?;
-        let mut clip = self
+        // `load_clip_by_id` hydrates, which matters here: the CAS payloads have
+        // to be inline before their live reference is removed, so the encrypted
+        // recovery record stays self-contained.
+        let clip = self
             .load_clip_by_id(id)?
             .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))?;
-        // Hydrate CAS payloads before their live reference is removed so the
-        // encrypted recovery record is self-contained.
-        self.hydrate_clip(&mut clip)?;
         let deleted_at = now_millis();
         let purge_after = deleted_at
             .checked_add(window_ms)
@@ -2287,44 +2471,11 @@ impl Store {
                 ciphertext,
             ],
         )?;
-        let delete_sql = if require_retention_guards {
-            r#"
-            DELETE FROM clips
-            WHERE id = ?1 AND pinned = 0 AND favorite = 0
-              AND EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id
-                  AND annotations.legal_hold = 0
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM temp.session_protected AS protected
-                WHERE protected.clip_id = clips.id
-              )
-            "#
-        } else {
-            r#"
-            DELETE FROM clips
-            WHERE id = ?1 AND EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id
-                  AND annotations.legal_hold = 0
-            )
-            "#
-        };
-        let deleted = transaction.execute(delete_sql, [id.to_string_repr()])?;
-        if deleted != 1 {
-            ensure_delete_eligible(&transaction, id, require_retention_guards)?;
-            return Err(StoreError::Maintenance(
-                "clip deletion eligibility changed".into(),
-            ));
+        if self.delete_clip_row(&transaction, id, guards)? != 1 {
+            return Ok(None);
         }
-        transaction.execute(
-            "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-            [id.to_string_repr()],
-        )?;
         transaction.commit()?;
-        self.scrub_deleted_pages()?;
-        Ok(recovery_id)
+        Ok(Some(recovery_id))
     }
 
     /// List unexpired encrypted recovery records without decrypting content.
@@ -2431,21 +2582,15 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                r#"
-                SELECT id, content_hash, flavors, kind, created_at, updated_at,
-                       byte_size, source_app, metadata_json, pinned, favorite
-                FROM clips WHERE id = ?1
-                "#,
+                &format!(
+                    "SELECT {projection} FROM clips WHERE id = ?1",
+                    projection = clip_projection("clips"),
+                ),
                 [id.to_string_repr()],
                 row_to_clip,
             )
             .optional()?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let mut clip = raw_to_clip(raw)?;
-        self.hydrate_clip(&mut clip)?;
-        Ok(Some(clip))
+        raw.map(|raw| self.hydrated_clip(raw)).transpose()
     }
 
     fn retention_candidates(
@@ -2456,32 +2601,26 @@ impl Store {
     ) -> Result<Vec<String>> {
         rule.validate()?;
         let (kind, sensitive) = rule.scope.database_values();
+        // Same protections the eviction itself applies, so the preview and the
+        // delete can never disagree about which rows are eligible.
+        let guards = DeleteGuards::SWEEP.sql();
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         if let Some(max_age) = rule.max_age {
             let cutoff = now
                 .checked_sub(duration_millis_i64(max_age)?)
                 .ok_or_else(|| StoreError::Maintenance("retention cutoff overflow".into()))?;
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare(&format!(
                 r#"
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                  AND EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
-                  )
-                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                SELECT clips.id FROM clips
+                WHERE ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
                         AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
-                  AND updated_at < ?3
+                  AND updated_at < ?3{guards}
                 ORDER BY updated_at ASC, seq ASC
                 LIMIT ?4
                 "#,
-            )?;
+            ))?;
             let rows = statement.query_map(
                 params![sensitive as i64, kind, cutoff, limit as i64],
                 |row| row.get::<_, String>(0),
@@ -2496,25 +2635,16 @@ impl Store {
         if let Some(max_items) = rule.max_items
             && candidates.len() < limit
         {
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare(&format!(
                 r#"
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                  AND EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
-                  )
-                  AND ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
+                SELECT clips.id FROM clips
+                WHERE ((?1 = 1 AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 1)
                     OR (?1 = 0 AND kind = ?2
-                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0))
+                        AND COALESCE(json_extract(metadata_json, '$.sensitive'), 0) = 0)){guards}
                 ORDER BY updated_at DESC, seq DESC
                 LIMIT ?3 OFFSET ?4
                 "#,
-            )?;
+            ))?;
             let rows = statement.query_map(
                 params![
                     sensitive as i64,
@@ -2534,10 +2664,84 @@ impl Store {
         Ok(candidates)
     }
 
+    /// Remove one clip row: the single row-scoped deletion primitive.
+    ///
+    /// Every public single-clip deletion funnels through here, so the legal
+    /// hold decision, the `session_protected` bookkeeping and the WAL dirty
+    /// marker cannot be forgotten by a new caller. `conn` is the caller's
+    /// transaction where there is one, so the marker rolls back with it.
+    ///
+    /// Returns the number of rows removed: `0` when a guard kept the row and
+    /// `guards.explicit` is false.
+    fn delete_clip_row(
+        &self,
+        conn: &Connection,
+        id: ClipId,
+        guards: DeleteGuards,
+    ) -> Result<usize> {
+        if guards.legal_hold {
+            if guards.explicit {
+                // Explicit deletes must say why nothing happened; this also
+                // keeps `ClipNotFound` for an id that is already gone.
+                self.ensure_not_legal_hold(id)?;
+            } else if self.legal_hold_active(id)? {
+                return Ok(0);
+            }
+        }
+        let deleted = conn.execute(
+            &format!("DELETE FROM clips WHERE clips.id = ?1{}", guards.sql()),
+            [id.to_string_repr()],
+        )?;
+        if deleted > 0 {
+            conn.execute(
+                "DELETE FROM temp.session_protected WHERE clip_id = ?1",
+                [id.to_string_repr()],
+            )?;
+            self.scrub_deleted_pages_on(conn)?;
+        }
+        Ok(deleted)
+    }
+
+    /// Remove every clip matching `scope`: the single bulk deletion primitive.
+    ///
+    /// `scope` is the caller's own predicate over `clips`; the protections in
+    /// `guards` are appended here so no bulk path can forget one. When
+    /// `order_limit` is present it caps the sweep, and it is applied to the
+    /// *guarded* set so a protected row can never consume the budget.
+    fn delete_clips_where(
+        &self,
+        scope: &str,
+        order_limit: Option<&str>,
+        values: &[Value],
+        guards: DeleteGuards,
+    ) -> Result<usize> {
+        let predicate = format!("{scope}{}", guards.sql());
+        let sql = match order_limit {
+            None => format!("DELETE FROM clips WHERE {predicate}"),
+            Some(tail) => format!(
+                "DELETE FROM clips WHERE clips.id IN (
+                    SELECT clips.id FROM clips WHERE {predicate} {tail}
+                 )"
+            ),
+        };
+        let deleted = self.conn.execute(&sql, params_from_iter(values.iter()))?;
+        if deleted > 0 {
+            if !guards.session_protected {
+                // Only a sweep allowed to remove a protected row can leave an
+                // orphaned `session_protected` entry behind.
+                self.conn.execute(
+                    "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
+                    [],
+                )?;
+            }
+            self.scrub_deleted_pages()?;
+        }
+        Ok(deleted)
+    }
+
     /// Apply all mutations in one SQLite transaction or roll every one back.
     pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction()?;
-        let mut deleted = false;
         for mutation in mutations {
             let (id, changed) = match *mutation {
                 StoreMutation::SetPinned { id, pinned } => (
@@ -2554,145 +2758,65 @@ impl Store {
                         params![favorite as i64, id.to_string_repr()],
                     )?,
                 ),
-                StoreMutation::Delete { id } => {
-                    ensure_delete_eligible(&transaction, id, false)?;
-                    deleted = true;
-                    let changed = transaction.execute(
-                        r#"
-                        DELETE FROM clips
-                        WHERE id = ?1 AND EXISTS (
-                            SELECT 1 FROM clip_annotations AS annotations
-                            WHERE annotations.clip_id = clips.id
-                              AND annotations.legal_hold = 0
-                        )
-                        "#,
-                        [id.to_string_repr()],
-                    )?;
-                    if changed != 1 {
-                        ensure_delete_eligible(&transaction, id, false)?;
-                        return Err(StoreError::Maintenance(
-                            "clip deletion eligibility changed".into(),
-                        ));
-                    }
-                    transaction.execute(
-                        "DELETE FROM temp.session_protected WHERE clip_id = ?1",
-                        [id.to_string_repr()],
-                    )?;
-                    (id, changed)
-                }
+                StoreMutation::Delete { id } => (
+                    id,
+                    self.delete_clip_row(&transaction, id, DeleteGuards::EXPLICIT)?,
+                ),
             };
             if changed != 1 {
                 return Err(StoreError::ClipNotFound(id.to_string_repr()));
             }
         }
         transaction.commit()?;
-        if deleted {
-            self.scrub_deleted_pages()?;
-        }
         Ok(mutations.len())
     }
 
     /// Delete a single clip by id.
     pub fn delete(&self, id: ClipId) -> Result<()> {
-        self.ensure_not_legal_hold(id)?;
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE id = ?1 AND EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id
-                  AND annotations.legal_hold = 0
-            )
-            "#,
-            params![id.to_string_repr()],
-        )?;
-        if deleted != 1 {
-            ensure_delete_eligible(&self.conn, id, false)?;
-            return Err(StoreError::Maintenance(
-                "clip deletion eligibility changed".into(),
-            ));
-        }
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id = ?1",
-            params![id.to_string_repr()],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clip_row(&self.conn, id, DeleteGuards::EXPLICIT)?;
         Ok(())
     }
 
     /// Delete every non-pinned, non-held, non-session-protected clip.
     pub fn clear(&self) -> Result<()> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE pinned = 0
-              AND EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM session_protected AS protected
-                WHERE protected.clip_id = clips.id
-              )
-            "#,
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clips_where("1 = 1", None, &[], DeleteGuards::CLEAR)?;
         Ok(())
     }
 
     /// Delete every non-held clip, including pinned and session-protected ones.
     pub fn clear_all(&self) -> Result<()> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE EXISTS (
-                SELECT 1 FROM clip_annotations AS annotations
-                WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
-            )
-            "#,
-            [],
-        )?;
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
+        self.delete_clips_where("1 = 1", None, &[], DeleteGuards::CLEAR_ALL)?;
         Ok(())
     }
 
-    /// Total number of stored clips.
+    /// Total number of stored clips that have not passed their hard expiry.
+    ///
+    /// Read-only by construction: expired rows are filtered by the query
+    /// rather than deleted first, so counting works on a connection opened
+    /// read-only (the doctor path) and never takes a write lock. Deletion of
+    /// expired rows stays with [`Store::purge_expired`], which runs on insert
+    /// and on the idle maintenance tick.
     pub fn count(&self) -> Result<usize> {
-        self.purge_expired()?;
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM clips WHERE expires_at IS NULL OR expires_at > ?1",
+            params![now_millis()],
+            |row| row.get(0),
+        )?;
         Ok(n as usize)
     }
 
     /// Delete clips whose hard privacy TTL elapsed, including pinned rows.
+    ///
+    /// This is the one deletion path that outranks a legal hold - see
+    /// [`DeleteGuards::HARD_PRIVACY_EXPIRY`]. A hold must not be able to turn
+    /// a time-boxed capture into indefinite retention.
     pub fn purge_expired(&self) -> Result<usize> {
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips
-            WHERE expires_at IS NOT NULL AND expires_at <= ?1
-            "#,
-            params![now_millis()],
-        )?;
-        self.conn.execute(
-            "DELETE FROM session_protected WHERE clip_id NOT IN (SELECT id FROM clips)",
-            [],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
-        Ok(deleted)
+        self.delete_clips_where(
+            "clips.expires_at IS NOT NULL AND clips.expires_at <= ?1",
+            None,
+            &[Value::Integer(now_millis())],
+            DeleteGuards::HARD_PRIVACY_EXPIRY,
+        )
     }
 
     /// Persist one capture-path outcome without retaining clipboard content.
@@ -2730,43 +2854,21 @@ impl Store {
 
     /// Enforce a count cap, deleting oldest non-pinned/non-favorite clips first.
     ///
-    /// Returns the number of clips evicted. This mirrors the policy in
-    /// [`vbuff_core::eviction::evict`] but is implemented directly in SQL so a
-    /// cap enforcement never has to load the full `Clip` rows (flavor bytes
-    /// included) into memory just to compute which ids to drop. The two
-    /// implementations are kept honest against each other by
-    /// `enforce_cap_matches_pure_eviction_policy` below rather than merged,
-    /// since merging would force this hot path back through an in-memory
-    /// `Vec<Clip>` fetch.
+    /// Returns the number of clips evicted. The policy is implemented directly
+    /// in SQL so a cap enforcement never has to load the full `Clip` rows
+    /// (flavor bytes included) into memory just to compute which ids to drop.
     pub fn enforce_cap(&self, max_history: usize) -> Result<usize> {
         let total = self.count()?;
         if total <= max_history {
             return Ok(0);
         }
         let overflow = total - max_history;
-        let deleted = self.conn.execute(
-            r#"
-            DELETE FROM clips WHERE id IN (
-                SELECT id FROM clips
-                WHERE pinned = 0 AND favorite = 0
-                  AND EXISTS (
-                    SELECT 1 FROM clip_annotations AS annotations
-                    WHERE annotations.clip_id = clips.id AND annotations.legal_hold = 0
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM session_protected AS protected
-                    WHERE protected.clip_id = clips.id
-                  )
-                ORDER BY updated_at ASC, seq ASC
-                LIMIT ?1
-            )
-            "#,
-            params![overflow as i64],
-        )?;
-        if deleted > 0 {
-            self.scrub_deleted_pages()?;
-        }
-        Ok(deleted)
+        self.delete_clips_where(
+            "1 = 1",
+            Some("ORDER BY clips.updated_at ASC, clips.seq ASC LIMIT ?1"),
+            &[Value::Integer(overflow as i64)],
+            DeleteGuards::SWEEP,
+        )
     }
 
     /// Mark the WAL as needing a scrub after one or more deletions.
@@ -2777,7 +2879,13 @@ impl Store {
     /// runs later, from [`Store::scrub_wal_if_dirty`], so a busy checkpoint
     /// can no longer turn an already-committed delete into a spurious error.
     fn scrub_deleted_pages(&self) -> Result<()> {
-        self.conn.execute(
+        self.scrub_deleted_pages_on(&self.conn)
+    }
+
+    /// Same marker, written through the caller's transaction so it rolls back
+    /// with the deletion that raised it.
+    fn scrub_deleted_pages_on(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
             "UPDATE maintenance_state SET value = value + 1 WHERE key = 'pending_wal_scrub'",
             [],
         )?;
@@ -2938,6 +3046,37 @@ fn collect_clips(
     Ok(out)
 }
 
+/// Columns of the canonical clip projection, in the order [`row_to_clip`]
+/// reads them.
+///
+/// Every query that decodes a [`Clip`] builds its SELECT list from here, so a
+/// schema change moves this array instead of ten hand-written column lists
+/// that only a runtime panic would tell you had drifted.
+const CLIP_COLUMNS: [&str; 11] = [
+    "id",
+    "content_hash",
+    "flavors",
+    "kind",
+    "created_at",
+    "updated_at",
+    "byte_size",
+    "source_app",
+    "metadata_json",
+    "pinned",
+    "favorite",
+];
+
+/// Render [`CLIP_COLUMNS`] qualified by the table name or alias the query
+/// reaches clip rows through (`"clips"`, or a join alias such as `"c"`).
+///
+/// Queries that need extra columns append them after this list: [`RawRow`]
+/// reads by position, so anything beyond index 10 is the caller's own.
+fn clip_projection(alias: &str) -> String {
+    CLIP_COLUMNS
+        .map(|column| format!("{alias}.{column}"))
+        .join(", ")
+}
+
 /// Intermediate row representation before JSON decoding.
 struct RawRow {
     id: String,
@@ -2982,11 +3121,12 @@ fn raw_to_clip(raw: RawRow) -> Result<Clip> {
         chrono::DateTime::from_timestamp_millis(raw.created_at).unwrap_or_else(chrono::Utc::now);
     let updated_at = chrono::DateTime::from_timestamp_millis(raw.updated_at).unwrap_or(created_at);
     let stored_meta: StoredMetadata = serde_json::from_str(&raw.metadata_json)?;
-    let mut meta = ClipMeta::now(
-        kind_from_int(raw.kind),
-        raw.byte_size as u64,
-        raw.source_app,
-    );
+    // Fail closed: an unknown discriminant means the row (or a newer schema)
+    // is not something this build can interpret; silently mapping it to
+    // `Other` used to hide the corruption.
+    let kind = ContentKind::from_stored_discriminant(raw.kind)
+        .ok_or_else(|| StoreError::Corrupt("unknown content kind in db".into()))?;
+    let mut meta = ClipMeta::now(kind, raw.byte_size as u64, raw.source_app);
     meta.created_at = created_at;
     meta.updated_at = updated_at;
     stored_meta.apply_to(&mut meta);
@@ -3014,6 +3154,9 @@ struct StoredMetadata {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     sensitive: bool,
     sensitivity_reason: Option<vbuff_types::SensitivityReason>,
+    /// `None` means the row predates the field, not that sharing was allowed.
+    /// Rows migrated from schema v1 carry a literal `'{}'`, so this is the
+    /// state of every clip captured before the privacy metadata existed.
     sync_eligible: Option<bool>,
     ai_allowed: bool,
 }
@@ -3043,9 +3186,90 @@ impl StoredMetadata {
         meta.expires_at = self.expires_at;
         meta.sensitive = self.sensitive;
         meta.sensitivity_reason = self.sensitivity_reason;
-        meta.sync_eligible = self.sync_eligible.unwrap_or(true);
+        // Fail closed: a row whose provenance metadata predates this field
+        // never proved it may leave the device, and "no record" is not
+        // consent. Costs nothing today (no sync transport is wired) and
+        // avoids a migration once one is.
+        meta.sync_eligible = self.sync_eligible.unwrap_or(false);
         meta.ai_allowed = self.ai_allowed;
     }
+}
+
+/// Every column blanked when a row is sensitive: the preview, the searchable
+/// text, and each similarity projection that could correlate the row with
+/// others. Both scrub paths (the sweep at open and the clawback
+/// reclassification) build their SQL from this single list, so a projection
+/// column can never be scrubbed by one path and forgotten by the other.
+pub(crate) const SENSITIVE_SCRUB_SET: &str = "preview = '[sensitive]', item_text = '', \
+     simhash = NULL, simhash_b0 = NULL, simhash_b1 = NULL, \
+     simhash_b2 = NULL, simhash_b3 = NULL, \
+     dhash = NULL, dhash_b0 = NULL, dhash_b1 = NULL, \
+     dhash_b2 = NULL, dhash_b3 = NULL, \
+     normalized_hash = NULL";
+
+/// A view of a clip's metadata that the sensitive clamp can tighten. Both the
+/// in-memory [`ClipMeta`] and the persisted [`StoredMetadata`] implement it so
+/// every path shares one definition of the invariant.
+pub(crate) trait SensitiveRecord {
+    /// Mark the row sensitive and withdraw it from sync and AI features.
+    fn mark_sensitive(&mut self);
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>);
+}
+
+impl SensitiveRecord for ClipMeta {
+    fn mark_sensitive(&mut self) {
+        self.sensitive = true;
+        self.sync_eligible = false;
+        self.ai_allowed = false;
+    }
+
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at
+    }
+
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>) {
+        self.expires_at = Some(value);
+    }
+}
+
+impl SensitiveRecord for StoredMetadata {
+    fn mark_sensitive(&mut self) {
+        self.sensitive = true;
+        self.sync_eligible = Some(false);
+        self.ai_allowed = false;
+    }
+
+    fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at
+    }
+
+    fn set_expires_at(&mut self, value: chrono::DateTime<chrono::Utc>) {
+        self.expires_at = Some(value);
+    }
+}
+
+/// The privacy invariant of a sensitive row, in one place: it never syncs,
+/// never feeds AI features, and always carries a bounded expiry.
+///
+/// `proposed_expiry` is the lifetime an incoming detection or re-copy
+/// suggests. Expiry merges monotonically, so the shortest bound always wins
+/// and a remaining lifetime can never be stretched or erased; a row left with
+/// no bound at all is capped at [`SENSITIVE_TTL_CEILING`].
+pub(crate) fn tighten_sensitive<T: SensitiveRecord>(
+    record: &mut T,
+    proposed_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    record.mark_sensitive();
+    let merged = match (record.expires_at(), proposed_expiry) {
+        (Some(current), Some(proposed)) => Some(current.min(proposed)),
+        (current, proposed) => current.or(proposed),
+    };
+    record.set_expires_at(merged.unwrap_or_else(|| {
+        chrono::Utc::now()
+            + chrono::Duration::from_std(SENSITIVE_TTL_CEILING)
+                .unwrap_or_else(|_| chrono::Duration::days(1))
+    }));
 }
 
 fn now_millis() -> i64 {
@@ -3060,52 +3284,6 @@ fn datetime_from_millis(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
 fn duration_millis_i64(duration: Duration) -> Result<i64> {
     i64::try_from(duration.as_millis())
         .map_err(|_| StoreError::Maintenance("duration exceeds SQLite range".into()))
-}
-
-fn ensure_delete_eligible(
-    connection: &Connection,
-    id: ClipId,
-    require_retention_guards: bool,
-) -> Result<()> {
-    let state = connection
-        .query_row(
-            r#"
-            SELECT c.pinned, c.favorite, a.legal_hold,
-                   EXISTS(
-                       SELECT 1 FROM temp.session_protected AS protected
-                       WHERE protected.clip_id = c.id
-                   )
-            FROM clips AS c
-            LEFT JOIN clip_annotations AS a ON a.clip_id = c.id
-            WHERE c.id = ?1
-            "#,
-            [id.to_string_repr()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)? != 0,
-                    row.get::<_, i64>(1)? != 0,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, i64>(3)? != 0,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((pinned, favorite, held, session_protected)) = state else {
-        return Err(StoreError::ClipNotFound(id.to_string_repr()));
-    };
-    let held =
-        held.ok_or_else(|| StoreError::Corrupt("clip annotation row is missing".into()))? != 0;
-    if held {
-        return Err(StoreError::Maintenance(
-            "clip is under legal hold; release it before deletion".into(),
-        ));
-    }
-    if require_retention_guards && (pinned || favorite || session_protected) {
-        return Err(StoreError::Maintenance(
-            "clip became protected before retention deletion".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn elapsed_ms(duration: Duration) -> u64 {
@@ -3160,11 +3338,7 @@ fn persist_embedding(
 fn validate_local_embedding_backend(backend: &dyn EmbeddingBackend) -> Result<()> {
     let id = backend.id();
     if backend.locality() != EmbeddingLocality::Local
-        || id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !is_valid_identifier(id, 128)
         || !(1..=8_192).contains(&backend.dimensions())
     {
         return Err(StoreError::Maintenance(
@@ -3209,34 +3383,6 @@ fn escape_like(s: &str) -> String {
     out
 }
 
-fn kind_to_int(kind: ContentKind) -> i64 {
-    match kind {
-        ContentKind::Text => 0,
-        ContentKind::Rtf => 1,
-        ContentKind::Html => 2,
-        ContentKind::Image => 3,
-        ContentKind::File => 4,
-        ContentKind::Color => 5,
-        ContentKind::Url => 6,
-        ContentKind::Code => 7,
-        ContentKind::Other => 8,
-    }
-}
-
-fn kind_from_int(v: i64) -> ContentKind {
-    match v {
-        0 => ContentKind::Text,
-        1 => ContentKind::Rtf,
-        2 => ContentKind::Html,
-        3 => ContentKind::Image,
-        4 => ContentKind::File,
-        5 => ContentKind::Color,
-        6 => ContentKind::Url,
-        7 => ContentKind::Code,
-        _ => ContentKind::Other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3263,6 +3409,96 @@ mod tests {
             pinned: false,
             favorite: false,
         }
+    }
+
+    #[test]
+    fn sensitive_scrub_set_covers_every_correlating_projection() {
+        // Pin test: shrinking the scrub list leaves a projection column that
+        // still correlates a sensitive row with its neighbours. Both scrub
+        // paths build their SQL from this constant, so widening it here is
+        // enough; narrowing it must be a deliberate, visible edit.
+        for column in [
+            "preview = '[sensitive]'",
+            "item_text = ''",
+            "simhash = NULL",
+            "simhash_b0 = NULL",
+            "simhash_b1 = NULL",
+            "simhash_b2 = NULL",
+            "simhash_b3 = NULL",
+            "dhash = NULL",
+            "dhash_b0 = NULL",
+            "dhash_b1 = NULL",
+            "dhash_b2 = NULL",
+            "dhash_b3 = NULL",
+            "normalized_hash = NULL",
+        ] {
+            assert!(
+                SENSITIVE_SCRUB_SET.contains(column),
+                "scrub set lost {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn clawback_never_stretches_an_existing_shorter_ttl() {
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("token ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+        clip.meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(5));
+        let id = store.insert(&clip).unwrap();
+        let before: i64 = store
+            .conn
+            .query_row(
+                "SELECT expires_at FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(report.reclassified, 1);
+        let after: i64 = store
+            .conn
+            .query_row(
+                "SELECT expires_at FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "reclassification stretched the lifetime");
+    }
+
+    #[test]
+    fn schema_bakes_canonical_code_discriminant() {
+        // The v7 trigger bodies bake `kind = 7` into sqlite_master, and that
+        // text persists verbatim in existing databases, so the canonical
+        // codec must never renumber Code.
+        assert_eq!(CODE_KIND_SQL, 7);
+        let store = Store::open_in_memory().unwrap();
+        let trigger_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'clips_fts_ai'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains(&format!(
+            "new.kind = {}",
+            ContentKind::Code.stored_discriminant()
+        )));
+    }
+
+    #[test]
+    fn unknown_kind_discriminant_fails_closed_as_corrupt() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("victim")).unwrap();
+        store
+            .conn
+            .execute("UPDATE clips SET kind = 99", [])
+            .unwrap();
+        let error = store.list(10).unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)));
     }
 
     #[test]
@@ -3349,6 +3585,20 @@ mod tests {
         assert_eq!(
             restored.provenance_confidence,
             vbuff_types::ProvenanceConfidence::Proven
+        );
+    }
+
+    #[test]
+    fn metadata_from_before_the_privacy_fields_never_claims_sync_consent() {
+        // Schema v1 rows were migrated with a literal '{}', so this is every
+        // clip captured before the privacy metadata existed.
+        let stored: StoredMetadata = serde_json::from_str("{}").unwrap();
+        let mut meta = ClipMeta::now(ContentKind::Text, 0, None);
+        meta.sync_eligible = true;
+        stored.apply_to(&mut meta);
+        assert!(
+            !meta.sync_eligible,
+            "a row with no record of consent was treated as consenting"
         );
     }
 
@@ -3883,6 +4133,506 @@ mod tests {
         assert_eq!(hits[0].primary_text(), url.primary_text());
     }
 
+    // ---------------------------------------------------------------------
+    // Characterization tests for the store search SQL path.
+    //
+    // These pin the *current* behaviour of `Store::search_page` -- the facet
+    // vocabulary, the LIKE/FTS tier split, the escaping, and the expiry
+    // filter -- so the planned grammar unification has a baseline to diff
+    // against. Several of them assert behaviour that is arguably wrong; each
+    // such case says so in a comment rather than being "fixed" here.
+    // ---------------------------------------------------------------------
+
+    /// Assert which tier the next `search` call will take. Several tests below
+    /// only make sense on one tier, and the planner can also promote itself
+    /// on slow LIKE latencies, so pin the expectation explicitly rather than
+    /// letting a promoted planner turn a real regression into a silent pass.
+    fn assert_tier(store: &Store, query: &str, expect_fts: bool) {
+        let text = search::parse_query(query).text;
+        let actual = !text.is_empty()
+            && store
+                .search_planner
+                .borrow()
+                .use_fts(store.count().unwrap(), &text);
+        assert_eq!(
+            actual,
+            expect_fts,
+            "expected {} tier for {query:?}",
+            if expect_fts { "FTS" } else { "LIKE" }
+        );
+    }
+
+    /// Pin the LIKE tier for the next search. Below the row threshold the
+    /// planner still promotes itself once observed LIKE latencies pass its
+    /// p95 budget, which a loaded test machine trips; clearing the window
+    /// keeps tier-specific characterization honest instead of flaky.
+    fn reset_to_like_tier(store: &Store, query: &str) {
+        *store.search_planner.borrow_mut() = search::SearchPlanner::default();
+        assert_tier(store, query, false);
+    }
+
+    /// Every facet key the store grammar accepts, end to end: indexer writes
+    /// the row into `clip_facets`, parser recognizes the key, SQL matches it.
+    #[test]
+    fn store_grammar_resolves_all_four_facets_end_to_end() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut url = make_clip("https://Docs.RS/rusqlite");
+        url.meta.kind = ContentKind::Url;
+        let url_id = store.insert(&url).unwrap();
+
+        let mut color = make_clip("#FF8800");
+        color.meta.kind = ContentKind::Color;
+        let color_id = store.insert(&color).unwrap();
+
+        let mut code = make_clip("fn main() { let x = 1; }");
+        code.meta.kind = ContentKind::Code;
+        let code_id = store.insert(&code).unwrap();
+
+        let date_id = store.insert(&make_clip("2026-07-26")).unwrap();
+
+        // `host` is the URL host, lowercased by the url crate and again by the
+        // indexer; the parser lowercases the query value to match.
+        let hits = store.search("host:DOCS.rs", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, url_id);
+
+        // `color` is the whole trimmed text, lowercased, only for Color rows.
+        let hits = store.search("color:#ff8800", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, color_id);
+
+        // `lang` is one of four hardcoded heuristics, only for Code rows.
+        let hits = store.search("lang:rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, code_id);
+
+        // `iso_date` is the whole trimmed text when it matches the ISO regex.
+        let hits = store.search("iso_date:2026-07-26", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, date_id);
+
+        // Facets AND together, and repeated keys therefore self-cancel.
+        assert!(
+            store
+                .search("host:docs.rs lang:rust", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search("host:docs.rs host:example.com", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Facet + text also ANDs: the text tier still has to match.
+        assert_eq!(store.search("host:docs.rs rusqlite", 10).unwrap().len(), 1);
+        assert!(store.search("host:docs.rs nomatch", 10).unwrap().is_empty());
+    }
+
+    /// Which facets are gated on `ContentKind` and which are not. `color` and
+    /// `lang` only ever appear on Color/Code rows; `host` and `iso_date` are
+    /// derived from the text alone, on any kind.
+    #[test]
+    fn facet_extraction_is_kind_gated_only_for_color_and_lang() {
+        let store = Store::open_in_memory().unwrap();
+        // Plain Text rows still get text-derived facets.
+        let url_as_text = store.insert(&make_clip("https://example.org/x")).unwrap();
+        let date_as_text = store.insert(&make_clip("2026-01-02")).unwrap();
+        // ...but not the kind-gated ones.
+        store.insert(&make_clip("#ff8800")).unwrap();
+        store
+            .insert(&make_clip("fn other() { let y = 2; }"))
+            .unwrap();
+
+        let hits = store.search("host:example.org", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, url_as_text);
+
+        let hits = store.search("iso_date:2026-01-02", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, date_as_text);
+
+        assert!(store.search("color:#ff8800", 10).unwrap().is_empty());
+        assert!(store.search("lang:rust", 10).unwrap().is_empty());
+    }
+
+    /// `host` and `iso_date` are whole-text predicates, not scanners: the
+    /// trimmed text must itself parse as a URL, or itself match the ISO
+    /// regex. A URL or a date embedded in a sentence is not indexed.
+    #[test]
+    fn host_and_iso_date_facets_require_the_whole_text_to_match() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&make_clip("see https://embedded.example"))
+            .unwrap();
+        store
+            .insert(&make_clip("meeting on 2026-01-02 at ten"))
+            .unwrap();
+        // Leading and trailing whitespace is trimmed first, so it is harmless.
+        let padded = store
+            .insert(&make_clip("  https://padded.example  "))
+            .unwrap();
+
+        let indexed: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM clip_facets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 1, "only the padded URL should be indexed");
+
+        assert!(
+            store
+                .search("host:embedded.example", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search("iso_date:2026-01-02", 10).unwrap().is_empty());
+        let hits = store.search("host:padded.example", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, padded);
+    }
+
+    /// The indexer writes a fifth facet key that the query grammar has no
+    /// word for, so it is dead weight in the index today.
+    #[test]
+    fn payment_facet_is_indexed_but_unreachable_from_the_query_grammar() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("4111 1111 1111 1111")).unwrap();
+
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM clip_facets WHERE key = 'has_payment_number'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+
+        // Not in the vocabulary -> degrades to a literal text search.
+        assert!(
+            store
+                .search("has_payment_number:true", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Defect, pinned as-is: the indexer stores `iso_date` verbatim while the
+    /// parser lowercases the query value, so any ISO timestamp carrying `T`
+    /// or `Z` is permanently unmatchable. The space-separated variant is
+    /// unreachable too, because the parser splits on whitespace first.
+    #[test]
+    fn iso_date_facet_with_a_time_component_is_unmatchable() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("2026-07-26T09:30:00Z")).unwrap();
+        store.insert(&make_clip("2026-07-27 09:30:00")).unwrap();
+
+        let mut stored = store
+            .conn
+            .prepare("SELECT value FROM clip_facets WHERE key = 'iso_date' ORDER BY value")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        stored.sort();
+        assert_eq!(stored, vec!["2026-07-26T09:30:00Z", "2026-07-27 09:30:00"]);
+
+        // Case-preserved in the index, lowercased in the query: never equal.
+        assert!(
+            store
+                .search("iso_date:2026-07-26T09:30:00Z", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search("iso_date:2026-07-26t09:30:00z", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Whitespace splits the token before the facet arm ever sees it.
+        assert!(
+            store
+                .search("iso_date:2026-07-27 09:30:00", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // The date-only prefix is a different facet value, so no match either.
+        assert!(store.search("iso_date:2026-07-26", 10).unwrap().is_empty());
+    }
+
+    /// Defect, pinned as-is: `Url::parse` stores IDNA/punycode hosts while the
+    /// parser only lowercases, so a Unicode `host:` value can never match.
+    #[test]
+    fn unicode_host_facet_is_stored_as_punycode_and_never_matches() {
+        let store = Store::open_in_memory().unwrap();
+        let mut url = make_clip("https://пример.рф/page");
+        url.meta.kind = ContentKind::Url;
+        store.insert(&url).unwrap();
+
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM clip_facets WHERE key = 'host'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.starts_with("xn--"),
+            "expected punycode, got {stored}"
+        );
+        assert!(store.search("host:пример.рф", 10).unwrap().is_empty());
+        assert_eq!(
+            store.search(&format!("host:{stored}"), 10).unwrap().len(),
+            1
+        );
+    }
+
+    /// The core grammar's facet keys are not rejected and not translated:
+    /// they fall through to the literal text tier, which searches the
+    /// projected `item_text` (text + source app + kind label).
+    #[test]
+    fn core_grammar_facets_degrade_to_literal_text() {
+        let store = Store::open_in_memory().unwrap();
+        let mut from_mail = make_clip("quarterly numbers");
+        from_mail.meta.source_app = Some("Mail".into());
+        store.insert(&from_mail).unwrap();
+        let literal_id = store
+            .insert(&make_clip("note about app:mail routing"))
+            .unwrap();
+
+        // `app:mail` never reaches `source_app`; it becomes the LIKE pattern
+        // `%app:mail%`, matching only text that literally contains it.
+        let hits = store.search("app:mail", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, literal_id);
+
+        for query in [
+            "kind:code",
+            "tag:work",
+            "device:laptop",
+            "before:yesterday",
+            "after:2026-07-01",
+        ] {
+            assert!(
+                store.search(query, 10).unwrap().is_empty(),
+                "{query} unexpectedly matched"
+            );
+        }
+
+        // A bare `kind` word still matches through the kind label the
+        // projection appends, which is what makes the silent fallthrough
+        // confusing rather than merely empty.
+        assert_eq!(store.search("text", 10).unwrap().len(), 2);
+    }
+
+    /// `escape_like` neutralizes the three LIKE metacharacters, and the SQL
+    /// declares `ESCAPE '\'` to match. Quotes need no escaping: the pattern
+    /// is a bound parameter.
+    #[test]
+    fn like_tier_escapes_wildcards_and_the_escape_character() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("snake_case"), "snake\\_case");
+        assert_eq!(escape_like("c:\\tmp"), "c:\\\\tmp");
+        // Double quotes and FTS operators are left alone on this tier.
+        assert_eq!(escape_like("say \"hi\" a*"), "say \"hi\" a*");
+
+        let store = Store::open_in_memory().unwrap();
+        let percent = store.insert(&make_clip("growth 50% quarterly")).unwrap();
+        store.insert(&make_clip("growth 50X quarterly")).unwrap();
+        let underscore = store.insert(&make_clip("snake_case name")).unwrap();
+        store.insert(&make_clip("snakeXcase name")).unwrap();
+        let backslash = store.insert(&make_clip("path c:\\tmp\\log")).unwrap();
+        store.insert(&make_clip("path c:Xtmp\\log")).unwrap();
+        let quoted = store.insert(&make_clip("say \"quoted\" now")).unwrap();
+
+        for (query, expected) in [
+            ("50%", percent),
+            ("snake_case", underscore),
+            ("c:\\tmp", backslash),
+            ("\"quoted\"", quoted),
+        ] {
+            reset_to_like_tier(&store, query);
+            let hits = store.search(query, 10).unwrap();
+            assert_eq!(hits.len(), 1, "{query} matched {} rows", hits.len());
+            assert_eq!(hits[0].id, expected, "{query} matched the wrong row");
+        }
+    }
+
+    /// The LIKE tier inherits SQLite's ASCII-only case folding, so a
+    /// non-ASCII query is effectively case-sensitive here. The FTS tier uses
+    /// `unicode61`, which folds the same query -- the two tiers therefore
+    /// disagree on the same database.
+    #[test]
+    fn like_and_fts_tiers_disagree_on_non_ascii_case_folding() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&make_clip("привет мир")).unwrap();
+        store.insert(&make_clip("Hello World")).unwrap();
+
+        // Fewer than 250 rows and no recorded latency -> LIKE tier.
+        reset_to_like_tier(&store, "ПРИВЕТ");
+        assert!(store.search("ПРИВЕТ", 10).unwrap().is_empty());
+        reset_to_like_tier(&store, "привет");
+        assert_eq!(store.search("привет", 10).unwrap().len(), 1);
+        // ASCII does fold on the LIKE tier.
+        reset_to_like_tier(&store, "hello");
+        assert_eq!(store.search("hello", 10).unwrap().len(), 1);
+
+        // Cross the row threshold to promote the same store to the FTS tier.
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        assert_tier(&store, "ПРИВЕТ", true);
+        assert_eq!(store.search("ПРИВЕТ", 10).unwrap().len(), 1);
+    }
+
+    /// On the FTS tier `fts_literal` wraps the whole text in one phrase, so
+    /// FTS5 operators are inert: `alpha OR beta` is a three-token phrase, not
+    /// a disjunction, and a trailing `*` is not a prefix query.
+    #[test]
+    fn fts_tier_neutralizes_query_operators() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        let phrase = store.insert(&make_clip("alpha OR beta together")).unwrap();
+        store.insert(&make_clip("alpha standalone")).unwrap();
+        store.insert(&make_clip("beta standalone")).unwrap();
+
+        assert_tier(&store, "alpha OR beta", true);
+        let hits = store.search("alpha OR beta", 10).unwrap();
+        assert_eq!(hits.len(), 1, "OR behaved as a disjunction");
+        assert_eq!(hits[0].id, phrase);
+
+        // `*` is a separator for unicode61, not a prefix operator: `stand*`
+        // becomes the single-token phrase `stand`, which matches nothing.
+        assert!(
+            store.search("stand*", 10).unwrap().is_empty(),
+            "* behaved as a prefix operator"
+        );
+        assert_eq!(store.search("standalone*", 10).unwrap().len(), 2);
+
+        // A leading `-` is likewise inert, so this is not an exclusion.
+        assert_eq!(store.search("-standalone", 10).unwrap().len(), 2);
+    }
+
+    /// A punctuation-only query survives the length guard (three chars) and
+    /// reaches FTS5 as a phrase that tokenizes to nothing. Pinned so the
+    /// unification work knows whether it must keep tolerating it.
+    #[test]
+    fn fts_tier_tolerates_a_query_that_tokenizes_to_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..260 {
+            store
+                .insert(&make_clip(&format!("filler row {index}")))
+                .unwrap();
+        }
+        for query in ["***", "%%%", "\"\"\"", "..."] {
+            assert_tier(&store, query, true);
+            assert!(
+                store.search(query, 10).unwrap().is_empty(),
+                "{query} did not come back empty"
+            );
+        }
+    }
+
+    /// Ordering and paging are independent of the tier: pinned first, then
+    /// newest `updated_at`, then newest `seq`; `limit` caps the page and the
+    /// cursor is only handed back when the page came back full.
+    #[test]
+    fn search_page_orders_pinned_first_and_pages_by_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(store.insert(&make_clip(&format!("row {index}"))).unwrap());
+        }
+        store.set_pinned(ids[0], true).unwrap();
+
+        let first = store.search_page("row", None, 2).unwrap();
+        assert_eq!(first.clips.len(), 2);
+        assert_eq!(first.clips[0].id, ids[0], "pinned row did not sort first");
+        assert_eq!(first.clips[1].id, ids[4]);
+        let cursor = first.next_cursor.expect("full page must yield a cursor");
+
+        let second = store.search_page("row", Some(cursor), 10).unwrap();
+        assert_eq!(second.clips.len(), 3);
+        assert_eq!(second.clips[0].id, ids[3]);
+        assert!(
+            second.next_cursor.is_none(),
+            "short page must not yield a cursor"
+        );
+
+        // A zero limit short-circuits before any SQL runs.
+        let empty = store.search_page("row", None, 0).unwrap();
+        assert!(empty.clips.is_empty() && empty.next_cursor.is_none());
+    }
+
+    /// Divergence, pinned as-is: `Store::search_page` is the only read path
+    /// whose expiry filter carves out session-protected rows. `list`,
+    /// `latest_by_recency` and `count` use the same predicate *without* the
+    /// carve-out, and the GUI's in-memory projection
+    /// (`vbuff-gui/src/projection.rs::clip_is_expired`) has no notion of
+    /// session protection either. A session-protected row past its TTL is
+    /// therefore searchable but invisible everywhere else.
+    #[test]
+    fn expiry_filter_in_search_sql_diverges_from_every_other_read_path() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.insert(&make_clip("protected but expired")).unwrap();
+        store.set_session_protected(id, true).unwrap();
+
+        // Expire the row after insert: `insert` itself calls `purge_expired`,
+        // which deletes expired rows regardless of session protection.
+        let past = chrono::Utc::now() - Duration::minutes(1);
+        store
+            .conn
+            .execute(
+                r#"
+                UPDATE clips
+                SET expires_at = ?1,
+                    metadata_json = json_set(metadata_json, '$.expires_at', ?2)
+                WHERE id = ?3
+                "#,
+                params![
+                    past.timestamp_millis(),
+                    past.to_rfc3339(),
+                    id.to_string_repr()
+                ],
+            )
+            .unwrap();
+
+        // search_page: visible, because of the session_protected carve-out.
+        let hits = store.search("protected", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+        let expires_at = hits[0].meta.expires_at.expect("expiry must round-trip");
+        assert!(
+            expires_at <= chrono::Utc::now(),
+            "the search path returned a row the GUI projection would drop"
+        );
+
+        // Empty query, no facets: same carve-out, so search is a full listing
+        // that disagrees with `list` on this row.
+        assert_eq!(store.search("", 10).unwrap().len(), 1);
+
+        // Every other read path applies the plain expiry predicate.
+        assert!(store.list(10).unwrap().is_empty());
+        assert!(store.latest_by_recency().unwrap().is_none());
+        assert_eq!(store.count().unwrap(), 0);
+
+        // And the count feeding the FTS/LIKE tier decision is the one without
+        // the carve-out, so the planner under-counts searchable rows.
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
     #[test]
     fn indexed_simhash_returns_exact_and_near_candidates() {
         let store = Store::open_in_memory().unwrap();
@@ -4151,6 +4901,87 @@ mod tests {
         );
     }
 
+    /// Reclassification runs unattended on every idle tick and destroys what
+    /// it touches: the searchable text is emptied, every projection nulled,
+    /// facets and embeddings deleted, and a delete timer forced on. Evidence
+    /// that is merely an English word next to some digits must never drive
+    /// it - "error code 1024" and "invoice 4821 paid" are ordinary notes, not
+    /// authenticator codes, and the user cannot get them back.
+    #[test]
+    fn clawback_never_shreds_a_clip_on_lexical_evidence_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let ordinary = [
+            "error code 1024 while opening the project",
+            "discount code SAVE20 valid until 2026",
+            "area code 415 is San Francisco",
+            "verify the invoice 4821 before sending",
+        ];
+        let ids: Vec<_> = ordinary
+            .iter()
+            .map(|text| store.insert(&make_clip(text)).unwrap())
+            .collect();
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(report.reclassified, 0, "ordinary notes were shredded");
+        for (id, text) in ids.iter().zip(ordinary) {
+            assert!(
+                !item_text_of(&store, *id).is_empty(),
+                "{text:?} lost its searchable text"
+            );
+        }
+    }
+
+    #[test]
+    fn clawback_acts_at_the_reclassification_floor_and_refuses_everything_below_it() {
+        let store = Store::open_in_memory().unwrap();
+        // Below the floor: the entropy detector scores 0.72, which is enough
+        // to mask a fresh copy but must never shred a clip the user already
+        // owns. An opaque blob is the strongest thing that detector produces.
+        let blob = store
+            .insert(&make_clip("xQ7vR2pL9mK4wZ8tB6nH3jF5cD1aG0uY7eT4iS2"))
+            .unwrap();
+        // No finding at all: a link is structure rather than randomness.
+        let url = store
+            .insert(&make_clip(
+                "https://example.com/blog/post?utm_source=Newsletter&id=8fA2",
+            ))
+            .unwrap();
+        // Exactly at the floor: a Luhn-valid card number scores 0.90, and the
+        // comparison is inclusive.
+        let card = store.insert(&make_clip("4111111111111111")).unwrap();
+
+        let report = store
+            .clawback_sensitive(10, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.reclassified, 1, "only the row at the floor may move");
+        for (id, label) in [(blob, "opaque blob"), (url, "url")] {
+            assert!(
+                !item_text_of(&store, id).is_empty(),
+                "{label} was reclassified on sub-floor evidence"
+            );
+        }
+        assert!(
+            item_text_of(&store, card).is_empty(),
+            "a finding exactly at the floor must be reclassified"
+        );
+    }
+
+    fn item_text_of(store: &Store, id: ClipId) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT item_text FROM clips WHERE id = ?1",
+                [id.to_string_repr()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn sensitive_clawback_cursor_reaches_rows_beyond_the_first_batch() {
         let store = Store::open_in_memory().unwrap();
@@ -4241,6 +5072,23 @@ mod tests {
     }
 
     #[test]
+    fn counting_never_writes_and_still_hides_expired_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("counting.db");
+        let store = Store::open(&path).unwrap();
+        store.insert(&make_clip("live")).unwrap();
+        let mut expired = make_clip("gone");
+        expired.meta.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        store.insert(&expired).unwrap();
+        drop(store);
+
+        let (read_only, _) = Store::open_read_only_profiled(&path).unwrap();
+        // A read-only connection would fail outright if counting still tried
+        // to delete the expired row first.
+        assert_eq!(read_only.count().unwrap(), 1);
+    }
+
+    #[test]
     fn keyset_session_pages_without_duplicates_across_pinned_boundary() {
         let store = Store::open_in_memory().unwrap();
         let mut ids = Vec::new();
@@ -4324,6 +5172,46 @@ mod tests {
         assert_eq!(record["id"], corrupted.id.to_string_repr());
         assert!(record.get("flavors").is_none());
         assert!(record.get("content_hash").is_none());
+    }
+
+    #[test]
+    fn rolling_audit_never_quarantines_a_clip_under_legal_hold() {
+        // Regression: the audit used to delete the colliding row outright, so
+        // a maintenance tick could destroy a clip the user was promised would
+        // survive until the hold is released. `quarantined_clips` only keeps
+        // id/kind/byte_size/sensitive, so the content really was gone.
+        let store = Store::open_in_memory().unwrap();
+        let canonical = make_clip("canonical bytes");
+        let held = make_clip("different bytes");
+        store.insert(&canonical).unwrap();
+        store.insert(&held).unwrap();
+        store.set_legal_hold(held.id, true).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET flavors = ?1 WHERE id = ?2",
+                params![
+                    serde_clip::flavors_to_json(&canonical.flavors).unwrap(),
+                    held.id.to_string_repr(),
+                ],
+            )
+            .unwrap();
+
+        let report = store.audit_content_hashes(10).unwrap();
+
+        assert_eq!(report.quarantined, 0, "a held clip must not be removed");
+        assert_eq!(report.held, 1, "the skip must be reported, not silent");
+        assert!(
+            store.get_clip(held.id).unwrap().is_some(),
+            "held clip disappeared from the store"
+        );
+        let quarantined: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM quarantined_clips", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(quarantined, 0);
     }
 
     #[test]
@@ -4554,5 +5442,157 @@ mod tests {
         assert_eq!(report.hard_deleted, 0);
         assert_eq!(store.count().unwrap(), 1);
         assert_eq!(store.grace_bin(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_deletion_path_leaves_a_clip_under_legal_hold_alone() {
+        // The point of routing every removal through `delete_clip_row` /
+        // `delete_clips_where` is that this list cannot silently gain a hole.
+        // A new public deletion that skips the primitives fails here.
+        let store = Store::open_in_memory().unwrap();
+        let held = make_clip("held by legal hold");
+        store.insert(&held).unwrap();
+        store.set_legal_hold(held.id, true).unwrap();
+        // A second, unheld clip so the sweeps have something they may delete.
+        let disposable = store.insert(&make_clip("disposable")).unwrap();
+
+        // Explicit paths report the hold instead of pretending to succeed.
+        assert!(store.delete(held.id).is_err(), "delete");
+        assert!(
+            store
+                .apply_batch(&[StoreMutation::Delete { id: held.id }])
+                .is_err(),
+            "apply_batch"
+        );
+        assert!(
+            store
+                .delete_with_grace(
+                    held.id,
+                    &[7; 32],
+                    std::time::Duration::from_secs(60),
+                    DeletionReason::User,
+                )
+                .is_err(),
+            "delete_with_grace"
+        );
+
+        // Sweeps leave the row and carry on with everything else.
+        store.clear().unwrap();
+        assert!(store.get_clip(held.id).unwrap().is_some(), "clear");
+        store.insert(&make_clip("refill one")).unwrap();
+        store.clear_all().unwrap();
+        assert!(store.get_clip(held.id).unwrap().is_some(), "clear_all");
+
+        store.insert(&make_clip("refill two")).unwrap();
+        assert_eq!(store.enforce_cap(1).unwrap(), 1);
+        assert!(store.get_clip(held.id).unwrap().is_some(), "enforce_cap");
+
+        store
+            .set_retention_rule(&RetentionRule {
+                scope: RetentionScope::Kind(ContentKind::Text),
+                max_age: None,
+                max_items: Some(0),
+                grace_window: std::time::Duration::ZERO,
+            })
+            .unwrap();
+        let retention = store.enforce_retention(None).unwrap();
+        assert_eq!(retention.hard_deleted, 0, "retention");
+        assert_eq!(retention.deferred_without_key, 0, "retention");
+        assert!(store.get_clip(held.id).unwrap().is_some(), "retention");
+
+        store
+            .upsert_collection(&CollectionRecord {
+                id: "held-collection".into(),
+                name: "held".into(),
+                retention: CollectionRetentionPolicy {
+                    max_age_days: None,
+                    max_items: Some(0),
+                    max_bytes: None,
+                },
+            })
+            .unwrap();
+        store
+            .set_collection(held.id, Some("held-collection"))
+            .unwrap();
+        let preview = store
+            .enforce_collection_retention("held-collection", 10)
+            .unwrap();
+        assert!(preview.clip_ids.is_empty(), "collection retention preview");
+        assert!(
+            store.get_clip(held.id).unwrap().is_some(),
+            "collection retention"
+        );
+
+        // The disposable clip really was removed along the way, so the checks
+        // above are not passing because nothing ever deleted anything.
+        assert!(store.get_clip(disposable).unwrap().is_none());
+
+        // Release the hold and the very same sweep takes the clip: the hold
+        // was the reason it survived, not an inert query that matched nothing.
+        store.set_legal_hold(held.id, false).unwrap();
+        let released = store
+            .enforce_collection_retention("held-collection", 10)
+            .unwrap();
+        assert_eq!(released.clip_ids, vec![held.id]);
+        assert!(store.get_clip(held.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn clip_projection_is_the_single_source_of_column_order() {
+        // `RawRow` reads by position, so the order here is load-bearing:
+        // swapping two entries would mis-decode every clip in the store, and
+        // three callers append their own column at index 11.
+        assert_eq!(CLIP_COLUMNS.len(), 11);
+        assert_eq!(
+            clip_projection("c"),
+            "c.id, c.content_hash, c.flavors, c.kind, c.created_at, c.updated_at, \
+             c.byte_size, c.source_app, c.metadata_json, c.pinned, c.favorite"
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        let clip = make_clip("projection pin");
+        store.insert(&clip).unwrap();
+        let raw = store
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM clips", clip_projection("clips")),
+                [],
+                row_to_clip,
+            )
+            .unwrap();
+        let decoded = raw_to_clip(raw).unwrap();
+        assert_eq!(decoded.id, clip.id);
+        assert_eq!(decoded.content_hash, clip.content_hash);
+        assert_eq!(decoded.meta.kind, clip.meta.kind);
+        assert_eq!(decoded.meta.byte_size, clip.meta.byte_size);
+        assert_eq!(decoded.flavors, clip.flavors);
+    }
+
+    #[test]
+    fn hard_privacy_expiry_is_the_one_path_that_outranks_a_legal_hold() {
+        // Deliberate divergence, not an oversight: `docs/data-contract-v3.md`
+        // states "hard privacy expiry retains precedence". A hold must not be
+        // able to convert a time-boxed capture into indefinite retention.
+        // Expressed as `DeleteGuards::HARD_PRIVACY_EXPIRY`; this test is what
+        // stops a later "consistency" cleanup from quietly flipping it.
+        let store = Store::open_in_memory().unwrap();
+        let mut clip = make_clip("time boxed and held");
+        clip.meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+        let id = store.insert(&clip).unwrap();
+        store.set_legal_hold(id, true).unwrap();
+        store.set_pinned(id, true).unwrap();
+        store.set_session_protected(id, true).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE clips SET expires_at = ?1 WHERE id = ?2",
+                params![now_millis() - 1, id.to_string_repr()],
+            )
+            .unwrap();
+
+        assert_eq!(store.purge_expired().unwrap(), 1);
+        assert!(store.get_clip(id).unwrap().is_none());
+        // The orphaned session-protection entry is swept with it.
+        assert!(!store.session_protected(id).unwrap());
     }
 }

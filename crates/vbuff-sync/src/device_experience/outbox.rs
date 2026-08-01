@@ -3,7 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_PLAN_ITEMS, all_zero};
+use vbuff_types::validation::all_zero;
+
+use super::MAX_PLAN_ITEMS;
 use crate::{Result, SyncError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,7 +57,7 @@ impl fmt::Debug for SyncOutbox {
 
 impl SyncOutbox {
     pub fn enqueue(&mut self, entry: OutboxEntry) -> Result<()> {
-        if entry.event_id.iter().all(|byte| *byte == 0)
+        if all_zero(&entry.event_id)
             || all_zero(&entry.item_hash)
             || all_zero(&entry.target_device_hash)
             || entry.attempts != 0

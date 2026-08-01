@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use vbuff_types::ContentKind;
+use vbuff_types::mac::{MacDomain, MacProof, hmac_proof};
+use vbuff_types::validation::{all_zero, is_valid_label};
 
 use super::IntegrationContractError;
 
@@ -12,7 +12,12 @@ const MAX_ACCESS_LABELS: usize = 256;
 const MAX_TAG_BYTES: usize = 128;
 const MAX_COLLECTION_BYTES: usize = 256;
 const MAX_MCP_LEASE_TTL_MS: u64 = 60 * 60 * 1_000;
-const MCP_LEASE_DOMAIN: &[u8] = b"vbuff-mcp-lease-v1";
+/// Frozen framing: every part of a lease preimage is fixed-width, so the
+/// missing terminator cannot make two leases collide, and adding one would
+/// invalidate the leases held by any process already running against this
+/// build (`docs/domain-separation-convention.md` §6.1, §7.3). New parts must
+/// stay fixed-width or the domain has to be bumped to `-v2`.
+const MCP_LEASE_DOMAIN: MacDomain = MacDomain::legacy_unterminated("vbuff-mcp-lease-v1");
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClipAccessContext<'a> {
@@ -63,11 +68,14 @@ impl ClipAccessFilter {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if self.tags.len() > MAX_ACCESS_LABELS
             || self.collections.len() > MAX_ACCESS_LABELS
-            || self.tags.iter().any(|tag| !valid_label(tag, MAX_TAG_BYTES))
+            || self
+                .tags
+                .iter()
+                .any(|tag| !is_valid_label(tag, MAX_TAG_BYTES))
             || self
                 .collections
                 .iter()
-                .any(|collection| !valid_label(collection, MAX_COLLECTION_BYTES))
+                .any(|collection| !is_valid_label(collection, MAX_COLLECTION_BYTES))
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -125,7 +133,7 @@ impl Default for McpReadPolicy {
 impl McpReadPolicy {
     pub fn validate(&self) -> Result<(), IntegrationContractError> {
         if !self.read_only
-            || !valid_label(&self.required_tag, MAX_TAG_BYTES)
+            || !is_valid_label(&self.required_tag, MAX_TAG_BYTES)
             || !(1..=100).contains(&self.maximum_results)
         {
             return Err(IntegrationContractError::InvalidField);
@@ -176,10 +184,7 @@ impl McpSessionLease {
         user_consented: bool,
     ) -> Result<Self, IntegrationContractError> {
         policy.validate()?;
-        if session_key.iter().all(|byte| *byte == 0)
-            || !user_consented
-            || ttl_ms == 0
-            || ttl_ms > MAX_MCP_LEASE_TTL_MS
+        if all_zero(session_key) || !user_consented || ttl_ms == 0 || ttl_ms > MAX_MCP_LEASE_TTL_MS
         {
             return Err(IntegrationContractError::InvalidField);
         }
@@ -189,22 +194,20 @@ impl McpSessionLease {
         let expires_at_ms = issued_at_ms
             .checked_add(ttl_ms)
             .ok_or(IntegrationContractError::InvalidField)?;
-        let proof = lease_proof(
-            session_key,
-            &session_id,
-            issued_at_ms,
-            expires_at_ms,
-            &policy_hash,
-            user_consented,
-        )?;
-        Ok(Self {
+        // The lease is assembled first and self-signed second, so that
+        // `lease_proof` reads the very fields that will be handed out. A
+        // signing path that rebuilt the field list separately is how the two
+        // copies used to drift apart.
+        let mut lease = Self {
             session_id,
             issued_at_ms,
             expires_at_ms,
             policy_hash,
             user_consented,
-            proof,
-        })
+            proof: [0; 32],
+        };
+        lease.proof = lease_proof(&lease, session_key)?.finish();
+        Ok(lease)
     }
 
     pub fn allows(
@@ -215,11 +218,12 @@ impl McpSessionLease {
         now_ms: u64,
     ) -> bool {
         self.user_consented
-            && session_key.iter().any(|byte| *byte != 0)
             && now_ms >= self.issued_at_ms
             && now_ms < self.expires_at_ms
             && policy_hash(policy).is_ok_and(|hash| hash == self.policy_hash)
-            && verify_lease_proof(self, session_key)
+            // `lease_proof` rejects an all-zero session key on both paths, so
+            // the check no longer has to be repeated here.
+            && lease_proof(self, session_key).is_ok_and(|proof| proof.verify(&self.proof))
             && policy.allows(context)
     }
 }
@@ -231,36 +235,32 @@ fn policy_hash(policy: &McpReadPolicy) -> Result<[u8; 32], IntegrationContractEr
         .map_err(|_| IntegrationContractError::InvalidField)
 }
 
+/// The one statement of what an MCP lease proof covers.
+///
+/// Every field of [`McpSessionLease`] except `proof` itself is in here, in a
+/// fixed order and all fixed-width. Issuance and [`McpSessionLease::allows`]
+/// both reach their tag through this function, so a field cannot be added to
+/// the lease and signed without also being verified. An all-zero session key
+/// is refused here rather than at the call sites, so the refusal applies to
+/// both directions at once.
 fn lease_proof(
+    lease: &McpSessionLease,
     session_key: &[u8; 32],
-    session_id: &[u8; 16],
-    issued_at_ms: u64,
-    expires_at_ms: u64,
-    policy_hash: &[u8; 32],
-    user_consented: bool,
-) -> Result<[u8; 32], IntegrationContractError> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(session_key)
-        .map_err(|_| IntegrationContractError::InvalidField)?;
-    mac.update(MCP_LEASE_DOMAIN);
-    mac.update(session_id);
-    mac.update(&issued_at_ms.to_be_bytes());
-    mac.update(&expires_at_ms.to_be_bytes());
-    mac.update(policy_hash);
-    mac.update(&[u8::from(user_consented)]);
-    Ok(mac.finalize().into_bytes().into())
-}
-
-fn verify_lease_proof(lease: &McpSessionLease, session_key: &[u8; 32]) -> bool {
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(session_key) else {
-        return false;
-    };
-    mac.update(MCP_LEASE_DOMAIN);
-    mac.update(&lease.session_id);
-    mac.update(&lease.issued_at_ms.to_be_bytes());
-    mac.update(&lease.expires_at_ms.to_be_bytes());
-    mac.update(&lease.policy_hash);
-    mac.update(&[u8::from(lease.user_consented)]);
-    mac.verify_slice(&lease.proof).is_ok()
+) -> Result<MacProof, IntegrationContractError> {
+    if all_zero(session_key) {
+        return Err(IntegrationContractError::InvalidField);
+    }
+    Ok(hmac_proof(
+        MCP_LEASE_DOMAIN,
+        session_key,
+        &[
+            &lease.session_id,
+            &lease.issued_at_ms.to_be_bytes(),
+            &lease.expires_at_ms.to_be_bytes(),
+            &lease.policy_hash,
+            &[u8::from(lease.user_consented)],
+        ],
+    ))
 }
 
 fn valid_context(context: &ClipAccessContext<'_>) -> bool {
@@ -268,19 +268,117 @@ fn valid_context(context: &ClipAccessContext<'_>) -> bool {
         && context
             .tags
             .iter()
-            .all(|tag| valid_label(tag, MAX_TAG_BYTES))
+            .all(|tag| is_valid_label(tag, MAX_TAG_BYTES))
         && context
             .collection
-            .is_none_or(|collection| valid_label(collection, MAX_COLLECTION_BYTES))
-}
-
-fn valid_label(value: &str, maximum_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
+            .is_none_or(|collection| is_valid_label(collection, MAX_COLLECTION_BYTES))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{hex, legacy_mac};
+
+    /// Freeze test for the MCP lease proof, and the executable statement of
+    /// which fields it covers. A field added to [`McpSessionLease`] but not to
+    /// `lease_proof` changes nothing here, which is exactly why the second
+    /// assertion spells the preimage out field by field: the pin catches an
+    /// accidental change, and the field list catches an omission.
+    #[test]
+    fn mcp_lease_mac_bytes_are_frozen_and_cover_every_field() {
+        let session_key = [7_u8; 32];
+        let mut lease = McpSessionLease {
+            session_id: [1; 16],
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+            policy_hash: [2; 32],
+            user_consented: true,
+            proof: [0; 32],
+        };
+        lease.proof = lease_proof(&lease, &session_key).unwrap().finish();
+
+        assert_eq!(
+            hex(&lease.proof),
+            "d0f77cbb49008be9fbfb2018dccbc4036c258001eff68ce5b54ddf4dde3be93c"
+        );
+        // Byte-identical to the hand-rolled `mac.update(MCP_LEASE_DOMAIN)`
+        // sequence this replaced, in the same field order.
+        assert_eq!(
+            lease.proof,
+            legacy_mac(
+                b"vbuff-mcp-lease-v1",
+                &session_key,
+                &[
+                    &[1_u8; 16],
+                    &100_u64.to_be_bytes(),
+                    &200_u64.to_be_bytes(),
+                    &[2_u8; 32],
+                    &[1_u8],
+                ]
+            )
+        );
+
+        // Every covered field is genuinely covered: flipping any one of them
+        // must break verification.
+        for tampered in [
+            McpSessionLease {
+                session_id: [9; 16],
+                ..lease.clone()
+            },
+            McpSessionLease {
+                issued_at_ms: 101,
+                ..lease.clone()
+            },
+            McpSessionLease {
+                expires_at_ms: 201,
+                ..lease.clone()
+            },
+            McpSessionLease {
+                policy_hash: [9; 32],
+                ..lease.clone()
+            },
+            McpSessionLease {
+                user_consented: false,
+                ..lease.clone()
+            },
+        ] {
+            assert!(
+                !lease_proof(&tampered, &session_key)
+                    .unwrap()
+                    .verify(&tampered.proof)
+            );
+        }
+
+        // A tag from the same label under the NUL convention is a foreign
+        // domain and must be refused.
+        let foreign = hmac_proof(
+            MacDomain::new("vbuff-mcp-lease-v1"),
+            &session_key,
+            &[
+                &lease.session_id,
+                &lease.issued_at_ms.to_be_bytes(),
+                &lease.expires_at_ms.to_be_bytes(),
+                &lease.policy_hash,
+                &[u8::from(lease.user_consented)],
+            ],
+        )
+        .finish();
+        assert_ne!(foreign, lease.proof);
+        assert!(!lease_proof(&lease, &session_key).unwrap().verify(&foreign));
+
+        // The all-zero key is refused on the verifying path too, not only at
+        // issuance.
+        assert_eq!(
+            lease_proof(&lease, &[0; 32]).err(),
+            Some(IntegrationContractError::InvalidField)
+        );
+        assert!(!lease.allows(
+            &McpReadPolicy::default(),
+            &context(&BTreeSet::from(["AI-shareable".into()])),
+            &[0; 32],
+            150
+        ));
+    }
 
     fn context<'a>(tags: &'a BTreeSet<String>) -> ClipAccessContext<'a> {
         ClipAccessContext {

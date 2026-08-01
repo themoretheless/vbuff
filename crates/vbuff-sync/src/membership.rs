@@ -3,28 +3,39 @@
 //!
 //! Single-writer model: the log opens with the owner device's self-add
 //! (entry 0), and only that owner may author later entries. Every entry
-//! carries an Ed25519 signature over its hash made with the author's
-//! registered signing key, so authorship cannot be forged by rewriting
-//! `added_by`. Concurrent multi-writer membership is intentionally not
-//! supported: strict clock monotonicity fails closed instead of merging
+//! carries an Ed25519 signature over its link preimage made with the
+//! author's registered signing key, so authorship cannot be forged by
+//! rewriting `added_by`. Concurrent multi-writer membership is intentionally
+//! not supported: strict clock monotonicity fails closed instead of merging
 //! competing heads, and stays in place until a CRDT-based design lands.
 //! Ownership transfer is a future signed operation.
+//!
+//! The chain mechanics live in [`crate::chain`]; this module supplies only
+//! the payload layout and the authorization rule.
 
 use std::collections::BTreeMap;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use vbuff_types::validation::is_valid_identifier;
+
+use crate::chain::{ChainEntry, ChainLink, Preimage, SignedChain};
 use crate::clock::HybridLogicalClock;
 use crate::crypto::{SealedEnvelope, seal_to};
-use crate::device_experience::valid_identifier;
 use crate::{Result, SyncError};
 
 /// Maximum byte length of device, author, and clock-node identifiers.
 const MAX_DEVICE_ID_BYTES: usize = 128;
 /// Fail-closed bound on the number of membership entries.
 const MAX_MEMBERSHIP_ENTRIES: usize = 1_024;
+/// Preimage discriminant for [`MembershipAction::Add`].
+const ACTION_ADD: u8 = 1;
+/// Preimage discriminant for [`MembershipAction::Revoke`].
+const ACTION_REVOKE: u8 = 2;
+/// Domain for the whole-set short authentication string.
+const SAS_DOMAIN: &[u8] = b"vbuff-membership-sas-v3";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceMember {
@@ -42,184 +53,129 @@ pub enum MembershipAction {
     Revoke { device_id: String },
 }
 
+/// The signed payload of one membership link.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MembershipEntry {
     pub action: MembershipAction,
     pub added_by: String,
     pub clock: HybridLogicalClock,
-    pub previous_hash: [u8; 32],
-    pub hash: [u8; 32],
-    /// Ed25519 signature over `hash` by the author's registered signing key.
-    #[serde(with = "serde_signature")]
-    pub signature: [u8; 64],
 }
 
-/// Serde support for the fixed-width signature (serde derives arrays only up
-/// to 32 elements); deserialization fails closed on any other length.
-mod serde_signature {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+/// Membership log: a [`SignedChain`] of [`MembershipEntry`] payloads.
+pub type MembershipLog = SignedChain<MembershipEntry>;
+/// One link of a [`MembershipLog`].
+pub type MembershipLink = ChainLink<MembershipEntry>;
 
-    pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
-        value.as_slice().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        <[u8; 64]>::try_from(bytes.as_slice())
-            .map_err(|_| serde::de::Error::custom("membership signature must be 64 bytes"))
-    }
+/// State replayed from the entries preceding the one being authorized.
+#[derive(Debug, Default)]
+pub struct MembershipState {
+    /// Author of entry 0, the only device allowed to author later entries.
+    owner: Option<String>,
+    active: BTreeMap<String, DeviceMember>,
+    previous_clock: Option<HybridLogicalClock>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MembershipLog {
-    pub entries: Vec<MembershipEntry>,
+impl ChainEntry for MembershipEntry {
+    const DOMAIN: &'static [u8] = b"vbuff-membership-entry-v3";
+    const MAX_ENTRIES: usize = MAX_MEMBERSHIP_ENTRIES;
+    const LABEL: &'static str = "membership log";
+
+    /// The log authorizes itself from its own replayed state; there is no
+    /// external key directory to consult.
+    type Authority = ();
+    type State = MembershipState;
+
+    fn extend_preimage(&self, preimage: &mut Preimage) {
+        match &self.action {
+            MembershipAction::Add(member) => {
+                preimage
+                    .byte(ACTION_ADD)
+                    .var(member.device_id.as_bytes())
+                    .fixed(&member.public_key)
+                    .fixed(&member.signing_key);
+            }
+            MembershipAction::Revoke { device_id } => {
+                preimage.byte(ACTION_REVOKE).var(device_id.as_bytes());
+            }
+        }
+        preimage
+            .var(self.added_by.as_bytes())
+            .var(self.clock.node_id.as_bytes())
+            .u64_be(self.clock.physical_ms)
+            .u32_be(self.clock.logical);
+    }
+
+    /// The one key permitted to sign this entry.
+    ///
+    /// Entry 0 is self-certifying: the owner declares the signing key it
+    /// will use. Later entries must be signed with the key registered for
+    /// the author by the replayed active set, so revoking a device also
+    /// revokes its ability to author.
+    fn expected_signing_key(
+        &self,
+        index: usize,
+        state: &MembershipState,
+        _authority: &(),
+    ) -> Result<[u8; 32]> {
+        let first = index == 0;
+        validate_entry_semantics(first, state, self)?;
+        if first {
+            match &self.action {
+                MembershipAction::Add(member) => Ok(member.signing_key),
+                MembershipAction::Revoke { .. } => Err(SyncError::Invalid(
+                    "membership log must start by adding its owner".into(),
+                )),
+            }
+        } else {
+            state
+                .active
+                .get(&self.added_by)
+                .map(|member| member.signing_key)
+                .ok_or_else(|| {
+                    SyncError::Invalid(
+                        "membership change was not authorized by an active device".into(),
+                    )
+                })
+        }
+    }
+
+    fn apply(&self, state: &mut MembershipState) {
+        if state.owner.is_none() {
+            state.owner = Some(self.added_by.clone());
+        }
+        apply_action(&mut state.active, &self.action);
+        state.previous_clock = Some(self.clock.clone());
+    }
 }
 
 impl MembershipLog {
     /// Append an entry authored by `added_by` and signed with `author_key`.
     ///
-    /// Fails closed: the log is bounded, identifiers are validated, only the
-    /// owner may author past entry 0, and `author_key` must match the signing
-    /// key registered for the author (the self-declared key for entry 0).
-    pub fn append(
+    /// Thin wrapper over [`SignedChain::append`]; all the fail-closed rules
+    /// live in [`MembershipEntry::expected_signing_key`].
+    pub fn append_change(
         &mut self,
         action: MembershipAction,
         added_by: impl Into<String>,
         clock: HybridLogicalClock,
         author_key: &SigningKey,
     ) -> Result<[u8; 32]> {
-        if self.entries.len() >= MAX_MEMBERSHIP_ENTRIES {
-            return Err(SyncError::Invalid("membership log is full".into()));
-        }
-        let added_by = added_by.into();
-        let active = self.active_members();
-        let owner = self
-            .entries
-            .first()
-            .map_or_else(|| added_by.clone(), |entry| entry.added_by.clone());
-        validate_entry_semantics(
-            self.entries.is_empty(),
-            &owner,
-            &active,
-            &action,
-            &added_by,
-            &clock,
-            self.entries.last().map(|entry| &entry.clock),
-        )?;
-        let expected_signing_key = if self.entries.is_empty() {
-            match &action {
-                MembershipAction::Add(member) => member.signing_key,
-                MembershipAction::Revoke { .. } => {
-                    return Err(SyncError::Invalid(
-                        "membership log must start by adding its owner".into(),
-                    ));
-                }
-            }
-        } else {
-            match active.get(&added_by) {
-                Some(member) => member.signing_key,
-                None => {
-                    return Err(SyncError::Invalid(
-                        "membership change was not authorized by an active device".into(),
-                    ));
-                }
-            }
-        };
-        if author_key.verifying_key().to_bytes() != expected_signing_key {
-            return Err(SyncError::Invalid(
-                "membership author key does not match the registered signing key".into(),
-            ));
-        }
-        let previous_hash = self.head();
-        let hash = entry_hash(&action, &added_by, &clock, &previous_hash)?;
-        let signature = author_key.sign(&hash).to_bytes();
-        self.entries.push(MembershipEntry {
-            action,
-            added_by,
-            clock,
-            previous_hash,
-            hash,
-            signature,
-        });
-        Ok(hash)
-    }
-
-    pub fn head(&self) -> [u8; 32] {
-        self.entries.last().map_or([0; 32], |entry| entry.hash)
-    }
-
-    /// Re-derive and check the whole chain: bound, hashes, entry semantics,
-    /// and each entry's signature against the replayed active set.
-    pub fn verify(&self) -> Result<()> {
-        if self.entries.len() > MAX_MEMBERSHIP_ENTRIES {
-            return Err(SyncError::Invalid(
-                "membership log exceeds the entry limit".into(),
-            ));
-        }
-        let owner = self
-            .entries
-            .first()
-            .map_or_else(String::new, |entry| entry.added_by.clone());
-        let mut previous = [0_u8; 32];
-        let mut previous_clock = None;
-        let mut active = BTreeMap::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            if entry.previous_hash != previous
-                || entry.hash
-                    != entry_hash(
-                        &entry.action,
-                        &entry.added_by,
-                        &entry.clock,
-                        &entry.previous_hash,
-                    )?
-            {
-                return Err(SyncError::Invalid("membership hash chain is broken".into()));
-            }
-            validate_entry_semantics(
-                index == 0,
-                &owner,
-                &active,
-                &entry.action,
-                &entry.added_by,
-                &entry.clock,
-                previous_clock,
-            )?;
-            let signing_key = if index == 0 {
-                match &entry.action {
-                    MembershipAction::Add(member) => member.signing_key,
-                    MembershipAction::Revoke { .. } => {
-                        return Err(SyncError::Invalid(
-                            "membership log must start by adding its owner".into(),
-                        ));
-                    }
-                }
-            } else {
-                match active.get(&entry.added_by) {
-                    Some(member) => member.signing_key,
-                    None => {
-                        return Err(SyncError::Invalid(
-                            "membership change was not authorized by an active device".into(),
-                        ));
-                    }
-                }
-            };
-            let key = VerifyingKey::from_bytes(&signing_key).map_err(|_| SyncError::Crypto)?;
-            key.verify(&entry.hash, &Signature::from_bytes(&entry.signature))
-                .map_err(|_| SyncError::Crypto)?;
-            apply_action(&mut active, &entry.action);
-            previous = entry.hash;
-            previous_clock = Some(&entry.clock);
-        }
-        Ok(())
+        self.append(
+            MembershipEntry {
+                action,
+                added_by: added_by.into(),
+                clock,
+            },
+            &(),
+            author_key,
+        )
     }
 
     /// Replay the log into the active device set keyed by device ID.
+    #[must_use]
     pub fn active_members(&self) -> BTreeMap<String, DeviceMember> {
-        let mut members = BTreeMap::new();
-        for entry in &self.entries {
-            apply_action(&mut members, &entry.action);
-        }
-        members
+        self.replay().active
     }
 
     /// Twenty-digit SAS committing to the whole membership head and both
@@ -228,20 +184,27 @@ impl MembershipLog {
     /// The BLAKE3 digest is reduced modulo 10^20, giving log2(10^20) ≈ 66.4
     /// bits of entropy — above the 60-bit floor expected for interactive
     /// pairing ceremonies.
+    ///
+    /// The modulus must have exactly as many digits as the rendering: reducing
+    /// modulo 10^19 while printing twenty digits pins the leading digit to
+    /// zero, which costs 3.3 bits and asks the two humans to compare a digit
+    /// that carries no information.
+    #[must_use]
     pub fn sas(&self, first_key: &[u8; 32], second_key: &[u8; 32]) -> String {
         let (left, right) = if first_key <= second_key {
             (first_key, second_key)
         } else {
             (second_key, first_key)
         };
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"vbuff-membership-sas-v2");
-        hasher.update(&self.head());
-        hasher.update(left);
-        hasher.update(right);
-        let bytes = hasher.finalize();
+        let mut preimage = Preimage::new(SAS_DOMAIN);
+        preimage.fixed(&self.head()).fixed(left).fixed(right);
+        let bytes = blake3::hash(
+            &preimage
+                .finish()
+                .expect("SAS preimage carries only fixed-width fields"),
+        );
         let value = u128::from_le_bytes(bytes.as_bytes()[0..16].try_into().unwrap())
-            % 10_000_000_000_000_000_000_u128;
+            % 100_000_000_000_000_000_000_u128;
         let digits = format!("{value:020}");
         format!(
             "{}-{}-{}-{}",
@@ -255,66 +218,66 @@ impl MembershipLog {
 
 fn validate_entry_semantics(
     first: bool,
-    owner: &str,
-    active: &BTreeMap<String, DeviceMember>,
-    action: &MembershipAction,
-    added_by: &str,
-    clock: &HybridLogicalClock,
-    previous_clock: Option<&HybridLogicalClock>,
+    state: &MembershipState,
+    entry: &MembershipEntry,
 ) -> Result<()> {
-    if !valid_identifier(added_by, MAX_DEVICE_ID_BYTES) {
+    if !is_valid_identifier(&entry.added_by, MAX_DEVICE_ID_BYTES) {
         return Err(SyncError::Invalid(
             "membership author identifier is invalid".into(),
         ));
     }
-    if !valid_identifier(&clock.node_id, MAX_DEVICE_ID_BYTES) {
+    if !is_valid_identifier(&entry.clock.node_id, MAX_DEVICE_ID_BYTES) {
         return Err(SyncError::Invalid(
             "membership clock node identifier is invalid".into(),
         ));
     }
     if first {
-        let MembershipAction::Add(member) = action else {
+        let MembershipAction::Add(member) = &entry.action else {
             return Err(SyncError::Invalid(
                 "membership log must start by adding its owner".into(),
             ));
         };
-        if member.device_id != added_by {
+        if member.device_id != entry.added_by {
             return Err(SyncError::Invalid(
                 "first membership entry must be self-added".into(),
             ));
         }
     } else {
-        if added_by != owner {
+        if state.owner.as_deref() != Some(entry.added_by.as_str()) {
             return Err(SyncError::Invalid(
                 "membership entries after the first are authored only by the owner".into(),
             ));
         }
-        if !active.contains_key(added_by) {
+        if !state.active.contains_key(&entry.added_by) {
             return Err(SyncError::Invalid(
                 "membership change was not authorized by an active device".into(),
             ));
         }
     }
-    if previous_clock.is_some_and(|previous| clock <= previous) {
+    if state
+        .previous_clock
+        .as_ref()
+        .is_some_and(|previous| &entry.clock <= previous)
+    {
         return Err(SyncError::Invalid(
             "membership clock must advance monotonically".into(),
         ));
     }
-    match action {
+    match &entry.action {
         MembershipAction::Add(member) => {
-            if !valid_identifier(&member.device_id, MAX_DEVICE_ID_BYTES) {
+            if !is_valid_identifier(&member.device_id, MAX_DEVICE_ID_BYTES) {
                 return Err(SyncError::Invalid("device identifier is invalid".into()));
             }
-            if active.contains_key(&member.device_id) {
+            if state.active.contains_key(&member.device_id) {
                 return Err(SyncError::Invalid("device is already active".into()));
             }
             validate_public_key(&member.public_key)
         }
         MembershipAction::Revoke { device_id } => {
-            if !valid_identifier(device_id, MAX_DEVICE_ID_BYTES) {
+            if !is_valid_identifier(device_id, MAX_DEVICE_ID_BYTES) {
                 return Err(SyncError::Invalid("device identifier is invalid".into()));
             }
-            if !active.contains_key(device_id) {
+            if !state.active.contains_key(device_id) {
                 return Err(SyncError::Invalid(
                     "cannot revoke a device that is not active".into(),
                 ));
@@ -357,12 +320,12 @@ pub fn revoke_and_rekey(
     new_group_key: &[u8; 32],
     author_key: &SigningKey,
 ) -> Result<EpochTransition> {
-    log.verify()?;
+    log.verify(&())?;
     if !log.active_members().contains_key(revoked_device) {
         return Err(SyncError::Invalid("device is not an active member".into()));
     }
     let mut staged = log.clone();
-    staged.append(
+    staged.append_change(
         MembershipAction::Revoke {
             device_id: revoked_device.into(),
         },
@@ -405,23 +368,12 @@ fn validate_public_key(bytes: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-fn entry_hash(
-    action: &MembershipAction,
-    added_by: &str,
-    clock: &HybridLogicalClock,
-    previous_hash: &[u8; 32],
-) -> Result<[u8; 32]> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"vbuff-membership-entry-v2");
-    hasher.update(previous_hash);
-    hasher.update(&serde_json::to_vec(&(action, added_by, clock))?);
-    Ok(*hasher.finalize().as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::link_preimage;
     use crate::crypto::open_sealed;
+    use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
     use x25519_dalek::{PublicKey, StaticSecret};
 
     fn member_parts(
@@ -443,14 +395,14 @@ mod tests {
         let (_, a_key, a_member) = member_parts("a", 21, 22);
         let (_, b_key, b_member) = member_parts("b", 23, 24);
         let mut log = MembershipLog::default();
-        log.append(
+        log.append_change(
             MembershipAction::Add(a_member),
             "a",
             HybridLogicalClock::new("a", 1),
             &a_key,
         )
         .unwrap();
-        log.append(
+        log.append_change(
             MembershipAction::Add(b_member),
             "a",
             HybridLogicalClock::new("a", 2),
@@ -460,37 +412,191 @@ mod tests {
         (log, a_key, b_key)
     }
 
+    fn state_before(log: &MembershipLog, index: usize) -> MembershipState {
+        let mut state = MembershipState::default();
+        for link in &log.entries[..index] {
+            link.payload.apply(&mut state);
+        }
+        state
+    }
+
+    fn reseal(link: &mut MembershipLink, key: &SigningKey) {
+        let preimage = link_preimage(&link.payload, &link.previous_hash).unwrap();
+        link.hash = *blake3::hash(&preimage).as_bytes();
+        link.signature = key.sign(&preimage).to_bytes();
+    }
+
+    #[test]
+    fn membership_link_preimage_is_pinned() {
+        // Hand-derived layout: domain, NUL, previous hash, action tag,
+        // length-prefixed device id, both keys, length-prefixed author,
+        // length-prefixed clock node, physical BE u64, logical BE u32.
+        let entry = MembershipEntry {
+            action: MembershipAction::Add(DeviceMember {
+                device_id: "d1".into(),
+                public_key: [3; 32],
+                signing_key: [4; 32],
+            }),
+            added_by: "d1".into(),
+            clock: HybridLogicalClock {
+                physical_ms: 258,
+                logical: 1,
+                node_id: "n".into(),
+            },
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"vbuff-membership-entry-v3");
+        expected.push(0);
+        expected.extend_from_slice(&[7; 32]);
+        expected.push(ACTION_ADD);
+        expected.extend_from_slice(&2_u32.to_be_bytes());
+        expected.extend_from_slice(b"d1");
+        expected.extend_from_slice(&[3; 32]);
+        expected.extend_from_slice(&[4; 32]);
+        expected.extend_from_slice(&2_u32.to_be_bytes());
+        expected.extend_from_slice(b"d1");
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        expected.extend_from_slice(b"n");
+        expected.extend_from_slice(&258_u64.to_be_bytes());
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(link_preimage(&entry, &[7; 32]).unwrap(), expected);
+
+        let revoke = MembershipEntry {
+            action: MembershipAction::Revoke {
+                device_id: "d1".into(),
+            },
+            added_by: "d1".into(),
+            clock: HybridLogicalClock {
+                physical_ms: 258,
+                logical: 1,
+                node_id: "n".into(),
+            },
+        };
+        let mut expected_revoke = Vec::new();
+        expected_revoke.extend_from_slice(b"vbuff-membership-entry-v3");
+        expected_revoke.push(0);
+        expected_revoke.extend_from_slice(&[7; 32]);
+        expected_revoke.push(ACTION_REVOKE);
+        expected_revoke.extend_from_slice(&2_u32.to_be_bytes());
+        expected_revoke.extend_from_slice(b"d1");
+        expected_revoke.extend_from_slice(&2_u32.to_be_bytes());
+        expected_revoke.extend_from_slice(b"d1");
+        expected_revoke.extend_from_slice(&1_u32.to_be_bytes());
+        expected_revoke.extend_from_slice(b"n");
+        expected_revoke.extend_from_slice(&258_u64.to_be_bytes());
+        expected_revoke.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(link_preimage(&revoke, &[7; 32]).unwrap(), expected_revoke);
+    }
+
+    #[test]
+    fn stale_v2_entries_fail_to_deserialize() {
+        // The v2 shape carried the hashes next to the payload fields. A log
+        // written by that build must not load at all, rather than load and
+        // be re-verified under v3 rules.
+        let (log, _, _) = two_device_log();
+        let mut value = serde_json::to_value(&log).unwrap();
+        for link in value["entries"].as_array_mut().unwrap() {
+            let payload = link.as_object_mut().unwrap().remove("payload").unwrap();
+            for (key, field) in payload.as_object().unwrap() {
+                link[key.as_str()] = field.clone();
+            }
+        }
+        let v2 = serde_json::to_string(&value).unwrap();
+        assert!(serde_json::from_str::<MembershipLog>(&v2).is_err());
+    }
+
+    #[test]
+    fn append_and_verify_share_one_expected_signing_key() {
+        let (log, a_key, _) = two_device_log();
+        let owner_key = a_key.verifying_key().to_bytes();
+        for (index, link) in log.entries.iter().enumerate() {
+            let state = state_before(&log, index);
+            // The hook is the single authorization decision: `append`
+            // admitted this link only because it names this key, and
+            // `verify` checks the signature against the same value.
+            let expected = link
+                .payload
+                .expected_signing_key(index, &state, &())
+                .unwrap();
+            assert_eq!(expected, owner_key);
+            let key = VerifyingKey::from_bytes(&expected).unwrap();
+            let preimage = link_preimage(&link.payload, &link.previous_hash).unwrap();
+            key.verify(&preimage, &Signature::from_bytes(&link.signature))
+                .unwrap();
+        }
+        log.verify(&()).unwrap();
+
+        // Every other key is refused on append, by the same hook.
+        let mut extended = log.clone();
+        let (_, _, c_member) = member_parts("c", 45, 46);
+        let next = MembershipEntry {
+            action: MembershipAction::Add(c_member),
+            added_by: "a".into(),
+            clock: HybridLogicalClock::new("a", 3),
+        };
+        let state = state_before(&extended, extended.entries.len());
+        assert_eq!(
+            next.expected_signing_key(extended.entries.len(), &state, &())
+                .unwrap(),
+            owner_key
+        );
+        for seed in [0_u8, 1, 99] {
+            let other = SigningKey::from_bytes(&[seed; 32]);
+            assert_ne!(other.verifying_key().to_bytes(), owner_key);
+            assert!(extended.append(next.clone(), &(), &other).is_err());
+        }
+        assert!(extended.append(next, &(), &a_key).is_ok());
+    }
+
+    #[test]
+    fn verify_derives_the_signing_key_from_the_chain_not_from_the_link() {
+        let (mut log, _, _) = two_device_log();
+        let genuine_head = log.head();
+        let attacker = SigningKey::from_bytes(&[77; 32]);
+
+        // Rebind the owner's registered key and re-seal entry 0 under it.
+        let MembershipAction::Add(member) = &mut log.entries[0].payload.action else {
+            unreachable!()
+        };
+        member.signing_key = attacker.verifying_key().to_bytes();
+        reseal(&mut log.entries[0], &attacker);
+        log.entries[1].previous_hash = log.entries[0].hash;
+        let preimage =
+            link_preimage(&log.entries[1].payload, &log.entries[1].previous_hash).unwrap();
+        log.entries[1].hash = *blake3::hash(&preimage).as_bytes();
+        // Entry 1 still carries the real owner's signature, which no longer
+        // matches the key verify derives for it from the replayed state.
+        assert!(log.verify(&()).is_err());
+
+        // Re-signing every link makes the log internally consistent again:
+        // rewriting entry 0 rewrites the root of trust. It is a different
+        // chain, and the head — hence the SAS — says so out of band.
+        reseal(&mut log.entries[1], &attacker);
+        log.verify(&()).unwrap();
+        assert_ne!(log.head(), genuine_head);
+    }
+
     #[test]
     fn signed_entries_verify_and_forged_author_is_rejected() {
         let (log, _, _) = two_device_log();
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
 
         // Forged author with a recomputed hash but no matching signature.
         let mut forged_author = log.clone();
-        let entry = &mut forged_author.entries[1];
-        entry.added_by = "ghost".into();
-        entry.hash = entry_hash(
-            &entry.action,
-            &entry.added_by,
-            &entry.clock,
-            &entry.previous_hash,
-        )
-        .unwrap();
-        assert!(forged_author.verify().is_err());
+        let link = &mut forged_author.entries[1];
+        link.payload.added_by = "ghost".into();
+        link.hash =
+            *blake3::hash(&link_preimage(&link.payload, &link.previous_hash).unwrap()).as_bytes();
+        assert!(forged_author.verify(&()).is_err());
 
         // Forged content under the real author still fails the signature.
         let mut forged_action = log;
         let (_, _, evil) = member_parts("evil", 25, 26);
-        let entry = &mut forged_action.entries[1];
-        entry.action = MembershipAction::Add(evil);
-        entry.hash = entry_hash(
-            &entry.action,
-            &entry.added_by,
-            &entry.clock,
-            &entry.previous_hash,
-        )
-        .unwrap();
-        assert!(forged_action.verify().is_err());
+        let link = &mut forged_action.entries[1];
+        link.payload.action = MembershipAction::Add(evil);
+        link.hash =
+            *blake3::hash(&link_preimage(&link.payload, &link.previous_hash).unwrap()).as_bytes();
+        assert!(forged_action.verify(&()).is_err());
     }
 
     #[test]
@@ -502,7 +608,7 @@ mod tests {
         let mut fresh = MembershipLog::default();
         assert!(
             fresh
-                .append(
+                .append_change(
                     MembershipAction::Add(member),
                     "a",
                     HybridLogicalClock::new("a", 1),
@@ -517,7 +623,7 @@ mod tests {
         let before = log.clone();
         let (_, _, c_member) = member_parts("c", 33, 34);
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Add(c_member),
                 "a",
                 HybridLogicalClock::new("a", 3),
@@ -531,7 +637,7 @@ mod tests {
     #[test]
     fn revoked_device_cannot_author_later_entries() {
         let (mut log, a_key, b_key) = two_device_log();
-        log.append(
+        log.append_change(
             MembershipAction::Revoke {
                 device_id: "b".into(),
             },
@@ -540,12 +646,12 @@ mod tests {
             &a_key,
         )
         .unwrap();
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
 
         let before = log.clone();
         let (_, _, c_member) = member_parts("c", 35, 36);
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Add(c_member),
                 "b",
                 HybridLogicalClock::new("b", 4),
@@ -554,7 +660,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(log, before);
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
     }
 
     #[test]
@@ -564,7 +670,7 @@ mod tests {
         let (_, _, c_member) = member_parts("c", 37, 38);
         // "b" is active and signs with its own key, but is not the owner.
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Add(c_member),
                 "b",
                 HybridLogicalClock::new("b", 3),
@@ -589,8 +695,25 @@ mod tests {
         assert_eq!(sas, log.sas(&[2; 32], &[3; 32]));
         assert_eq!(sas, log.sas(&[3; 32], &[2; 32]));
 
+        // The full twenty-digit space must be reachable. Reducing modulo
+        // 10^19 while printing twenty digits would pin the first digit to
+        // zero, costing 3.3 bits and wasting one of the digits the two humans
+        // read aloud to each other.
+        let leading: Vec<char> = (0..64_u8)
+            .map(|seed| {
+                log.sas(&[seed; 32], &[seed.wrapping_add(1); 32])
+                    .chars()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            leading.iter().any(|digit| *digit != '0'),
+            "the leading SAS digit never varies, so the modulus is too small"
+        );
+
         let (_, _, c_member) = member_parts("c", 39, 40);
-        log.append(
+        log.append_change(
             MembershipAction::Add(c_member),
             "a",
             HybridLogicalClock::new("a", 3),
@@ -608,7 +731,7 @@ mod tests {
             let clock = HybridLogicalClock::new("a", 10);
             let (_, _, bad_member) = member_parts(bad, 41, 42);
             assert!(
-                log.append(
+                log.append_change(
                     MembershipAction::Add(bad_member),
                     "a",
                     clock.clone(),
@@ -617,7 +740,7 @@ mod tests {
                 .is_err()
             );
             assert!(
-                log.append(
+                log.append_change(
                     MembershipAction::Revoke {
                         device_id: bad.into(),
                     },
@@ -629,11 +752,16 @@ mod tests {
             );
             let (_, _, c_member) = member_parts("c", 43, 44);
             assert!(
-                log.append(MembershipAction::Add(c_member.clone()), bad, clock.clone(), &a_key)
-                    .is_err()
+                log.append_change(
+                    MembershipAction::Add(c_member.clone()),
+                    bad,
+                    clock.clone(),
+                    &a_key
+                )
+                .is_err()
             );
             assert!(
-                log.append(
+                log.append_change(
                     MembershipAction::Add(c_member),
                     "a",
                     HybridLogicalClock::new(bad, 10),
@@ -643,14 +771,14 @@ mod tests {
             );
         }
         assert_eq!(log.entries.len(), 2);
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
     }
 
     #[test]
     fn log_is_bounded() {
         let (_, a_key, a_member) = member_parts("a", 51, 52);
         let mut log = MembershipLog::default();
-        log.append(
+        log.append_change(
             MembershipAction::Add(a_member),
             "a",
             HybridLogicalClock::new("a", 1),
@@ -664,7 +792,7 @@ mod tests {
             let mut key_bytes = [0_u8; 32];
             key_bytes[..8].copy_from_slice(&(index as u64 + 10_000).to_le_bytes());
             let signing = SigningKey::from_bytes(&key_bytes);
-            log.append(
+            log.append_change(
                 MembershipAction::Add(DeviceMember {
                     device_id: format!("d{index}"),
                     public_key: PublicKey::from(&secret).to_bytes(),
@@ -677,11 +805,11 @@ mod tests {
             .unwrap();
         }
         assert_eq!(log.entries.len(), MAX_MEMBERSHIP_ENTRIES);
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
 
         let (_, _, extra) = member_parts("overflow", 53, 54);
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Add(extra),
                 "a",
                 HybridLogicalClock::new("a", MAX_MEMBERSHIP_ENTRIES as u64 + 1),
@@ -692,7 +820,7 @@ mod tests {
 
         // A log constructed past the bound fails closed in verify.
         log.entries.push(log.entries[0].clone());
-        assert!(log.verify().is_err());
+        assert!(log.verify(&()).is_err());
     }
 
     #[test]
@@ -732,32 +860,27 @@ mod tests {
     fn sas_commits_to_full_verified_chain() {
         let (_, a_key, a_member) = member_parts("a", 9, 10);
         let mut log = MembershipLog::default();
-        log.append(
+        log.append_change(
             MembershipAction::Add(a_member),
             "a",
             HybridLogicalClock::new("a", 1),
             &a_key,
         )
         .unwrap();
-        log.verify().unwrap();
+        log.verify(&()).unwrap();
         assert_eq!(log.sas(&[2; 32], &[3; 32]), log.sas(&[3; 32], &[2; 32]));
-        log.entries[0].added_by = "attacker".into();
-        assert!(log.verify().is_err());
+        log.entries[0].payload.added_by = "attacker".into();
+        assert!(log.verify(&()).is_err());
     }
 
     #[test]
     fn verification_replays_authorization_even_if_hashes_are_recomputed() {
         let (mut log, _, _) = two_device_log();
-        let entry = &mut log.entries[1];
-        entry.added_by = "ghost".into();
-        entry.hash = entry_hash(
-            &entry.action,
-            &entry.added_by,
-            &entry.clock,
-            &entry.previous_hash,
-        )
-        .unwrap();
-        assert!(log.verify().is_err());
+        let link = &mut log.entries[1];
+        link.payload.added_by = "ghost".into();
+        link.hash =
+            *blake3::hash(&link_preimage(&link.payload, &link.previous_hash).unwrap()).as_bytes();
+        assert!(log.verify(&()).is_err());
     }
 
     #[test]
@@ -765,14 +888,14 @@ mod tests {
         let (a_secret, a_key, a_member) = member_parts("a", 11, 61);
         let (_, _, b_member) = member_parts("b", 12, 62);
         let mut log = MembershipLog::default();
-        log.append(
+        log.append_change(
             MembershipAction::Add(a_member),
             "a",
             HybridLogicalClock::new("a", 1),
             &a_key,
         )
         .unwrap();
-        log.append(
+        log.append_change(
             MembershipAction::Add(b_member),
             "a",
             HybridLogicalClock::new("a", 2),
@@ -804,7 +927,7 @@ mod tests {
         let mut log = MembershipLog::default();
         low_order.public_key = [0; 32];
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Add(low_order),
                 "a",
                 HybridLogicalClock::new("a", 1),
@@ -814,7 +937,7 @@ mod tests {
         );
 
         let (_, _, member) = member_parts("a", 10, 60);
-        log.append(
+        log.append_change(
             MembershipAction::Add(member),
             "a",
             HybridLogicalClock::new("a", 1),
@@ -822,7 +945,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            log.append(
+            log.append_change(
                 MembershipAction::Revoke {
                     device_id: "a".into(),
                 },
@@ -839,14 +962,14 @@ mod tests {
         let (_, a_key, a_member) = member_parts("a", 41, 63);
         let (_, _, b_member) = member_parts("b", 42, 64);
         let mut log = MembershipLog::default();
-        log.append(
+        log.append_change(
             MembershipAction::Add(a_member),
             "a",
             HybridLogicalClock::new("a", 1),
             &a_key,
         )
         .unwrap();
-        log.append(
+        log.append_change(
             MembershipAction::Add(b_member),
             "a",
             HybridLogicalClock::new("a", 2),

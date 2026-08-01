@@ -9,9 +9,8 @@ mod snippets;
 mod timeline;
 
 pub use boards::{
-    ActionCandidate, BoardContext, BoardError, BoardItem, BoardMatcher, BoardRouter,
-    CaptureCollector, Checklist, CollectorJoiner, ConsumeQueue, NamedSlots, PinBoard,
-    SessionBasket, rank_actions,
+    BoardContext, BoardError, BoardItem, BoardMatcher, BoardRouter, CaptureCollector, Checklist,
+    CollectorJoiner, ConsumeQueue, NamedSlots, PinBoard, SessionBasket,
 };
 pub use compare::{
     CompareError, DiffChunk, DiffKind, DiffMode, TextTransform, TransformHistory, TransformOverlay,

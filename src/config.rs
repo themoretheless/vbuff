@@ -9,6 +9,7 @@ use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use vbuff_core::capture::UnknownEvidencePolicy;
 use vbuff_core::onboarding::DefaultProfile;
 use vbuff_gui::{
     DensityMode, HandedMode, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT, UI_SCALE_MIN_PERCENT,
@@ -34,8 +35,6 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// Maximum number of clips to retain (count cap).
     pub max_history: usize,
-    /// Paste modifier: `"cmd"` or `"ctrl"`. Empty/auto = OS default.
-    pub paste_modifier: String,
     /// Source apps to exclude from capture (matched as a substring of the
     /// source-app identifier). Stub-honored in the MVP.
     pub excluded_apps: Vec<String>,
@@ -48,9 +47,8 @@ pub struct Config {
     /// Retention window for structurally detected secrets.
     pub secret_ttl_seconds: u64,
     /// Degradation mode when the clipboard backend cannot prove capture
-    /// evidence: `"guard"` (capture as sensitive), `"skip"` (refuse), or
-    /// `"allow"` (legacy fail-open). Only bites when source rules are armed.
-    pub unknown_evidence_policy: String,
+    /// evidence. Only bites when source rules are armed.
+    pub unknown_evidence_policy: UnknownEvidenceMode,
     /// Full-payload threshold after which capture sheds to a text preview.
     pub capture_soft_limit_bytes: usize,
     /// Absolute per-capture admission cap.
@@ -75,14 +73,14 @@ pub struct Config {
     pub auto_pause_remote: bool,
     /// The summon-shortcut coachmark has been acknowledged on this profile.
     pub hotkey_coachmark_seen: bool,
-    /// Native history-row density: auto, compact, or comfortable.
-    pub ui_density: String,
+    /// Native history-row density.
+    pub ui_density: UiDensity,
     /// Disable non-essential native popup animation.
     pub ui_reduced_motion: Option<bool>,
     /// Show the wide clip preview when the viewport has enough room.
     pub ui_large_preview: bool,
-    /// Optional one-handed keyboard layout: off, left, or right.
-    pub ui_handed_mode: String,
+    /// Optional one-handed keyboard layout.
+    pub ui_handed_mode: UiHandedMode,
     /// Show the local frame/scroll diagnostic overlay.
     pub ui_motion_inspector: bool,
     /// Expand the metadata-only clipboard health digest.
@@ -91,32 +89,20 @@ pub struct Config {
     pub ui_scale_percent: u16,
 }
 
+// Hand-written so the two owner-private lists degrade to counts: a derived
+// `Debug` would dump app identities into any log line that formats a `Config`
+// (directly or through `ConfigHandoff`). The machine-independent keys print
+// through `ShareableConfig`'s own derived `Debug`, so adding a shareable key
+// needs no edit here; only the owner-local keys are enumerated.
 impl fmt::Debug for Config {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Config")
             .field("schema_version", &self.schema_version)
-            .field("hotkey", &self.hotkey)
-            .field("poll_interval_ms", &self.poll_interval_ms)
-            .field("max_history", &self.max_history)
-            .field("paste_modifier", &self.paste_modifier)
+            .field("shared", &self.shareable())
             .field("excluded_app_count", &self.excluded_apps.len())
             .field("source_rule_count", &self.source_rules.len())
-            .field("skip_whitespace_only", &self.skip_whitespace_only)
-            .field("detect_secrets", &self.detect_secrets)
-            .field("secret_ttl_seconds", &self.secret_ttl_seconds)
             .field("unknown_evidence_policy", &self.unknown_evidence_policy)
-            .field("capture_soft_limit_bytes", &self.capture_soft_limit_bytes)
-            .field("capture_hard_limit_bytes", &self.capture_hard_limit_bytes)
-            .field("capture_preview_bytes", &self.capture_preview_bytes)
-            .field("memory_soft_limit_mb", &self.memory_soft_limit_mb)
-            .field("memory_hard_limit_mb", &self.memory_hard_limit_mb)
-            .field("strict_security_mode", &self.strict_security_mode)
-            .field("launch_at_login", &self.launch_at_login)
-            .field("default_profile", &self.default_profile)
-            .field("auto_pause_idle_seconds", &self.auto_pause_idle_seconds)
-            .field("auto_pause_on_lock", &self.auto_pause_on_lock)
-            .field("auto_pause_remote", &self.auto_pause_remote)
             .field("hotkey_coachmark_seen", &self.hotkey_coachmark_seen)
             .field("ui_density", &self.ui_density)
             .field("ui_reduced_motion", &self.ui_reduced_motion)
@@ -136,13 +122,12 @@ impl Default for Config {
             hotkey: default_hotkey().to_string(),
             poll_interval_ms: 300,
             max_history: 500,
-            paste_modifier: String::new(),
             excluded_apps: Vec::new(),
             source_rules: Vec::new(),
             skip_whitespace_only: true,
             detect_secrets: true,
             secret_ttl_seconds: 10 * 60,
-            unknown_evidence_policy: "guard".into(),
+            unknown_evidence_policy: UnknownEvidenceMode::Guard,
             capture_soft_limit_bytes: 16 * 1024 * 1024,
             capture_hard_limit_bytes: 128 * 1024 * 1024,
             capture_preview_bytes: 256 * 1024,
@@ -155,10 +140,10 @@ impl Default for Config {
             auto_pause_on_lock: true,
             auto_pause_remote: true,
             hotkey_coachmark_seen: false,
-            ui_density: "auto".into(),
+            ui_density: UiDensity::Auto,
             ui_reduced_motion: None,
             ui_large_preview: true,
-            ui_handed_mode: "off".into(),
+            ui_handed_mode: UiHandedMode::Off,
             ui_motion_inspector: false,
             ui_show_health_digest: false,
             ui_scale_percent: UI_SCALE_DEFAULT_PERCENT,
@@ -198,29 +183,164 @@ pub enum SourceRuleAction {
     CaptureSensitive,
 }
 
-/// Deliberately excludes app exclusions, source rules, and clipboard data.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ShareableConfig {
-    pub schema: u16,
-    pub hotkey: String,
-    pub poll_interval_ms: u64,
-    pub max_history: usize,
-    pub paste_modifier: String,
-    pub skip_whitespace_only: bool,
-    pub detect_secrets: bool,
-    pub secret_ttl_seconds: u64,
-    pub capture_soft_limit_bytes: usize,
-    pub capture_hard_limit_bytes: usize,
-    pub capture_preview_bytes: usize,
-    pub memory_soft_limit_mb: usize,
-    pub memory_hard_limit_mb: usize,
-    pub strict_security_mode: bool,
-    pub launch_at_login: bool,
-    pub default_profile: Option<DefaultProfile>,
-    pub auto_pause_idle_seconds: u64,
-    pub auto_pause_on_lock: bool,
-    pub auto_pause_remote: bool,
+/// Degradation mode when the clipboard backend cannot prove capture evidence.
+///
+/// Owned here rather than reused from `vbuff_core` for the same reason
+/// [`SourceRuleAction`] is: the on-disk spelling of a mode is a config-format
+/// decision, not a domain one, so renaming a domain variant cannot silently
+/// invalidate every user's `config.toml`. Deserialization rejects anything
+/// outside this set, and the conversion below is exhaustive, so a mode can
+/// neither be misspelled on disk nor left unmapped in the gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownEvidenceMode {
+    /// Capture, but route the clip into the masked sensitive lane instead of
+    /// matching source rules against evidence the backend never supplied.
+    #[default]
+    Guard,
+    /// Refuse the capture outright.
+    Skip,
+    /// Legacy fail-open: evaluate source rules against absent evidence.
+    Allow,
+}
+
+impl From<UnknownEvidenceMode> for UnknownEvidencePolicy {
+    fn from(mode: UnknownEvidenceMode) -> Self {
+        match mode {
+            UnknownEvidenceMode::Guard => Self::Guard,
+            UnknownEvidenceMode::Skip => Self::Skip,
+            UnknownEvidenceMode::Allow => Self::Allow,
+        }
+    }
+}
+
+/// Native history-row density, as persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    #[default]
+    Auto,
+    Compact,
+    Comfortable,
+}
+
+impl From<UiDensity> for DensityMode {
+    fn from(density: UiDensity) -> Self {
+        match density {
+            UiDensity::Auto => Self::Auto,
+            UiDensity::Compact => Self::Compact,
+            UiDensity::Comfortable => Self::Comfortable,
+        }
+    }
+}
+
+impl From<DensityMode> for UiDensity {
+    fn from(density: DensityMode) -> Self {
+        match density {
+            DensityMode::Auto => Self::Auto,
+            DensityMode::Compact => Self::Compact,
+            DensityMode::Comfortable => Self::Comfortable,
+        }
+    }
+}
+
+/// Optional one-handed keyboard layout, as persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiHandedMode {
+    #[default]
+    Off,
+    Left,
+    Right,
+}
+
+impl From<UiHandedMode> for HandedMode {
+    fn from(handed: UiHandedMode) -> Self {
+        match handed {
+            UiHandedMode::Off => Self::Off,
+            UiHandedMode::Left => Self::Left,
+            UiHandedMode::Right => Self::Right,
+        }
+    }
+}
+
+impl From<HandedMode> for UiHandedMode {
+    fn from(handed: HandedMode) -> Self {
+        match handed {
+            HandedMode::Off => Self::Off,
+            HandedMode::Left => Self::Left,
+            HandedMode::Right => Self::Right,
+        }
+    }
+}
+
+/// Emits [`ShareableConfig`] together with both halves of its mapping to
+/// [`Config`] from a single field list.
+///
+/// Export and import are generated from the same names, so they cannot drift:
+/// a key that is written by `Config::shareable` is by construction read back
+/// by `Config::apply_shareable`, and a key omitted from the list is owner-local
+/// in both directions. The field must exist on `Config` with the same name and
+/// type or the expansion fails to compile.
+macro_rules! shareable_config {
+    ($($field:ident: $type:ty,)+) => {
+        /// Deliberately excludes app exclusions, source rules, evidence policy,
+        /// UI state, and clipboard data.
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct ShareableConfig {
+            pub schema: u16,
+            $(pub $field: $type,)+
+            /// Inert legacy field. Paste injection resolves its modifier from
+            /// the platform, never from configuration, so this value is neither
+            /// applied nor produced; it stays on the wire only so schema-2
+            /// exports written by older builds keep importing, and so exports
+            /// written here keep importing on those builds
+            /// (`deny_unknown_fields` bites in both directions).
+            pub paste_modifier: String,
+        }
+
+        impl Config {
+            /// Project the machine-independent subset for `vbuff config export`.
+            pub fn shareable(&self) -> ShareableConfig {
+                ShareableConfig {
+                    schema: SHAREABLE_CONFIG_SCHEMA,
+                    // Called as a free function so the one list can mix owned
+                    // values with `Copy` scalars.
+                    $($field: Clone::clone(&self.$field),)+
+                    paste_modifier: String::new(),
+                }
+            }
+
+            /// Adopt a validated shareable subset, leaving owner-local policy
+            /// (exclusions, source rules, evidence policy, UI state) untouched.
+            pub fn apply_shareable(&mut self, shared: ShareableConfig) -> anyhow::Result<()> {
+                shared.validate()?;
+                $(self.$field = shared.$field;)+
+                Ok(())
+            }
+        }
+    };
+}
+
+shareable_config! {
+    hotkey: String,
+    poll_interval_ms: u64,
+    max_history: usize,
+    skip_whitespace_only: bool,
+    detect_secrets: bool,
+    secret_ttl_seconds: u64,
+    capture_soft_limit_bytes: usize,
+    capture_hard_limit_bytes: usize,
+    capture_preview_bytes: usize,
+    memory_soft_limit_mb: usize,
+    memory_hard_limit_mb: usize,
+    strict_security_mode: bool,
+    launch_at_login: bool,
+    default_profile: Option<DefaultProfile>,
+    auto_pause_idle_seconds: u64,
+    auto_pause_on_lock: bool,
+    auto_pause_remote: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -337,53 +457,6 @@ impl Config {
         Ok(())
     }
 
-    pub fn shareable(&self) -> ShareableConfig {
-        ShareableConfig {
-            schema: SHAREABLE_CONFIG_SCHEMA,
-            hotkey: self.hotkey.clone(),
-            poll_interval_ms: self.poll_interval_ms,
-            max_history: self.max_history,
-            paste_modifier: self.paste_modifier.clone(),
-            skip_whitespace_only: self.skip_whitespace_only,
-            detect_secrets: self.detect_secrets,
-            secret_ttl_seconds: self.secret_ttl_seconds,
-            capture_soft_limit_bytes: self.capture_soft_limit_bytes,
-            capture_hard_limit_bytes: self.capture_hard_limit_bytes,
-            capture_preview_bytes: self.capture_preview_bytes,
-            memory_soft_limit_mb: self.memory_soft_limit_mb,
-            memory_hard_limit_mb: self.memory_hard_limit_mb,
-            strict_security_mode: self.strict_security_mode,
-            launch_at_login: self.launch_at_login,
-            default_profile: self.default_profile,
-            auto_pause_idle_seconds: self.auto_pause_idle_seconds,
-            auto_pause_on_lock: self.auto_pause_on_lock,
-            auto_pause_remote: self.auto_pause_remote,
-        }
-    }
-
-    pub fn apply_shareable(&mut self, shared: ShareableConfig) -> anyhow::Result<()> {
-        shared.validate()?;
-        self.hotkey = shared.hotkey;
-        self.poll_interval_ms = shared.poll_interval_ms;
-        self.max_history = shared.max_history;
-        self.paste_modifier = shared.paste_modifier;
-        self.skip_whitespace_only = shared.skip_whitespace_only;
-        self.detect_secrets = shared.detect_secrets;
-        self.secret_ttl_seconds = shared.secret_ttl_seconds;
-        self.capture_soft_limit_bytes = shared.capture_soft_limit_bytes;
-        self.capture_hard_limit_bytes = shared.capture_hard_limit_bytes;
-        self.capture_preview_bytes = shared.capture_preview_bytes;
-        self.memory_soft_limit_mb = shared.memory_soft_limit_mb;
-        self.memory_hard_limit_mb = shared.memory_hard_limit_mb;
-        self.strict_security_mode = shared.strict_security_mode;
-        self.launch_at_login = shared.launch_at_login;
-        self.default_profile = shared.default_profile;
-        self.auto_pause_idle_seconds = shared.auto_pause_idle_seconds;
-        self.auto_pause_on_lock = shared.auto_pause_on_lock;
-        self.auto_pause_remote = shared.auto_pause_remote;
-        Ok(())
-    }
-
     pub fn apply_default_profile(&mut self, profile: DefaultProfile) {
         let defaults = profile.defaults();
         self.default_profile = Some(profile);
@@ -401,21 +474,13 @@ impl Config {
 
     pub fn ui_preferences(&self) -> UiPreferences {
         UiPreferences {
-            density: match self.ui_density.as_str() {
-                "compact" => DensityMode::Compact,
-                "comfortable" => DensityMode::Comfortable,
-                _ => DensityMode::Auto,
-            },
+            density: self.ui_density.into(),
             reduced_motion: self
                 .ui_reduced_motion
                 .or_else(vbuff_platform::desktop::reduced_motion_preference)
                 .unwrap_or(false),
             large_preview: self.ui_large_preview,
-            handed_mode: match self.ui_handed_mode.as_str() {
-                "left" => HandedMode::Left,
-                "right" => HandedMode::Right,
-                _ => HandedMode::Off,
-            },
+            handed_mode: self.ui_handed_mode.into(),
             motion_inspector: self.ui_motion_inspector,
             show_health_digest: self.ui_show_health_digest,
             ui_scale_percent: snap_ui_scale_percent(self.ui_scale_percent),
@@ -427,22 +492,12 @@ impl Config {
         preferences: &UiPreferences,
         reduced_motion_changed: bool,
     ) {
-        self.ui_density = match preferences.density {
-            DensityMode::Auto => "auto",
-            DensityMode::Compact => "compact",
-            DensityMode::Comfortable => "comfortable",
-        }
-        .into();
+        self.ui_density = preferences.density.into();
         if reduced_motion_changed {
             self.ui_reduced_motion = Some(preferences.reduced_motion);
         }
         self.ui_large_preview = preferences.large_preview;
-        self.ui_handed_mode = match preferences.handed_mode {
-            HandedMode::Off => "off",
-            HandedMode::Left => "left",
-            HandedMode::Right => "right",
-        }
-        .into();
+        self.ui_handed_mode = preferences.handed_mode.into();
         self.ui_motion_inspector = preferences.motion_inspector;
         self.ui_show_health_digest = preferences.show_health_digest;
         self.ui_scale_percent = preferences
@@ -465,21 +520,10 @@ impl Config {
             );
         }
         anyhow::ensure!(self.source_rules.len() <= 1_024, "too many source rules");
-        anyhow::ensure!(
-            matches!(
-                self.unknown_evidence_policy.as_str(),
-                "guard" | "skip" | "allow"
-            ),
-            "invalid unknown evidence policy"
-        );
-        anyhow::ensure!(
-            matches!(self.ui_density.as_str(), "auto" | "compact" | "comfortable"),
-            "invalid UI density"
-        );
-        anyhow::ensure!(
-            matches!(self.ui_handed_mode.as_str(), "off" | "left" | "right"),
-            "invalid handed mode"
-        );
+        // `unknown_evidence_policy`, `ui_density` and `ui_handed_mode` are not
+        // re-checked here: they are enums, so an out-of-set value cannot reach
+        // a `Config` at all. Deserialization already refused it, and by name.
+        // The interface scale is a plain number, so its range is still checked.
         anyhow::ensure!(
             (UI_SCALE_MIN_PERCENT..=UI_SCALE_MAX_PERCENT).contains(&self.ui_scale_percent),
             "invalid UI scale percent"
@@ -541,6 +585,8 @@ impl ShareableConfig {
                 && self.memory_hard_limit_mb <= 1024 * 1024,
             "invalid memory limits"
         );
+        // Inert, but still vetted: a schema-2 export carrying garbage here is
+        // malformed regardless of the fact that nothing consumes the value.
         anyhow::ensure!(
             matches!(self.paste_modifier.as_str(), "" | "auto" | "cmd" | "ctrl"),
             "invalid paste modifier"
@@ -799,7 +845,6 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "hotkey",
         "poll_interval_ms",
         "max_history",
-        "paste_modifier",
         "excluded_apps",
         "source_rules",
         "skip_whitespace_only",
@@ -826,6 +871,11 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "ui_show_health_digest",
         "ui_scale_percent",
     ];
+    // Keys older builds wrote that no longer map to anything. They are still
+    // accepted so an existing config.toml keeps loading, and they disappear
+    // the next time the file is rewritten. `paste_modifier` never reached the
+    // paste path: injection resolves its modifier from the platform.
+    const RETIRED_CONFIG_KEYS: &[&str] = &["paste_modifier"];
     const SOURCE_RULE_KEYS: &[&str] = &["app_contains", "title_regex", "url_host_suffix", "action"];
 
     let table = value
@@ -833,7 +883,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("config must be a TOML table"))?;
     for key in table.keys() {
         anyhow::ensure!(
-            CONFIG_KEYS.contains(&key.as_str()),
+            CONFIG_KEYS.contains(&key.as_str()) || RETIRED_CONFIG_KEYS.contains(&key.as_str()),
             "unknown config key `{key}`"
         );
     }
@@ -950,27 +1000,259 @@ mod tests {
     }
 
     #[test]
+    fn retired_paste_modifier_key_still_loads_but_no_longer_exists() {
+        // The knob never reached the paste path, so it was dropped from the
+        // model. An existing config that still carries it must keep loading
+        // rather than failing as an unknown key.
+        let text = "schema_version = 2\npaste_modifier = \"cmd\"\n";
+        let parsed = parse_runtime_config(text).unwrap();
+        parsed.validate().unwrap();
+        // The value is gone from the runtime model: exporting no longer
+        // claims a modifier preference the paste path would ignore.
+        assert_eq!(parsed.shareable().paste_modifier, "");
+        // Real typos are still rejected.
+        assert!(parse_runtime_config("schema_version = 2\npaste_modifer = \"cmd\"\n").is_err());
+    }
+
+    #[test]
     fn unknown_evidence_policy_defaults_to_guard_and_validates() {
         // A config written before the key existed stays fail closed.
         let legacy = "schema_version = 2\nhotkey = \"Ctrl+Shift+V\"\n";
         let parsed = parse_runtime_config(legacy).unwrap();
-        assert_eq!(parsed.unknown_evidence_policy, "guard");
+        assert_eq!(parsed.unknown_evidence_policy, UnknownEvidenceMode::Guard);
         parsed.validate().unwrap();
 
-        for mode in ["guard", "skip", "allow"] {
-            let text = format!("schema_version = 2\nunknown_evidence_policy = \"{mode}\"\n");
+        for (spelling, mode) in [
+            ("guard", UnknownEvidenceMode::Guard),
+            ("skip", UnknownEvidenceMode::Skip),
+            ("allow", UnknownEvidenceMode::Allow),
+        ] {
+            let text = format!("schema_version = 2\nunknown_evidence_policy = \"{spelling}\"\n");
             let parsed = parse_runtime_config(&text).unwrap();
             assert_eq!(parsed.unknown_evidence_policy, mode);
             parsed.validate().unwrap();
         }
 
+        // Out-of-set values no longer survive parsing at all, so there is no
+        // window in which a `Config` holds one and a forgotten check waves it
+        // through.
         let invalid = "schema_version = 2\nunknown_evidence_policy = \"yolo\"\n";
-        let parsed = parse_runtime_config(invalid).unwrap();
-        assert!(parsed.validate().is_err());
+        assert!(parse_runtime_config(invalid).is_err());
+        assert!(toml::from_str::<Config>(invalid).is_err());
 
         // Unknown keys are still rejected alongside the new one.
         let typo = "schema_version = 2\nunknown_evidence_polici = \"skip\"\n";
         assert!(parse_runtime_config(typo).is_err());
+    }
+
+    #[test]
+    fn invalid_enum_values_are_refused_while_parsing_and_name_the_accepted_set() {
+        // The three enum keys used to be `String` plus a hand-written check in
+        // `validate`; the error must not have become less useful for having
+        // moved into the parser.
+        for (key, accepted) in [
+            ("unknown_evidence_policy", ["guard", "skip", "allow"]),
+            ("ui_density", ["auto", "compact", "comfortable"]),
+            ("ui_handed_mode", ["off", "left", "right"]),
+        ] {
+            let text = format!("schema_version = 2\n{key} = \"yolo\"\n");
+            let error = parse_runtime_config(&text).unwrap_err().to_string();
+            // e.g. "TOML parse error at line 2, column 27 / ... / unknown
+            // variant `yolo`, expected one of `guard`, `skip`, `allow`",
+            // strictly more than the old "invalid unknown evidence policy".
+            assert!(error.contains("unknown variant `yolo`"), "{key}: {error}");
+            assert!(error.contains(key), "{key}: {error}");
+            for value in accepted {
+                assert!(error.contains(value), "{key}: {error} omits `{value}`");
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_enum_spellings_are_pinned_to_what_older_builds_wrote() {
+        // These strings are the on-disk format. Renaming a variant without
+        // renaming the spelling would invalidate every existing config.toml.
+        for (mode, spelling) in [
+            (UnknownEvidenceMode::Guard, "\"guard\""),
+            (UnknownEvidenceMode::Skip, "\"skip\""),
+            (UnknownEvidenceMode::Allow, "\"allow\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), spelling);
+        }
+        for (density, spelling) in [
+            (UiDensity::Auto, "\"auto\""),
+            (UiDensity::Compact, "\"compact\""),
+            (UiDensity::Comfortable, "\"comfortable\""),
+        ] {
+            assert_eq!(serde_json::to_string(&density).unwrap(), spelling);
+        }
+        for (handed, spelling) in [
+            (UiHandedMode::Off, "\"off\""),
+            (UiHandedMode::Left, "\"left\""),
+            (UiHandedMode::Right, "\"right\""),
+        ] {
+            assert_eq!(serde_json::to_string(&handed).unwrap(), spelling);
+        }
+    }
+
+    #[test]
+    fn persisted_ui_enums_round_trip_through_the_gui_types() {
+        // Both directions come from separate `From` impls; a mis-wired arm in
+        // either one would survive a one-way test.
+        for density in [UiDensity::Auto, UiDensity::Compact, UiDensity::Comfortable] {
+            assert_eq!(UiDensity::from(DensityMode::from(density)), density);
+        }
+        for handed in [UiHandedMode::Off, UiHandedMode::Left, UiHandedMode::Right] {
+            assert_eq!(UiHandedMode::from(HandedMode::from(handed)), handed);
+        }
+    }
+
+    #[test]
+    fn an_existing_owner_config_with_every_key_still_loads() {
+        // What a real config.toml looks like once every knob has been touched,
+        // retired key included.
+        let text = r#"
+schema_version = 2
+hotkey = "Ctrl+Shift+V"
+poll_interval_ms = 300
+max_history = 500
+excluded_apps = ["private-bank-app"]
+skip_whitespace_only = true
+detect_secrets = true
+secret_ttl_seconds = 600
+unknown_evidence_policy = "skip"
+capture_soft_limit_bytes = 16777216
+capture_hard_limit_bytes = 134217728
+capture_preview_bytes = 262144
+memory_soft_limit_mb = 512
+memory_hard_limit_mb = 1024
+strict_security_mode = true
+launch_at_login = true
+default_profile = "privacy_max"
+auto_pause_idle_seconds = 900
+auto_pause_on_lock = true
+auto_pause_remote = true
+hotkey_coachmark_seen = true
+ui_density = "comfortable"
+ui_reduced_motion = true
+ui_large_preview = false
+ui_handed_mode = "left"
+ui_motion_inspector = true
+ui_show_health_digest = true
+paste_modifier = "cmd"
+
+[[source_rules]]
+app_contains = "private-app"
+action = "capture_sensitive"
+"#;
+        let config = parse_runtime_config(text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.unknown_evidence_policy, UnknownEvidenceMode::Skip);
+        assert_eq!(config.ui_density, UiDensity::Comfortable);
+        assert_eq!(config.ui_handed_mode, UiHandedMode::Left);
+        assert_eq!(config.default_profile, Some(DefaultProfile::PrivacyMax));
+        assert_eq!(config.excluded_apps, vec!["private-bank-app"]);
+        assert_eq!(config.source_rules.len(), 1);
+
+        // Rewriting drops the retired key and keeps everything else loadable.
+        let rewritten = toml::to_string_pretty(&config).unwrap();
+        assert!(!rewritten.contains("paste_modifier"));
+        let reloaded = parse_runtime_config(&rewritten).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded.ui_density, UiDensity::Comfortable);
+        assert_eq!(reloaded.unknown_evidence_policy, UnknownEvidenceMode::Skip);
+        assert_eq!(
+            reloaded.source_rules[0].app_contains.as_deref(),
+            Some("private-app")
+        );
+    }
+
+    #[test]
+    fn shareable_export_and_import_cover_the_same_keys() {
+        // Every shareable key set away from its default: if `shareable` wrote a
+        // key that `apply_shareable` never read back (or the reverse), the
+        // adopted config would fall back to the default for it.
+        let custom = Config {
+            hotkey: "Ctrl+Alt+B".into(),
+            poll_interval_ms: 137,
+            max_history: 321,
+            skip_whitespace_only: false,
+            detect_secrets: false,
+            secret_ttl_seconds: 42,
+            capture_soft_limit_bytes: 3 * 1024 * 1024,
+            capture_hard_limit_bytes: 7 * 1024 * 1024,
+            capture_preview_bytes: 1024,
+            memory_soft_limit_mb: 64,
+            memory_hard_limit_mb: 128,
+            strict_security_mode: true,
+            launch_at_login: true,
+            default_profile: Some(DefaultProfile::Developer),
+            auto_pause_idle_seconds: 120,
+            auto_pause_on_lock: false,
+            auto_pause_remote: false,
+            ..Config::default()
+        };
+        let exported = toml::to_string_pretty(&custom.shareable()).unwrap();
+        let imported: ShareableConfig = toml::from_str(&exported).unwrap();
+        let mut adopted = Config::default();
+        adopted.apply_shareable(imported).unwrap();
+        assert_eq!(adopted.shareable(), custom.shareable());
+
+        // Guard the fixture itself: a shareable key added later but left at its
+        // default here would make the assertion above vacuous for that key.
+        let exported_table: toml::Table = toml::from_str(&exported).unwrap();
+        let default_export = toml::to_string_pretty(&Config::default().shareable()).unwrap();
+        let default_table: toml::Table = toml::from_str(&default_export).unwrap();
+        for (key, value) in &exported_table {
+            if key == "schema" || key == "paste_modifier" {
+                continue;
+            }
+            assert_ne!(
+                Some(value),
+                default_table.get(key),
+                "`{key}` is still at its default; the round trip does not prove it moved"
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_two_export_from_an_older_build_still_imports() {
+        // Byte-for-byte in the shape the previous build's `config export`
+        // wrote, inert `paste_modifier` and original key order included.
+        let older = r#"
+schema = 2
+hotkey = "Ctrl+Shift+V"
+poll_interval_ms = 300
+max_history = 500
+paste_modifier = "cmd"
+skip_whitespace_only = true
+detect_secrets = true
+secret_ttl_seconds = 600
+capture_soft_limit_bytes = 16777216
+capture_hard_limit_bytes = 134217728
+capture_preview_bytes = 262144
+memory_soft_limit_mb = 512
+memory_hard_limit_mb = 1024
+strict_security_mode = false
+launch_at_login = false
+auto_pause_idle_seconds = 900
+auto_pause_on_lock = true
+auto_pause_remote = true
+"#;
+        let shared: ShareableConfig = toml::from_str(older).unwrap();
+        let mut config = Config::default();
+        config.apply_shareable(shared).unwrap();
+        assert_eq!(config.max_history, 500);
+        assert_eq!(config.auto_pause_idle_seconds, 900);
+
+        // And the reverse direction still holds: today's export keeps the inert
+        // key on the wire, so that older build's `deny_unknown_fields` import
+        // does not trip over a missing field.
+        assert!(
+            toml::to_string_pretty(&config.shareable())
+                .unwrap()
+                .contains("paste_modifier")
+        );
     }
 
     #[test]

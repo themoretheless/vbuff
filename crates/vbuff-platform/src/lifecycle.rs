@@ -1,9 +1,32 @@
 //! Session lifecycle, reconnect, power, and coexistence policies.
+//!
+//! # Static session shape versus dynamic session state
+//!
+//! Two different things are called "the session" here, and mixing them is how
+//! two surfaces end up disagreeing:
+//!
+//! * [`SessionContext`] is the **static shape** of the session this process was
+//!   launched into: which display server it talks to, whether that session was
+//!   already a remote one, which seat it belongs to. Every field is derived
+//!   from the process environment, which the kernel snapshots at `exec` and
+//!   never updates afterwards, so it cannot change while the process lives.
+//!   Detected once via [`SessionContext::current`].
+//! * [`SessionState`], [`AutoPauseSignals`], and [`PowerSignals`] carry the
+//!   **dynamic state**: lock, foreground, sleep, idle time, and whether a
+//!   remote controller is attached *right now*. These change under a running
+//!   process and must be re-observed on every evaluation; nothing here caches
+//!   them.
+//!
+//! Note the deliberate asymmetry around "remote": [`SessionContext::remote`]
+//! answers "was this process started inside a remote session", which is fixed
+//! at launch, while [`AutoPauseSignals::remote_control_active`] answers "is
+//! someone controlling this desktop remotely at this moment", which is not.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Serialize;
-pub use vbuff_types::CapturePauseReason as AutoPauseReason;
+use vbuff_types::CapturePauseReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +39,32 @@ pub enum DisplayServer {
     Unknown,
 }
 
+impl DisplayServer {
+    /// The one spelling of a display server used by every surface: the doctor
+    /// JSON field, the GUI feedback report, and logs. A unit test pins it
+    /// identical to the `Serialize` output, so the two can never drift.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Wayland => "wayland",
+            Self::X11 => "x11",
+            Self::Windows => "windows",
+            Self::MacOs => "mac_os",
+            Self::Headless => "headless",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The static shape of the session this process runs in.
+///
+/// Constructed exactly once per process by [`SessionContext::current`]; the
+/// environment it reads is fixed at `exec`, so a second read could only ever
+/// return the same answer, and a memoized snapshot makes that guarantee
+/// structural rather than incidental. Pass the borrowed snapshot to whatever
+/// needs it instead of re-detecting: two detections cannot disagree if only
+/// one exists.
+///
+/// Dynamic session properties do **not** belong here; see the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SessionContext {
     pub display_server: DisplayServer,
@@ -25,7 +74,27 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    pub fn detect() -> Self {
+    /// The process-wide session snapshot, detected on first use.
+    ///
+    /// Every surface in a process (capability posture, paste permission, GUI
+    /// feedback, `doctor` output) reads this one value. A separately launched
+    /// process - `vbuff doctor` is the live example - legitimately takes its
+    /// own snapshot of its own environment.
+    pub fn current() -> &'static Self {
+        static CURRENT: OnceLock<SessionContext> = OnceLock::new();
+        CURRENT.get_or_init(Self::from_environment)
+    }
+
+    /// A content-free environment label for feedback reports and logs.
+    pub fn environment_label(&self) -> String {
+        if self.remote {
+            format!("{} (remote)", self.display_server.slug())
+        } else {
+            self.display_server.slug().to_owned()
+        }
+    }
+
+    fn from_environment() -> Self {
         let display_server = if cfg!(target_os = "windows") {
             DisplayServer::Windows
         } else if cfg!(target_os = "macos") {
@@ -91,16 +160,16 @@ impl Default for AutoPausePolicy {
 }
 
 impl AutoPausePolicy {
-    pub fn reason(self, signals: AutoPauseSignals) -> Option<AutoPauseReason> {
+    pub fn reason(self, signals: AutoPauseSignals) -> Option<CapturePauseReason> {
         if self.pause_on_lock && signals.screen_locked {
-            Some(AutoPauseReason::ScreenLocked)
+            Some(CapturePauseReason::ScreenLocked)
         } else if self.pause_on_remote_control && signals.remote_control_active {
-            Some(AutoPauseReason::RemoteControl)
+            Some(CapturePauseReason::RemoteControl)
         } else if self
             .idle_after
             .is_some_and(|threshold| !threshold.is_zero() && signals.idle_for >= threshold)
         {
-            Some(AutoPauseReason::Idle)
+            Some(CapturePauseReason::Idle)
         } else {
             None
         }
@@ -109,14 +178,14 @@ impl AutoPausePolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoPauseTransition {
-    Pause(AutoPauseReason),
+    Pause(CapturePauseReason),
     Resume,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct AutoPauseController {
     policy: AutoPausePolicy,
-    active_reason: Option<AutoPauseReason>,
+    active_reason: Option<CapturePauseReason>,
 }
 
 impl AutoPauseController {
@@ -145,7 +214,7 @@ impl AutoPauseController {
         }
     }
 
-    pub const fn active_reason(self) -> Option<AutoPauseReason> {
+    pub const fn active_reason(self) -> Option<CapturePauseReason> {
         self.active_reason
     }
 }
@@ -282,6 +351,50 @@ pub fn detect_coexisting_managers(
 mod tests {
     use super::*;
 
+    /// The slug and the serialized name are the same vocabulary, so the GUI
+    /// feedback report and the doctor JSON cannot name the same session two
+    /// different ways.
+    #[test]
+    fn display_server_slug_matches_serialization() {
+        for display in [
+            DisplayServer::Wayland,
+            DisplayServer::X11,
+            DisplayServer::Windows,
+            DisplayServer::MacOs,
+            DisplayServer::Headless,
+            DisplayServer::Unknown,
+        ] {
+            let serialized = serde_json::to_string(&display).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", display.slug()));
+        }
+    }
+
+    /// One snapshot per process, by construction: repeated calls hand back the
+    /// very same value, so no two surfaces can observe different sessions.
+    #[test]
+    fn session_snapshot_is_detected_once_per_process() {
+        let first = SessionContext::current();
+        let second = SessionContext::current();
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn environment_label_is_content_free_and_marks_remote_sessions() {
+        let local = SessionContext {
+            display_server: DisplayServer::X11,
+            remote: false,
+            seat: Some("seat0".into()),
+            input_injection_allowed: true,
+        };
+        assert_eq!(local.environment_label(), "x11");
+        let remote = SessionContext {
+            remote: true,
+            ..local
+        };
+        assert_eq!(remote.environment_label(), "x11 (remote)");
+    }
+
     #[test]
     fn locked_and_background_sessions_fail_closed() {
         let state = SessionState::default().transition(SessionEvent::Locked);
@@ -341,7 +454,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::Idle))
+            Some(AutoPauseTransition::Pause(CapturePauseReason::Idle))
         );
         assert_eq!(
             controller.observe(
@@ -351,7 +464,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::ScreenLocked))
+            Some(AutoPauseTransition::Pause(CapturePauseReason::ScreenLocked))
         );
         assert_eq!(controller.observe(AutoPauseSignals::default(), true), None);
         assert_eq!(controller.active_reason(), None);
@@ -368,7 +481,9 @@ mod tests {
                 },
                 false,
             ),
-            Some(AutoPauseTransition::Pause(AutoPauseReason::RemoteControl))
+            Some(AutoPauseTransition::Pause(
+                CapturePauseReason::RemoteControl
+            ))
         );
         assert_eq!(
             controller.observe(AutoPauseSignals::default(), false),

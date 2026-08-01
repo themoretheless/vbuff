@@ -6,12 +6,10 @@ use crate::capture::{CaptureOutcome, DropClass};
 
 const DOMAIN: &[u8] = b"vbuff-privacy-ledger-v1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrivacyDecisionKind {
-    Captured,
-    Skipped,
-    Lost,
-}
+/// Classification of one ledger decision. The vocabulary is owned by
+/// `vbuff-types`, which the diagnostics and GUI surfaces already speak, so
+/// the ledger and what the user is shown cannot disagree.
+pub use vbuff_types::PrivacyDecisionLevel as PrivacyDecisionKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrivacyLedgerEntry {

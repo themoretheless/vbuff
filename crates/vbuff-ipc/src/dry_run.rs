@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use vbuff_types::ClipId;
+use vbuff_types::validation::is_valid_identifier;
 
 const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
 const MAX_WARNINGS: usize = 32;
@@ -15,10 +16,10 @@ pub struct DryRunRequest {
 
 impl DryRunRequest {
     pub fn validate(&self, maximum_preview_bytes: usize) -> Result<(), &'static str> {
-        if !valid_id(&self.request_id) {
+        if !is_valid_identifier(&self.request_id, 128) {
             return Err("request_id_invalid");
         }
-        if !valid_id(&self.pipeline_id) {
+        if !is_valid_identifier(&self.pipeline_id, 128) {
             return Err("pipeline_id_invalid");
         }
         if self.preview_bytes > maximum_preview_bytes.min(MAX_PREVIEW_BYTES) {
@@ -41,7 +42,7 @@ pub struct DryRunPreview {
 
 impl DryRunPreview {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !valid_id(&self.request_id) {
+        if !is_valid_identifier(&self.request_id, 128) {
             return Err("request_id_invalid");
         }
         if self.output_mime.is_empty()
@@ -79,14 +80,6 @@ impl std::fmt::Debug for DryRunPreview {
             .field("warning_count", &self.warnings.len())
             .finish()
     }
-}
-
-fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[cfg(test)]

@@ -4,7 +4,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use super::{MAX_QR_TOKEN_TTL_MS, all_zero};
+use vbuff_types::validation::all_zero;
+
+use super::MAX_QR_TOKEN_TTL_MS;
 use crate::{Result, SyncError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

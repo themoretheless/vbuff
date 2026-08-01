@@ -1,24 +1,25 @@
 //! Cross-platform clipboard backend built on `arboard`.
 //!
 //! `arboard` reads text and image flavors. It cannot enumerate every MIME
-//! flavor, read concealed-type markers, or prove source attribution (that is
-//! the job of the future native backends), but it is enough for the MVP:
-//! capture text and images, and write them back for paste.
+//! flavor, read concealed-type markers, prove source attribution, or observe
+//! clipboard ownership and selection intent (that is the job of the future
+//! native backends), but it is enough for the MVP: capture text and images,
+//! and write them back for paste.
 //!
-//! Degradation contract: reads therefore report
-//! `concealment: ConcealmentSignal::Unknown` and
-//! `provenance_confidence: ProvenanceConfidence::Unknown` (via
-//! `CapturedClipboard::default()`), and the inherited
-//! `ClipboardBackend::evidence()` reports `Unknown` for both signals. The
-//! capture policy — not this adapter — decides how to degrade on that
-//! uncertainty; this backend never claims evidence it cannot supply.
+//! Degradation contract: reads therefore report `Unknown` for all four
+//! evidence signals — `concealment`, `provenance_confidence`, `coherence`
+//! and `intent` — which is precisely what `CapturedClipboard::default()`
+//! yields, so `..CapturedClipboard::default()` below is an honest statement
+//! and not a shortcut. The capture policy — not this adapter — decides how to
+//! degrade on that uncertainty; this backend never claims evidence it cannot
+//! supply.
 
 use std::borrow::Cow;
 
 use arboard::{Clipboard, ImageData};
 use vbuff_types::{Body, Flavor, RGBA_MIME_PREFIX, parse_rgba_dims, rgba_mime, rgba_required_len};
 
-use crate::traits::{CapturedClipboard, ClipboardBackend};
+use crate::traits::{CapturedClipboard, ClipboardBackend, WriteOptions};
 use crate::{PlatformError, Result};
 
 /// An `arboard`-backed clipboard.
@@ -69,7 +70,12 @@ impl ClipboardBackend for ArboardClipboard {
         })
     }
 
-    fn write(&mut self, flavors: &[Flavor]) -> Result<()> {
+    /// `arboard` has no access to OS clipboard-history retention and cannot
+    /// attach a private sentinel flavor, so it implements only the primitive
+    /// and inherits the trait's fail-closed [`ClipboardBackend::write`]: it
+    /// never claims a retention hint it did not apply, and a write that
+    /// *requires* history exclusion never reaches this method at all.
+    fn place_flavors(&mut self, flavors: &[Flavor], _options: &WriteOptions) -> Result<()> {
         // Prefer text; fall back to image. arboard can only hold one kind at a
         // time via its high-level API, so we pick the richest single flavor.
         if let Some(text) = flavors
