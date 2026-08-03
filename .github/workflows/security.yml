@@ -35,9 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install nightly and cargo-fuzz
-        run: |
-          rustup toolchain install nightly --profile minimal
-          cargo +nightly install --locked cargo-fuzz --version 0.13.2
+        uses: themoretheless/.github/.github/actions/setup-rust@eb557370f9aae2547ddbbdce8bf2a8798e68dad2 # v1
+        with:
+          rust-toolchain: nightly
+          tools: cargo-fuzz@0.13.2
       - name: Smoke fuzz parsers
         run: |
           cargo +nightly fuzz run api_token -- -max_total_time=30
