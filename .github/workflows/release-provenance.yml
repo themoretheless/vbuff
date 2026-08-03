@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
-        uses: themoretheless/.github/.github/actions/setup-rust@eb557370f9aae2547ddbbdce8bf2a8798e68dad2 # v1
+        uses: themoretheless/.github/.github/actions/setup-rust@bb3377f2f424201379ab4e47e147f164f4014b38 # v1
         with:
           rust-toolchain: 1.97.0
       - name: Linux native dependencies
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust and evidence tools
-        uses: themoretheless/.github/.github/actions/setup-rust@eb557370f9aae2547ddbbdce8bf2a8798e68dad2 # v1
+        uses: themoretheless/.github/.github/actions/setup-rust@bb3377f2f424201379ab4e47e147f164f4014b38 # v1
         with:
           rust-toolchain: 1.97.0
           tools: cargo-deny@0.19.8,cargo-audit@0.22.2,cargo-vet@0.10.2,cargo-cyclonedx@0.5.9
@@ -111,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust and auditable build tool
-        uses: themoretheless/.github/.github/actions/setup-rust@eb557370f9aae2547ddbbdce8bf2a8798e68dad2 # v1
+        uses: themoretheless/.github/.github/actions/setup-rust@bb3377f2f424201379ab4e47e147f164f4014b38 # v1
         with:
           rust-toolchain: 1.97.0
           tools: cargo-auditable@0.7.5
@@ -142,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Rust and SBOM tool
-        uses: themoretheless/.github/.github/actions/setup-rust@eb557370f9aae2547ddbbdce8bf2a8798e68dad2 # v1
+        uses: themoretheless/.github/.github/actions/setup-rust@bb3377f2f424201379ab4e47e147f164f4014b38 # v1
         with:
           rust-toolchain: 1.97.0
           tools: cargo-cyclonedx@0.5.9
