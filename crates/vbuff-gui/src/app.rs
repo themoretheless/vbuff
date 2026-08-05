@@ -887,131 +887,132 @@ impl eframe::App for PopupApp {
                     );
                 }
 
-            if show_hotkey_coachmark && let Some(hotkey) = hotkey_label.as_deref() {
-                self.render_hotkey_coachmark(ui, hotkey);
-            }
-            if let Some(notice) = &notice {
-                self.render_notice(ui, notice);
-            }
-
-            match self.surface {
-                PopupSurface::History => {
-                    self.render_search_field(ui, paused, &clips);
-                    if let Some(health) = health_alert {
-                        self.render_health_alert(ui, health, size_budget_alert.is_some());
-                    } else if let Some(alert) = size_budget_alert {
-                        self.render_size_budget_alert(ui, alert);
-                    }
-                    if recoverable_skip {
-                        ui.horizontal(|ui| {
-                            ui.add_space(design::SPACE_M);
-                            ui.label(
-                                RichText::new("Current copy was skipped")
-                                    .small()
-                                    .color(design::warning(ui)),
-                            );
-                            if ui.small_button("Keep current copy").clicked() {
-                                self.actions.push_back(UiAction::RecoverSkipped);
-                            }
-                        });
-                    }
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin {
-                            left: design::SPACE_M as i8,
-                            right: design::SPACE_M as i8,
-                            top: 0,
-                            bottom: design::SPACE_XS as i8,
-                        })
-                        .show(ui, |ui| {
-                            self.render_history_filters(ui, &clips);
-                        });
-
-                    if total == 0 {
-                        self.render_empty_history(
-                            ui,
-                            clips.is_empty(),
-                            paused,
-                            pause_reason,
-                            capture_health,
-                        );
-                    } else {
-                        // Stable-height virtualized rows keep controls from shifting.
-                        let row_height = self.preferences.density.row_height(viewport.y);
-                        let cheap_rows = self.scroll_tuner.rapid();
-                        let visible_height = ui.available_height();
-                        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-                        if self.scroll_selection_into_view {
-                            let selected_center = (self.selected as f32 + 0.5) * row_height;
-                            let offset = (selected_center - visible_height * 0.5).max(0.0);
-                            scroll = scroll.vertical_scroll_offset(offset);
-                        }
-                        let mut active_history_option = None;
-                        let history_list =
-                            scroll.show_rows(ui, row_height, total, |ui, row_range| {
-                                for row in row_range {
-                                    let Some(hit) = filtered.get(row) else {
-                                        continue;
-                                    };
-                                    let Some(clip) = clip_by_id.get(&hit.id) else {
-                                        continue;
-                                    };
-                                    let selected = row == self.selected;
-                                    let option_id = self.render_row(
-                                        ui,
-                                        &ctx,
-                                        row,
-                                        clip,
-                                        *hit,
-                                        selected,
-                                        cheap_rows,
-                                        modifier_down,
-                                        total,
-                                        row_height,
-                                        session_protected.contains(&clip.id),
-                                        memory_only_clips.contains(&clip.id),
-                                        encryption_at_rest,
-                                    );
-                                    if selected {
-                                        active_history_option = Some(option_id);
-                                    }
-                                }
-                            });
-                        ctx.accesskit_node_builder(history_list.id, |node| {
-                            node.set_role(egui::accesskit::Role::ListBox);
-                            node.set_label("Clipboard history");
-                            node.set_size_of_set(total);
-                        });
-                        if !query_completions_active {
-                            ctx.accesskit_node_builder(history_search_id(), |node| {
-                                node.set_role(egui::accesskit::Role::EditableComboBox);
-                                node.set_label("Search clipboard history");
-                                node.set_expanded(false);
-                                if let Some(active) = active_history_option {
-                                    node.set_active_descendant(active.value().into());
-                                }
-                            });
-                        }
-                        self.scroll_selection_into_view = false;
-                    }
+                if show_hotkey_coachmark && let Some(hotkey) = hotkey_label.as_deref() {
+                    self.render_hotkey_coachmark(ui, hotkey);
                 }
-                PopupSurface::Compose => self.render_compose_surface(ui),
-                PopupSurface::Trust => crate::trust_view::render(
-                    ui,
-                    security_posture,
-                    &capabilities,
-                    &privacy_ledger,
-                    privacy_score.as_ref(),
-                    &slo_status,
-                ),
-                PopupSurface::Settings => self.render_settings_surface(
-                    ui,
-                    &clips,
-                    health_digest,
-                    default_profile,
-                    launch_at_login,
-                ),
-            }
-        });
+                if let Some(notice) = &notice {
+                    self.render_notice(ui, notice);
+                }
+
+                match self.surface {
+                    PopupSurface::History => {
+                        self.render_search_field(ui, paused, &clips);
+                        if let Some(health) = health_alert {
+                            self.render_health_alert(ui, health, size_budget_alert.is_some());
+                        } else if let Some(alert) = size_budget_alert {
+                            self.render_size_budget_alert(ui, alert);
+                        }
+                        if recoverable_skip {
+                            ui.horizontal(|ui| {
+                                ui.add_space(design::SPACE_M);
+                                ui.label(
+                                    RichText::new("Current copy was skipped")
+                                        .small()
+                                        .color(design::warning(ui)),
+                                );
+                                if ui.small_button("Keep current copy").clicked() {
+                                    self.actions.push_back(UiAction::RecoverSkipped);
+                                }
+                            });
+                        }
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: design::SPACE_M as i8,
+                                right: design::SPACE_M as i8,
+                                top: 0,
+                                bottom: design::SPACE_XS as i8,
+                            })
+                            .show(ui, |ui| {
+                                self.render_history_filters(ui, &clips);
+                            });
+
+                        if total == 0 {
+                            self.render_empty_history(
+                                ui,
+                                clips.is_empty(),
+                                paused,
+                                pause_reason,
+                                capture_health,
+                            );
+                        } else {
+                            // Stable-height virtualized rows keep controls from shifting.
+                            let row_height = self.preferences.density.row_height(viewport.y);
+                            let cheap_rows = self.scroll_tuner.rapid();
+                            let visible_height = ui.available_height();
+                            let mut scroll =
+                                egui::ScrollArea::vertical().auto_shrink([false, false]);
+                            if self.scroll_selection_into_view {
+                                let selected_center = (self.selected as f32 + 0.5) * row_height;
+                                let offset = (selected_center - visible_height * 0.5).max(0.0);
+                                scroll = scroll.vertical_scroll_offset(offset);
+                            }
+                            let mut active_history_option = None;
+                            let history_list =
+                                scroll.show_rows(ui, row_height, total, |ui, row_range| {
+                                    for row in row_range {
+                                        let Some(hit) = filtered.get(row) else {
+                                            continue;
+                                        };
+                                        let Some(clip) = clip_by_id.get(&hit.id) else {
+                                            continue;
+                                        };
+                                        let selected = row == self.selected;
+                                        let option_id = self.render_row(
+                                            ui,
+                                            &ctx,
+                                            row,
+                                            clip,
+                                            *hit,
+                                            selected,
+                                            cheap_rows,
+                                            modifier_down,
+                                            total,
+                                            row_height,
+                                            session_protected.contains(&clip.id),
+                                            memory_only_clips.contains(&clip.id),
+                                            encryption_at_rest,
+                                        );
+                                        if selected {
+                                            active_history_option = Some(option_id);
+                                        }
+                                    }
+                                });
+                            ctx.accesskit_node_builder(history_list.id, |node| {
+                                node.set_role(egui::accesskit::Role::ListBox);
+                                node.set_label("Clipboard history");
+                                node.set_size_of_set(total);
+                            });
+                            if !query_completions_active {
+                                ctx.accesskit_node_builder(history_search_id(), |node| {
+                                    node.set_role(egui::accesskit::Role::EditableComboBox);
+                                    node.set_label("Search clipboard history");
+                                    node.set_expanded(false);
+                                    if let Some(active) = active_history_option {
+                                        node.set_active_descendant(active.value().into());
+                                    }
+                                });
+                            }
+                            self.scroll_selection_into_view = false;
+                        }
+                    }
+                    PopupSurface::Compose => self.render_compose_surface(ui),
+                    PopupSurface::Trust => crate::trust_view::render(
+                        ui,
+                        security_posture,
+                        &capabilities,
+                        &privacy_ledger,
+                        privacy_score.as_ref(),
+                        &slo_status,
+                    ),
+                    PopupSurface::Settings => self.render_settings_surface(
+                        ui,
+                        &clips,
+                        health_digest,
+                        default_profile,
+                        launch_at_login,
+                    ),
+                }
+            });
 
         self.render_clear_history_confirmation(&ctx);
         self.render_delete_confirmation(&ctx);
@@ -2925,19 +2926,12 @@ impl PopupApp {
         if let Some(app) = &clip.meta.source_app {
             rows.push(("Source", short_app_name(app)));
         }
-        rows.push((
-            "Captured",
-            relative_time(clip.meta.created_at, Utc::now()),
-        ));
+        rows.push(("Captured", relative_time(clip.meta.created_at, Utc::now())));
         rows.push(("Size", human_bytes(clip.meta.byte_size)));
         ui.add_space(design::SPACE_XS);
         for (label, value) in rows {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(label)
-                        .small()
-                        .color(design::faint_text(ui)),
-                );
+                ui.label(RichText::new(label).small().color(design::faint_text(ui)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(value)
@@ -3560,7 +3554,8 @@ fn render_security_status(
         SecurityPostureLevel::Partial => "Protection partial",
         SecurityPostureLevel::Blocked => "Protection blocked",
     };
-    let label = privacy_score.map_or_else(|| label.to_owned(), |score| format!("{label} · {score}"));
+    let label =
+        privacy_score.map_or_else(|| label.to_owned(), |score| format!("{label} · {score}"));
     let (fill, border) = match posture.level {
         SecurityPostureLevel::Partial => (design::warning_bg(ui), design::warning_border(ui)),
         SecurityPostureLevel::Protected | SecurityPostureLevel::Blocked => (

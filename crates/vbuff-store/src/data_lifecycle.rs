@@ -1141,9 +1141,9 @@ impl Store {
             )
             .optional()?;
         match held {
-            None if self.clip_row_exists(id)? => Err(StoreError::Corrupt(
-                "clip annotation row is missing".into(),
-            )),
+            None if self.clip_row_exists(id)? => {
+                Err(StoreError::Corrupt("clip annotation row is missing".into()))
+            }
             None => Err(StoreError::ClipNotFound(id.to_string_repr())),
             Some(0) => Ok(()),
             Some(_) => Err(StoreError::Maintenance(LEGAL_HOLD_BLOCKED.into())),

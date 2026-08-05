@@ -410,14 +410,19 @@ pub(crate) fn navigation_tab(ui: &mut Ui, label: &'static str, selected: bool) -
             secondary_text(ui)
         },
     );
-    response.widget_info(|| {
-        WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, label)
-    });
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, label));
     response
 }
 
 /// A small rounded status pill: `Protection partial · 54`, `lossless`, `local`.
-pub(crate) fn badge_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32, border: Option<Color32>) {
+pub(crate) fn badge_pill(
+    ui: &mut Ui,
+    label: &str,
+    fg: Color32,
+    bg: Color32,
+    border: Option<Color32>,
+) {
     let font = FontId::proportional(10.5);
     let galley = ui
         .painter()
@@ -752,10 +757,7 @@ mod tests {
 
     #[test]
     fn semantic_foregrounds_pass_wcag_aa_on_both_panel_themes() {
-        for (dark, background) in [
-            (true, window_bg_for(true)),
-            (false, window_bg_for(false)),
-        ] {
+        for (dark, background) in [(true, window_bg_for(true)), (false, window_bg_for(false))] {
             for foreground in [
                 accent_for(dark),
                 success_for(dark),
@@ -774,10 +776,7 @@ mod tests {
 
     #[test]
     fn secondary_text_passes_wcag_aa_on_both_panel_themes() {
-        for (dark, background) in [
-            (true, window_bg_for(true)),
-            (false, window_bg_for(false)),
-        ] {
+        for (dark, background) in [(true, window_bg_for(true)), (false, window_bg_for(false))] {
             let foreground = secondary_text_for(dark);
             let ratio = contrast_ratio(
                 [foreground.r(), foreground.g(), foreground.b()],
@@ -789,10 +788,7 @@ mod tests {
 
     #[test]
     fn strong_borders_pass_non_text_contrast_on_both_panel_themes() {
-        for (dark, background) in [
-            (true, window_bg_for(true)),
-            (false, window_bg_for(false)),
-        ] {
+        for (dark, background) in [(true, window_bg_for(true)), (false, window_bg_for(false))] {
             let foreground = border_strong_for(dark);
             let ratio = contrast_ratio(
                 [foreground.r(), foreground.g(), foreground.b()],
