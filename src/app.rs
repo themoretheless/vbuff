@@ -295,8 +295,9 @@ impl Runtime {
                     // indistinguishably from a hide whenever no tray icon is
                     // available.
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    // A dismissed popup no longer owns the confirmed paste
-                    // target; the next summon must re-confirm it.
+                    // Hiding abandons the confirmed paste target: the window
+                    // that was focused before the popup opened is no longer
+                    // the one a later paste would reach.
                     self.paste.cancel_target();
                     self.popup.request_hide(&ctx);
                 }
@@ -617,8 +618,9 @@ impl Runtime {
                 }
             }
             // Hide only ever hides the popup; the process exits solely via
-            // an explicit Quit. The dismissed popup releases its confirmed
-            // paste target so the next summon has to re-confirm it.
+            // an explicit Quit. The confirmed paste target is abandoned with
+            // the popup, because the window focused before it opened is no
+            // longer the one a later paste would reach.
             UiAction::Hide => {
                 self.paste.cancel_target();
                 self.popup.request_hide(ctx);

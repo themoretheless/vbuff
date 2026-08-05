@@ -615,26 +615,30 @@ impl Store {
         let preview = self.collection_retention_preview(collection_id, limit)?;
         let transaction = self.conn.unchecked_transaction()?;
         for id in &preview.clip_ids {
-            // The protections come from the one `DeleteGuards` set every
-            // deletion path shares; the collection predicate is this sweep's
-            // own, and it is re-checked here because the preview ran before
-            // this transaction opened and the clip may have left the
-            // collection since.
-            transaction.execute(
-                &format!(
-                    r#"
-                    DELETE FROM clips
-                    WHERE clips.id = ?1
-                      AND EXISTS (
-                        SELECT 1 FROM clip_annotations AS annotations
-                        WHERE annotations.clip_id = clips.id
-                          AND annotations.collection_id = ?2
-                      ){guards}
-                    "#,
-                    guards = DeleteGuards::SWEEP.sql(),
-                ),
+            // Collection membership is re-checked here rather than trusted
+            // from the preview: a clip can leave the collection between the
+            // two statements, and a retention sweep must never remove a clip
+            // that is no longer in the collection it is sweeping.
+            let still_a_member: bool = transaction.query_row(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM clip_annotations
+                    WHERE clip_id = ?1 AND collection_id = ?2
+                )
+                "#,
                 params![id.to_string_repr(), collection_id],
+                |row| row.get(0),
             )?;
+            if !still_a_member {
+                return Err(StoreError::Maintenance(
+                    "collection retention eligibility changed".into(),
+                ));
+            }
+            if self.delete_clip_row(&transaction, *id, DeleteGuards::SWEEP)? != 1 {
+                return Err(StoreError::Maintenance(
+                    "collection retention eligibility changed".into(),
+                ));
+            }
         }
         transaction.commit()?;
         Ok(preview)
@@ -1126,11 +1130,6 @@ impl Store {
 
     /// Strict form used by explicit deletes: a missing clip is `ClipNotFound`
     /// and a held clip is an error the caller must show the user.
-    ///
-    /// A clip row with no annotation row is neither: every clip is inserted
-    /// with its annotation sidecar in the same transaction, so a clip that has
-    /// lost it is a corrupt store, and deleting through a hold that can no
-    /// longer be read would be exactly the wrong way to fail.
     pub(crate) fn ensure_not_legal_hold(&self, id: ClipId) -> Result<()> {
         let held = self
             .conn
@@ -1141,22 +1140,16 @@ impl Store {
             )
             .optional()?;
         match held {
-            None if self.clip_row_exists(id)? => {
+            // A live clip whose annotation sidecar is gone cannot be judged:
+            // its hold state is unknowable, so deleting it would be deleting
+            // something that might be held. Corruption, not absence.
+            None if self.ensure_clip_exists(id).is_ok() => {
                 Err(StoreError::Corrupt("clip annotation row is missing".into()))
             }
             None => Err(StoreError::ClipNotFound(id.to_string_repr())),
             Some(0) => Ok(()),
             Some(_) => Err(StoreError::Maintenance(LEGAL_HOLD_BLOCKED.into())),
         }
-    }
-
-    fn clip_row_exists(&self, id: ClipId) -> Result<bool> {
-        let exists: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
-            [id.to_string_repr()],
-            |row| row.get(0),
-        )?;
-        Ok(exists != 0)
     }
 
     /// Lenient form used by background sweeps: a clip that is already gone is

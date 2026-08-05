@@ -264,12 +264,10 @@ impl DeleteGuards {
             );
         }
         if self.legal_hold {
-            // Stated as "an unheld annotation row exists" rather than "no held
-            // row exists": every clip is inserted with its annotation sidecar
-            // in the same transaction, so a clip missing one is a corrupt
-            // store, and the `NOT EXISTS` form would read that as "not held"
-            // and delete it. Fail closed and leave the row for the integrity
-            // check to report.
+            // Positive form on purpose: the annotation row must exist *and*
+            // say the clip is free. A clip whose sidecar is missing has an
+            // unknowable hold state, and deleting it would mean deleting
+            // something that might be held.
             predicate.push_str(
                 " AND EXISTS (
                     SELECT 1 FROM clip_annotations AS annotations
@@ -1378,6 +1376,9 @@ impl Store {
             JOIN clip_annotations AS a ON a.clip_id = c.id
             WHERE c.normalized_hash = ?1 AND a.archived = 0
               AND (c.expires_at IS NULL OR c.expires_at > ?2)
+              -- Sensitive rows are never correlated with their neighbours:
+              -- the group would tell the user which other clips share a
+              -- secret's normalized text.
               AND COALESCE(json_extract(c.metadata_json, '$.sensitive'), 0) = 0
             ORDER BY c.updated_at DESC, c.seq DESC
             LIMIT ?3
@@ -3285,7 +3286,6 @@ fn duration_millis_i64(duration: Duration) -> Result<i64> {
     i64::try_from(duration.as_millis())
         .map_err(|_| StoreError::Maintenance("duration exceeds SQLite range".into()))
 }
-
 fn elapsed_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

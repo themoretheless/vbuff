@@ -216,6 +216,18 @@ pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
     findings
 }
 
+/// Recognize short numeric codes without retaining or returning the match.
+///
+/// A thin view over the one-time-code rule inside [`detect_secrets`], not a
+/// second heuristic: the capture gate and the detector used to carry
+/// different marker lists, so the same text was a secret to one and ordinary
+/// to the other. Callers that only need the yes/no answer use this; the rule
+/// itself lives in exactly one place.
+#[must_use]
+pub fn is_probable_otp(text: &str) -> bool {
+    otp_finding(text, &text.to_ascii_lowercase()).is_some()
+}
+
 fn scan_token(token: &str, recovery_context: bool, findings: &mut Vec<SecretFinding>) {
     if is_cloud_credential(token) {
         push_once(findings, SecretKind::CloudCredential, 0.98);
@@ -259,21 +271,18 @@ fn is_structured_locator(token: &str) -> bool {
 ///
 /// This is the union of the two lists that used to disagree: the detector's
 /// `["otp", "one-time", "verification code", "security code"]` and the capture
-/// gate's `["code", "otp", "verification", "verify", "passcode"]`. `"code"`
-/// subsumes `"verification code"` and `"security code"`; `"one-time"` and
-/// `"verification"` are the two the other list lacked.
+/// gate's `["code", "otp", "verification", "verify", "passcode"]`.
 ///
-/// `"passcode"` is listed separately even though it ends in `"code"`, because
-/// markers match on word boundaries (see [`contains_marker_word`]). Substring
-/// matching would fold it in, but it would also make `"barcode 123456"` a
-/// one-time password.
+/// Matched as whole words, so `"passcode"` has to be listed in its own right:
+/// under substring matching `"code"` covered it, but that also made
+/// `"barcode"`, `"postcode"` and `"encode"` read as one-time codes.
 const OTP_CONTEXT_MARKERS: [&str; 6] = [
     "otp",
     "one-time",
     "verification",
     "verify",
-    "passcode",
     "code",
+    "passcode",
 ];
 
 /// Digit-run length that reads as a one-time code. The detector used to
@@ -301,17 +310,20 @@ const OTP_BARE_CONFIDENCE: f32 = 0.90;
 ///   digit run of [`OTP_DIGIT_LENGTHS`]. The run is matched against maximal
 ///   digit sequences rather than whitespace-delimited tokens, so
 ///   `"verification code:123456"` is caught - punctuation used to hide it.
-///   The marker itself is matched on word boundaries (see
-///   [`contains_marker_word`]), so `"barcode 123456"` is not a code.
 /// * bare: the whole trimmed text is nothing but a short digit run.
 ///
 /// The bare rule is anchored to the *whole* text on purpose. Applying it per
 /// token would make every four-digit number in ordinary prose - a year, a
 /// street number, an invoice line - a secret.
 fn otp_finding(text: &str, lower: &str) -> Option<SecretFinding> {
-    let has_context = OTP_CONTEXT_MARKERS
-        .iter()
-        .any(|marker| contains_marker_word(lower, marker));
+    // Whole words, not substrings: "barcode", "postcode" and "encode" all
+    // contain "code" without being anywhere near a one-time password. The
+    // hyphen survives the split so "one-time" stays one word, and is then
+    // trimmed so "code->123456" still matches on "code".
+    let has_context = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .map(|word| word.trim_matches('-'))
+        .any(|word| OTP_CONTEXT_MARKERS.contains(&word));
     if has_context && has_otp_digit_run(text) {
         return Some(SecretFinding {
             kind: SecretKind::OneTimePassword,
@@ -331,23 +343,6 @@ fn otp_finding(text: &str, lower: &str) -> Option<SecretFinding> {
 fn has_otp_digit_run(text: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_digit())
         .any(|run| OTP_DIGIT_LENGTHS.contains(&run.len()))
-}
-
-/// Whether `marker` occurs in `lower` as a whole word.
-///
-/// A plain substring test is wrong here: `"code"` is one of the markers, and
-/// `"barcode 123456"` contains it, which would mark an ordinary barcode as a
-/// one-time password. Alphabetic neighbours are what disqualify a match, so
-/// hyphenated and punctuated markers (`"one-time"`, `"verification code:"`)
-/// still match while `"barcode"` and `"decode"` do not.
-fn contains_marker_word(lower: &str, marker: &str) -> bool {
-    let bytes = lower.as_bytes();
-    lower.match_indices(marker).any(|(start, _)| {
-        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphabetic();
-        let end = start + marker.len();
-        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphabetic();
-        before_ok && after_ok
-    })
 }
 
 fn is_recovery_code(token: &str) -> bool {
@@ -545,14 +540,10 @@ mod tests {
 
     #[test]
     fn otp_and_recovery_codes_require_context() {
-        assert!(is_otp("123456"));
-        assert!(is_otp("verify 1234"));
-        assert!(!is_otp("invoice 123456"));
-        // A marker must be a whole word: "barcode" is not "code". The two
-        // heuristics this detector replaced disagreed here, and only one of
-        // them checked word boundaries.
-        assert!(!is_otp("barcode 123456"));
-        assert!(!is_otp("decode 123456"));
+        assert!(is_probable_otp("123456"));
+        assert!(is_probable_otp("verify 1234"));
+        assert!(!is_probable_otp("invoice 123456"));
+        assert!(!is_probable_otp("barcode 123456"));
         assert!(
             detect_secrets("verification code 123456")
                 .iter()
@@ -575,10 +566,6 @@ mod tests {
             .into_iter()
             .find(|finding| finding.kind == SecretKind::OneTimePassword)
             .map(|finding| finding.confidence)
-    }
-
-    fn is_otp(text: &str) -> bool {
-        otp_confidence(text).is_some()
     }
 
     /// The capture gate flagged a bare digit run as a one-time password; this
