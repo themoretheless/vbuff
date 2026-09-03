@@ -48,7 +48,7 @@ pub struct ClipId(pub Ulid);
 impl ClipId {
     /// Generate a fresh id from the current time.
     pub fn new() -> Self {
-        ClipId(Ulid::new())
+        ClipId(Ulid::generate())
     }
 
     /// Render as the canonical 26-character Crockford base32 string.

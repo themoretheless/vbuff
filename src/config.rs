@@ -908,7 +908,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
 
 fn migrate_config_text(text: &str) -> anyhow::Result<String> {
     let config = parse_runtime_config(text)?;
-    let mut document = text.parse::<toml_edit::Document>()?;
+    let mut document = text.parse::<toml_edit::DocumentMut>()?;
     document["schema_version"] = toml_edit::value(i64::from(CONFIG_SCHEMA_VERSION));
     if document.get("auto_pause_idle_seconds").is_none() {
         document["auto_pause_idle_seconds"] =
