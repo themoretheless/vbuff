@@ -48,7 +48,7 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 egui_extras = { version = "0.35", features = ["image"] }
-egui_kittest = { version = "=0.36.0", features = ["eframe", "snapshot", "wgpu"] }
+egui_kittest = { version = "=0.35.0", features = ["eframe", "snapshot", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 # Platform integrations
