@@ -14,6 +14,8 @@ mod diagnostics;
 mod doctor;
 mod heartbeat;
 mod history;
+mod history_presenter;
+mod history_search;
 mod logging;
 mod maintenance;
 mod memory_pressure;
@@ -21,6 +23,7 @@ mod paste;
 mod runtime_metrics;
 mod seed_pack;
 mod single_instance;
+mod store_owner;
 #[cfg(feature = "tray")]
 mod tray;
 mod verify;
@@ -113,7 +116,9 @@ fn main() -> anyhow::Result<()> {
     let health_digest = store
         .clipboard_health_digest()
         .context("building clipboard health digest")?;
-    let recent = store.load_recent(GUI_LIMIT).context("loading history")?;
+    let recent = store
+        .load_recent_for_ui(GUI_LIMIT)
+        .context("loading history")?;
     let mut initial_state = AppState::with_clips(recent);
     initial_state.health_digest = health_digest;
     initial_state.paused = strict_capture_blocked || remote_auto_paused;
@@ -137,6 +142,9 @@ fn main() -> anyhow::Result<()> {
     )));
     let shared: SharedState = Arc::new(Mutex::new(initial_state));
     let history = History::new(store, Arc::clone(&shared), GUI_LIMIT);
+    history.refresh_tags()?;
+    let query_history = history.clone();
+    single_instance::install_history_handler(move |request| query_history.query(request));
     let diagnostics = Diagnostics::new(Arc::clone(&shared));
     if strict_capture_blocked {
         diagnostics.notice(

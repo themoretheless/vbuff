@@ -22,6 +22,7 @@ pub(crate) struct FilteredClip {
     pub variant_of: Option<ClipId>,
 }
 
+#[cfg(test)]
 pub(crate) fn filter_clips(
     clips: &[Clip],
     raw_query: &str,
@@ -29,18 +30,53 @@ pub(crate) fn filter_clips(
     expanded_duplicates: &HashSet<ClipId>,
     now: DateTime<Utc>,
 ) -> Vec<FilteredClip> {
+    filter_clips_with_tags(
+        clips,
+        raw_query,
+        history_scope,
+        expanded_duplicates,
+        now,
+        &Default::default(),
+    )
+}
+
+fn filter_clips_with_tags(
+    clips: &[Clip],
+    raw_query: &str,
+    history_scope: &HistoryScope,
+    expanded_duplicates: &HashSet<ClipId>,
+    now: DateTime<Utc>,
+    tags: &vbuff_types::TagSnapshot,
+) -> Vec<FilteredClip> {
     let Ok(query) = parse_natural_query(raw_query, now) else {
         // Invalid structured syntax never falls back to a raw scan: doing so
         // could inspect sensitive payloads under a malformed filter.
         return Vec::new();
     };
-    let results = search_recall(clips, &query, RecallSearchContext::default());
+    let mut recall_tags = vbuff_core::recall::ClipTags::default();
+    if let Some(label) = &query.tag {
+        let variants = vbuff_core::recall::layout_variants(label);
+        for tag in tags.tags.iter().filter(|t| variants.contains(&t.name)) {
+            for clip in clips {
+                if tag.clips.contains(&clip.id) {
+                    recall_tags.add_tag(clip.id, label);
+                }
+            }
+        }
+    }
+    let results = search_recall(
+        clips,
+        &query,
+        RecallSearchContext {
+            tags: Some(&recall_tags),
+            ..Default::default()
+        },
+    );
     let mut filtered: Vec<FilteredClip> = Vec::with_capacity(results.len());
     let mut root: Option<(ClipId, vbuff_types::ContentKind, String)> = None;
-    for result in results
-        .into_iter()
-        .filter(|result| !clip_is_expired(result.clip, now) && history_scope.matches(result.clip))
-    {
+    for result in results.into_iter().filter(|result| {
+        !clip_is_expired(result.clip, now) && history_scope.matches_tags(result.clip, tags)
+    }) {
         let clip = result.clip;
         let text = (!clip.meta.sensitive)
             .then(|| clip.primary_text())
@@ -152,6 +188,7 @@ struct CachedProjection {
 
 impl ProjectionCache {
     /// The projection for this frame, recomputed only when an input changed.
+    #[cfg(test)]
     pub(crate) fn projection(
         &mut self,
         clips: &[Clip],
@@ -160,6 +197,28 @@ impl ProjectionCache {
         history_scope: &HistoryScope,
         expanded_duplicates: &HashSet<ClipId>,
         now: DateTime<Utc>,
+    ) -> Arc<[FilteredClip]> {
+        self.projection_with_tags(
+            clips,
+            revision,
+            raw_query,
+            history_scope,
+            expanded_duplicates,
+            now,
+            &Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn projection_with_tags(
+        &mut self,
+        clips: &[Clip],
+        revision: u64,
+        raw_query: &str,
+        history_scope: &HistoryScope,
+        expanded_duplicates: &HashSet<ClipId>,
+        now: DateTime<Utc>,
+        tags: &vbuff_types::TagSnapshot,
     ) -> Arc<[FilteredClip]> {
         // Key material only; `filter_clips` parses again on a miss. The double
         // parse costs well under a microsecond and buys the guarantee that the
@@ -176,8 +235,15 @@ impl ProjectionCache {
             return Arc::clone(&entry.projection);
         }
 
-        let projection: Arc<[FilteredClip]> =
-            filter_clips(clips, raw_query, history_scope, expanded_duplicates, now).into();
+        let projection: Arc<[FilteredClip]> = filter_clips_with_tags(
+            clips,
+            raw_query,
+            history_scope,
+            expanded_duplicates,
+            now,
+            tags,
+        )
+        .into();
         #[cfg(test)]
         {
             self.computations += 1;

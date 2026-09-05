@@ -19,6 +19,7 @@ struct DoctorOutput {
     required_capabilities_ok: bool,
     store_present: bool,
     version: &'static str,
+    storage_backend: String,
     target_os: &'static str,
     session: SessionContext,
     process_hardening: ProcessHardeningReport,
@@ -52,13 +53,21 @@ pub(crate) fn run(
     strict_mode: bool,
 ) -> anyhow::Result<()> {
     let path = vbuff_store::default_db_path()?;
-    let store_present = path.exists();
-    let (store, store_open) = if store_present {
-        Store::open_read_only_profiled(&path)?
+    let mut store_present = path.exists();
+    let (store_report, store_open) = if let Some(json) =
+        crate::single_instance::request_history(crate::single_instance::HistoryRequest::Doctor)?
+    {
+        // The resident can use a different backend and database path.
+        store_present = true;
+        (serde_json::from_str(&json)?, StoreOpenProfile::default())
     } else {
-        (Store::open_in_memory()?, StoreOpenProfile::default())
+        let (store, profile) = if store_present {
+            Store::open_read_only_profiled(&path)?
+        } else {
+            (Store::open_in_memory()?, StoreOpenProfile::default())
+        };
+        (store.doctor()?, profile)
     };
-    let store_report = store.doctor()?;
     // `vbuff doctor` is its own short-lived process, so it takes its own
     // snapshot of its own environment - that is the point of running it. What
     // it must not do is take two: the posture below and the `session` field
@@ -76,6 +85,7 @@ pub(crate) fn run(
         required_capabilities_ok: security_posture.required_capabilities_satisfied(),
         store_present,
         version: env!("CARGO_PKG_VERSION"),
+        storage_backend: store_report.backend.clone(),
         target_os: std::env::consts::OS,
         session: session.clone(),
         process_hardening,
@@ -95,12 +105,13 @@ pub(crate) fn run(
                 }
             );
             println!(
-                "store present: {}; schema: {}/{}; rows: {}; FTS healthy: {}",
+                "store backend: {}; present: {}; schema: {}/{}; rows: {}; Search projection healthy: {}",
+                output.storage_backend,
                 output.store_present,
                 output.store.schema_version,
                 output.store.expected_schema_version,
                 output.store.clip_rows,
-                output.store.fts.is_healthy()
+                output.store.search.is_healthy()
             );
             println!(
                 "encryption: {}; strict capture allowed: {}",
@@ -157,6 +168,7 @@ mod tests {
             required_capabilities_ok: security_posture.required_capabilities_satisfied(),
             store_present: true,
             version: "test",
+            storage_backend: store_report.backend.clone(),
             target_os: "test",
             session: session.clone(),
             process_hardening: ProcessHardeningReport::default(),

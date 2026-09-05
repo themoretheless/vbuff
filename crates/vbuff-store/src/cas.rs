@@ -55,6 +55,23 @@ impl CasStore {
         Ok(())
     }
 
+    #[cfg(feature = "duckdb")]
+    /// Copy a verified immutable payload into the new engine's independent CAS.
+    pub(crate) fn copy_from(
+        &self,
+        source: &Self,
+        kind: ContentKind,
+        blob_ref: &str,
+        size: u64,
+    ) -> Result<()> {
+        source.verify(kind, blob_ref, size)?;
+        let bytes = source.read(kind, blob_ref, size)?;
+        if self.put(kind, &bytes)? != blob_ref {
+            return Err(StoreError::Migration("CAS copy hash mismatch".into()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove(&self, kind: ContentKind, blob_ref: &str) -> Result<()> {
         let path = self.path_for(kind, blob_ref)?;
         match std::fs::remove_file(path) {

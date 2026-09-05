@@ -2,7 +2,7 @@
 
 **Product direction: right clip, tested format, explicit evidence.**
 
-A native desktop clipboard manager written in Rust. The current executable is an `eframe`/`egui` application only; the web demo, browser UI, and WASM target have been removed. It polls the generic `arboard` backend and can read either text or raw-RGBA image content per observation into a searchable local SQLite history. That SQLite database is not encrypted. When summoned by the registered global hotkey on a local macOS or Windows session, vbuff can capture the application active before the popup, hide after selection, restore and re-confirm that application, then inject Cmd/Ctrl+V; every unproven target degrades to copy-only. macOS additionally requires Accessibility permission. Tray/relaunch opening and Linux remain copy-only, and sensitive copy is blocked when the backend cannot exclude the write from OS or third-party clipboard history.
+A native desktop clipboard manager written in Rust. The current executable is an `eframe`/`egui` application only; the web demo, browser UI, and WASM target have been removed. It polls the generic `arboard` backend and can read either text or raw-RGBA image content per observation into a searchable local history using DuckDB (default) or SQLite. The database is not encrypted. When summoned by the registered global hotkey on a local macOS or Windows session, vbuff can capture the application active before the popup, hide after selection, restore and re-confirm that application, then inject Cmd/Ctrl+V; every unproven target degrades to copy-only. macOS additionally requires Accessibility permission. Tray/relaunch opening and Linux remain copy-only, and sensitive copy is blocked when the backend cannot exclude the write from OS or third-party clipboard history.
 
 ---
 
@@ -10,7 +10,7 @@ A native desktop clipboard manager written in Rust. The current executable is an
 
 Clipboard history itself is now an operating-system baseline: Windows provides Win+V history and cloud sync, and macOS Tahoe 26 exposes searchable history in Spotlight. Dedicated products have also moved well beyond simple recall. **Paste** now advertises OCR/Power Search, Teams, shared pinboards, Apple Intelligence, local MCP, and both recurring and lifetime purchase choices. **CrossPaste** advertises cross-OS LAN E2EE, OCR, MCP, and a browser extension. **PowerToys**, **CopyQ**, **Raycast**, **Maccy**, **PastePal**, and **PasteBar** already cover most individual transform, scripting, queue, collection, and privacy checkboxes.
 
-vbuff therefore does not try to win by accumulating the longest feature list. Its initial target is technical work across desktop operating systems: recall the right item by source/time/session context, preserve and test representations across source and destination apps, and attach explicit evidence to vbuff-controlled capture, storage, and disclosure boundaries. Cross-platform reach, encryption, and polish remain required, but they are foundations rather than the headline. The current fallback backend cannot yet observe all native privacy hints, the current SQLite file is not encrypted, and generic applications cannot acknowledge successful insertion; those limitations are tracked explicitly rather than hidden behind stronger product language. The dated evidence and implementation order are in [the 2026 competitive strategy refresh](docs/competitive-strategy-2026.md).
+vbuff therefore does not try to win by accumulating the longest feature list. Its initial target is technical work across desktop operating systems: recall the right item by source/time/session context, preserve and test representations across source and destination apps, and attach explicit evidence to vbuff-controlled capture, storage, and disclosure boundaries. Cross-platform reach, encryption, and polish remain required, but they are foundations rather than the headline. The current fallback backend cannot yet observe all native privacy hints, the current database is not encrypted, and generic applications cannot acknowledge successful insertion; those limitations are tracked explicitly rather than hidden behind stronger product language. The dated evidence and implementation order are in [the 2026 competitive strategy refresh](docs/competitive-strategy-2026.md).
 
 ---
 
@@ -48,7 +48,7 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 
 ### Capture everything, byte-for-byte
 
-- Background watcher captures clipboard changes via a fixed-interval `arboard` poll today (target: event-driven per-OS backends, near-0%-idle CPU - **target**, see audit #11-13).
+- Background watcher captures clipboard changes via adaptive `arboard` polling with idle backoff; event-driven native backends remain target work.
 - Currently captures **plain text and a single raster image** per copy via `arboard`; rich text/HTML, RTF, files/folders, custom MIME types and color clips are **target** (audit #14-15).
 - Atomic multi-flavor capture (HTML + plain text + image together) is **target**; today only one flavor is ever stored per copy (audit #14).
 - **Byte-for-byte fidelity**: no whitespace, newline or encoding normalization, so editor selections and exact payloads round-trip.
@@ -61,14 +61,16 @@ Curated from the project's feature catalog (the strongest MVP and v1 items, not 
 - Fully keyboard-driven: navigate, filter, paste-back and pin without touching the mouse.
 - **Number-key quick-pick** for the top items, and per-action shortcuts (paste, paste-plain, pin, delete).
 - Type / pinned / favorite filters, empty and no-results states, dark/light themes, image thumbnails, per-type icons.
-- Search today is a client-side substring filter over the most recent 1,000 clips; FTS5 indexed search for 100k+ items is **target**, and no FTS5 schema exists yet (audit #21-23).
+- Non-empty queries and scoped views search the entire active history on one cancellable background worker. The popup preserves its structured filters, substring and typo matching, and shows up to 1,000 best matches with an explicit total and memory-pressure limits. Empty unfiltered history remains a bounded recent snapshot. The selected storage backend supplies candidate rows; the core still verifies structured filters and typo matches.
+- Save up to 24 named queries and scopes on this device. Relative dates are evaluated when the search runs; saved queries are excluded from shareable configuration and debug output.
+- External image bodies stay unloaded in UI snapshots; visible thumbnails are decoded on a bounded worker with a 32-entry texture cache. Text remains fully loaded for editing/composition, and paste resolves original content by ID.
 
 ### Reliable paste-back
 
 - Restores focus to the previously active app and injects a real paste, so the clip lands where you were typing.
 - **Plain vs keep-formatting** paste, with a one-shot paste-as-plain action.
 - **Enter** to paste-back, double-click to paste, or a number key for quick-pick; **copy-only** fallback when paste injection is unavailable.
-- Self-write suppression is **target**; today a paste triggers a harmless but needless re-insert cycle on the next capture-thread poll (audit #44).
+- Self-write suppression is wired through the capture ledger; paste writes can be recognized without treating them as new user copies.
 
 ### Organization that survives restarts
 
@@ -102,13 +104,13 @@ vbuff is designed around one hard rule: **fail closed.** Every uncertainty in "s
 
 ## Status
 
-vbuff is in active early development. The current product surface is a native `eframe`/`egui` resident application; there is no web UI, browser demo, or WASM build. Generic `arboard` polling observes text or image content, not an atomic native flavor set, and supplies no trustworthy source, concealed, generation, provenance, or OS-history-exclusion evidence. Eligible clips are stored in bundled, **unencrypted** SQLite. `strict_security_mode` may block capture while required protections are unavailable.
+vbuff is in active early development. The current product surface is a native `eframe`/`egui` resident application; there is no web UI, browser demo, or WASM build. Generic `arboard` polling observes text or image content, not an atomic native flavor set, and supplies no trustworthy source, concealed, generation, provenance, or OS-history-exclusion evidence. Eligible clips are stored in the selected bundled, **unencrypted** database. `strict_security_mode` may block capture while required protections are unavailable.
 
 The popup can search and manage the local history. On a global-hotkey summon in local macOS and Windows sessions, the runtime captures the previously active application before showing the popup and treats that target as a one-shot capability. After an eligible non-sensitive selection, it stages the clipboard, hides the popup, requests target activation, waits for independent foreground confirmation, verifies the clipboard did not change, and only then injects Cmd/Ctrl+V. Opening from the tray or a repeated launch deliberately stays copy-only because those paths cannot prove that the foreground window is the original editor. A missing permission, unsupported desktop, stale target, failed restoration, or changed clipboard likewise degrades to copy-only or a surfaced failure without injecting. macOS requires Accessibility permission; Linux is currently copy-only. A sensitive selection remains blocked when OS-history exclusion cannot be proven. Native sink-app conformance evidence is still outstanding, so `InjectionSent` must not be described as application acknowledgement.
 
-One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery use a bounded process-only lane instead of SQLite. It holds at most 32 clips, applies hard expiry, never permits pinning or session protection, is rejected by store/import boundaries, and disappears when the process exits. The lane is recallable from History while alive, but it is not durable or crash-recoverable.
+One-time passwords, private keys, recovery codes, and explicit skipped-capture recovery use a bounded process-only lane outside the database. It holds at most 32 clips, applies hard expiry, never permits pinning or session protection, is rejected by store/import boundaries, and disappears when the process exits. The lane is recallable from History while alive, but it is not durable or crash-recoverable.
 
-Schema 7 and its lifecycle APIs include migration, archive, retention, quarantine, export, and backup-evidence contracts. Lifecycle mutations fail closed when required annotation/residency sidecars are missing; ordinary and auxiliary recall consistently exclude archived or expired rows; derived-index backfills skip expired rows; legal-hold and retention guards are part of the destructive SQL predicates. These contracts do not encrypt the live database and do not create a user backup service. A migration guard may use a temporary owner-only safety copy while applying an upgrade; that artifact is removed only after the upgraded or next-start live store opens fully and passes `quick_check`, so a failed open keeps the rollback bytes. It must not be described as a durable user backup. The native plugin executable protocol uses bounded, big-endian-length-prefixed JSON frames but remains contract-only and disconnected from the resident runtime. No plugin is launched, sandboxed, installed, or granted clipboard access; activation remains release-gated on an OS sandbox, host-side capability enforcement, publisher trust, and conformance evidence.
+Both stores retain lifecycle APIs for archive, retention, quarantine, export, and backup evidence. SQLite data-contract schema v7 and export bytes remain frozen; the new physical DuckDB schema has an independent version. Existing `history.db` is read in one snapshot and copied to `history.duckdb` only after row counts, field hashes, clip hashes, and external files verify. The old database and its `blobs/` directory are retained; the new engine owns `duckdb-blobs/`. Logical deletion and checkpoints do not guarantee physical erasure of old blocks or retained backups. See [the migration and ownership design](docs/duckdb-migration.md). The native plugin executable protocol uses bounded, big-endian-length-prefixed JSON frames but remains contract-only and disconnected from the resident runtime. No plugin is launched, sandboxed, installed, or granted clipboard access; activation remains release-gated on an OS sandbox, host-side capability enforcement, publisher trust, and conformance evidence.
 
 ---
 
@@ -120,7 +122,7 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 |---|---|---|
 | `vbuff-types` | Plain shared clip, status, notice, and minimal IPC contracts; serde only | Yes |
 | `vbuff-core` | Pure dedup/eviction/classification plus capture, composition, everyday workflow, privacy/AI, embedding, delivery, feedback, and observability policy | Yes (partial) |
-| `vbuff-store` | Bundled SQLite schema v7, FTS5, migrations, sharded CAS, exact/near dedup, lifecycle annotations/quarantine/export contracts, externally keyed recovery primitives, eligible local embeddings, expiry, and audits; SQLCipher/keystore wiring remains a release gate | Yes (partial) |
+| `vbuff-store` | Bundled DuckDB (physical schema v1) or SQLite (schema v7), verified SQLite-to-DuckDB import, sharded CAS, exact/near dedup, lifecycle annotations/quarantine/export contracts, externally keyed recovery primitives, eligible local embeddings, expiry, and audits; encryption/keystore wiring remains a release gate | Yes (partial) |
 | `vbuff-platform` | Current traits, generic `arboard` text-or-image polling/write path, macOS/Windows target-confirmed paste adapters, desktop capability decisions, and disconnected access/profile/theme policy; native per-OS clipboard privacy/fidelity proof remains target work | Yes (partial) |
 | `vbuff-gui` | Native `eframe` History/Trust/Compose/Settings popup; no browser/WASM target; native assistive-technology evidence remains | Yes (partial) |
 | *(root app)* | `src/main.rs` composes startup; focused modules own capture supervision, history, guarded delivery, event-loop wiring, autostart, tray/menu-bar integration, and minimal single-instance handoff | Yes |
@@ -131,7 +133,7 @@ vbuff is a Cargo **workspace** with a fat, OS-agnostic core and thin platform cr
 | `vbuff-update` | Signed manifests, key rotation, downgrade/replay defense, staged rollout, build attestation, and streaming checksum verification | Foundation + verifier CLI |
 | `vbuff-cli` | `vbuff` verbs as a pure IPC client | Later |
 
-The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. The current store is bundled **SQLite** via `rusqlite`, with FTS5 and an out-of-row content-addressable blob store already active; SQLCipher and OS-keystore keying remain target work. Dedup uses **BLAKE3**. See [architecture.md](architecture.md) for the full target design and current cut lines.
+The GUI is **egui** rendered via **eframe**. Immediate mode is a natural fit for a search-as-you-type list: each keystroke re-filters the rows with no retained widget tree to diff, and `ScrollArea::show_rows` gives row virtualization for free. The store supports bundled **DuckDB** (default) or **SQLite**, selected at build time, with engine-specific search and an out-of-row content-addressable blob store already active; database encryption and OS-keystore keying remain target work. Dedup uses **BLAKE3**. See [architecture.md](architecture.md) for the full target design and current cut lines.
 
 ---
 
@@ -219,11 +221,11 @@ vbuff is a standard Cargo workspace. You need a recent stable **Rust toolchain**
 
 **macOS**
 - Xcode Command Line Tools: `xcode-select --install`
-- A recent stable Rust toolchain. No extra packages are required to build; the current store uses bundled SQLite via `rusqlite`. SQLCipher encryption is planned.
+- A recent stable Rust toolchain. The bundled DuckDB build requires a C++ toolchain; no separately installed database server is required. Encryption at rest remains unfinished.
 
 **Windows**
 - Rust with the MSVC toolchain (the default from rustup) and the **Visual Studio Build Tools** (the "Desktop development with C++" workload) for the C/C++ linker.
-- No additional system libraries are required for the current bundled SQLite store.
+- No additional system libraries are required for the current bundled DuckDB store.
 
 **Linux (X11 and Wayland)**
 - A C toolchain and `pkg-config`.
@@ -287,13 +289,15 @@ The default hotkey is registered at startup. Live rebinding/conflict repair in S
 
 ## Configuration
 
-Settings, hotkeys, exclusion lists and the per-app blacklist live in a human-editable **TOML config file** in your OS config directory (resolved via the platform's standard application directories). Configuration is policy and lives in the config file; clipboard history is data and lives in the SQLite database stored separately in your OS data directory:
+Settings, hotkeys, exclusion lists and the per-app blacklist live in a human-editable **TOML config file** in your OS config directory (resolved via the platform's standard application directories). Configuration is policy and lives in the config file; clipboard history is data and lives in the selected database stored separately in your OS data directory:
 
 | Platform | Config (TOML) | Data (history database) |
 |---|---|---|
-| macOS | `~/Library/Application Support/vbuff/` | `~/Library/Application Support/vbuff/vbuff.db` |
-| Windows | `%APPDATA%\vbuff\` | `%APPDATA%\vbuff\vbuff.db` |
-| Linux | `$XDG_CONFIG_HOME/vbuff/` (default `~/.config/vbuff/`) | `$XDG_DATA_HOME/vbuff/vbuff.db` (default `~/.local/share/vbuff/`) |
+| macOS | `~/Library/Application Support/vbuff/` | `~/Library/Application Support/vbuff/history.duckdb` |
+| Windows | `%APPDATA%\vbuff\` | `%APPDATA%\vbuff\history.duckdb` |
+| Linux | `$XDG_CONFIG_HOME/vbuff/` (default `~/.config/vbuff/`) | `$XDG_DATA_HOME/vbuff/history.duckdb` (default `~/.local/share/vbuff/`) |
+
+The paths above show the default DuckDB build; SQLite uses `history.db` in the same directory.
 
 The target architecture adds an encrypted database, storage-location overrides, cloud-folder warnings, and stronger path validation before broader releases. The current config also exposes byte-aware capture limits, RSS soft/hard limits, structural-secret detection and TTL, and `strict_security_mode`; strict mode intentionally refuses capture while required protections such as encryption at rest remain unavailable.
 
@@ -384,3 +388,11 @@ Licensed under either of
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+### Storage engine selection
+
+Both engines use the same history service, popup recall and CLI. Selection is currently at build time; see [storage backends](docs/storage-backends.md) for commands and migration behavior.
+
+### Tags
+
+Use **Tags** above history to manage names, colors and assignments, including bulk assignment and merging. **Filter tags** combines all/any matching with full-history search; `tag:work` is also supported. Both storage engines persist the catalog. See [tag behavior and limits](docs/tags.md).

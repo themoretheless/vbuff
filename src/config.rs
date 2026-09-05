@@ -87,6 +87,8 @@ pub struct Config {
     pub ui_show_health_digest: bool,
     /// Interface scale in percent (75..=200); 100 follows the platform default.
     pub ui_scale_percent: u16,
+    /// Explicit owner-local searches, excluded from shareable configuration.
+    pub saved_searches: Vec<vbuff_gui::experience::SavedSearch>,
 }
 
 // Hand-written so the two owner-private lists degrade to counts: a derived
@@ -147,6 +149,7 @@ impl Default for Config {
             ui_motion_inspector: false,
             ui_show_health_digest: false,
             ui_scale_percent: UI_SCALE_DEFAULT_PERCENT,
+            saved_searches: Vec::new(),
         }
     }
 }
@@ -474,6 +477,7 @@ impl Config {
 
     pub fn ui_preferences(&self) -> UiPreferences {
         UiPreferences {
+            saved_searches: self.saved_searches.clone(),
             density: self.ui_density.into(),
             reduced_motion: self
                 .ui_reduced_motion
@@ -492,6 +496,7 @@ impl Config {
         preferences: &UiPreferences,
         reduced_motion_changed: bool,
     ) {
+        self.saved_searches = preferences.saved_searches.clone();
         self.ui_density = preferences.density.into();
         if reduced_motion_changed {
             self.ui_reduced_motion = Some(preferences.reduced_motion);
@@ -506,6 +511,11 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.saved_searches.len() <= 24
+                && self.saved_searches.iter().all(|search| search.is_valid()),
+            "invalid saved searches"
+        );
         anyhow::ensure!(
             self.schema_version == CONFIG_SCHEMA_VERSION,
             "config schema {} needs previewed migration; run `vbuff config migrate preview`",
@@ -870,6 +880,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "ui_motion_inspector",
         "ui_show_health_digest",
         "ui_scale_percent",
+        "saved_searches",
     ];
     // Keys older builds wrote that no longer map to anything. They are still
     // accepted so an existing config.toml keeps loading, and they disappear
@@ -986,6 +997,39 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_searches_are_validated_private_and_roundtrip() {
+        let saved = vbuff_gui::experience::SavedSearch {
+            name: "private-label".into(),
+            query: "private-needle today".into(),
+            scope: vbuff_gui::experience::HistoryScope::All,
+        };
+        let config = Config {
+            saved_searches: vec![saved.clone()],
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.ui_preferences().saved_searches, vec![saved]);
+        assert!(!format!("{config:?}").contains("private-needle"));
+        assert!(!format!("{:?}", config.ui_preferences()).contains("private-label"));
+        assert!(
+            !toml::to_string(&config.shareable())
+                .unwrap()
+                .contains("private-needle")
+        );
+        let invalid = Config {
+            saved_searches: vec![vbuff_gui::experience::SavedSearch {
+                name: "bad".into(),
+                query: "kind:invalid".into(),
+                scope: vbuff_gui::experience::HistoryScope::All,
+            }],
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn default_roundtrips_through_toml() {
@@ -1371,6 +1415,7 @@ action = "skip"
     fn native_ui_preferences_roundtrip_through_owner_config() {
         let mut config = Config::default();
         let preferences = UiPreferences {
+            saved_searches: Vec::new(),
             density: DensityMode::Compact,
             reduced_motion: true,
             large_preview: false,

@@ -269,3 +269,73 @@ fn text_clip(text: &str, kind: ContentKind) -> Clip {
         favorite: false,
     }
 }
+
+#[test]
+fn full_history_search_and_saved_query_surface() {
+    let old = text_clip("cargo test --workspace", ContentKind::Code);
+    let shared = Arc::new(Mutex::new(AppState {
+        show_requested: true,
+        ..Default::default()
+    }));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(560.0, 620.0))
+        .with_theme(egui::Theme::Dark)
+        .wgpu()
+        .build_eframe(|_| PopupApp::new(shared.clone()));
+    harness
+        .state_mut()
+        .set_preferences(vbuff_gui::UiPreferences {
+            saved_searches: vec![vbuff_gui::experience::SavedSearch {
+                name: "Work commands".into(),
+                query: "cargo".into(),
+                scope: vbuff_gui::experience::HistoryScope::All,
+            }],
+            ..Default::default()
+        });
+    harness.run_steps(2);
+    harness.event(egui::Event::Text("cargo".into()));
+    harness.run_steps(2);
+    shared.lock().unwrap().history_search = Some(vbuff_gui::HistorySearchResults {
+        query: "cargo".into(),
+        scope: vbuff_gui::experience::HistoryScope::All,
+        history_revision: 0,
+        clips: vec![old].into(),
+        total: 1,
+        failed: false,
+    });
+    harness.run_steps(2);
+    let snapshots = SnapshotOptions::new()
+        .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
+    harness.snapshot_options("popup_dark_full_history_search", &snapshots);
+    let mut results = SnapshotResults::new();
+    results.extend(harness.take_snapshot_results());
+}
+
+#[test]
+fn tag_manager_snapshot() {
+    use egui_kittest::kittest::Queryable;
+    let mut state = snapshot_state(Surface::Populated);
+    let id = state.clips[0].id;
+    state.tags = Arc::new(vbuff_types::TagSnapshot {
+        tags: vec![vbuff_types::TagRecord {
+            id: "work".into(),
+            name: "work".into(),
+            color: [40, 140, 220],
+            clips: [id].into_iter().collect(),
+        }],
+    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(650.0, 680.0))
+        .with_theme(egui::Theme::Dark)
+        .wgpu()
+        .build_eframe(|_| PopupApp::new(Arc::new(Mutex::new(state))));
+    harness.run_steps(2);
+    harness.get_by_label("Tags").click();
+    harness.run_steps(3);
+    let snapshots = SnapshotOptions::new()
+        .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
+    harness.snapshot_options("popup_dark_tag_manager", &snapshots);
+    let mut results = SnapshotResults::new();
+    results.extend(harness.take_snapshot_results());
+    results.unwrap();
+}

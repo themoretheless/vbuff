@@ -14,6 +14,8 @@
 //! over its canonical flavor bytes (see `vbuff-core`).
 
 mod ipc;
+mod tags;
+pub use tags::{TagCommand, TagRecord, TagSnapshot};
 pub mod mac;
 pub mod replay;
 mod rgba;

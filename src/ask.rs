@@ -29,17 +29,17 @@ impl fmt::Debug for AskCommand {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 struct AskOutput {
-    engine: &'static str,
+    engine: String,
     semantic_model: bool,
     results: Vec<AskResult>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 struct AskResult {
     id: String,
-    kind: &'static str,
+    kind: String,
     preview: String,
 }
 
@@ -83,20 +83,30 @@ fn parse_requested(
 }
 
 pub(crate) fn run(command: AskCommand) -> anyhow::Result<()> {
-    let store = Store::open_default()?;
-    let _ = store.backfill_embeddings(command.limit.saturating_mul(8).min(512))?;
-    let clips = store.local_similarity_search(&command.query, command.limit)?;
-    let output = AskOutput {
-        engine: "local-feature-hash-v1",
-        semantic_model: false,
-        results: clips
-            .into_iter()
-            .map(|clip| AskResult {
-                id: clip.id.to_string_repr(),
-                kind: clip.meta.kind.label(),
-                preview: clip.preview(240),
-            })
-            .collect(),
+    let output = if let Some(json) =
+        crate::single_instance::request_history(crate::single_instance::HistoryRequest::Ask {
+            query: command.query.clone(),
+            limit: command.limit,
+        })? {
+        serde_json::from_str::<AskOutput>(&json)?
+    } else {
+        match crate::single_instance::acquire_or_forward(vbuff_types::ClientIntent::Ping)? {
+            crate::single_instance::LaunchOutcome::Primary { guard, .. } => {
+                let _guard = guard;
+                let store = Store::open_default()?;
+                serde_json::from_str(&query_store(&store, &command.query, command.limit)?)?
+            }
+            crate::single_instance::LaunchOutcome::Forwarded => {
+                let json = crate::single_instance::request_history(
+                    crate::single_instance::HistoryRequest::Ask {
+                        query: command.query.clone(),
+                        limit: command.limit,
+                    },
+                )?
+                .ok_or_else(|| anyhow::anyhow!("resident history became unavailable"))?;
+                serde_json::from_str(&json)?
+            }
+        }
     };
     if command.json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -108,6 +118,24 @@ pub(crate) fn run(command: AskCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn query_store(store: &Store, query: &str, limit: usize) -> anyhow::Result<String> {
+    let _ = store.backfill_embeddings(limit.saturating_mul(8).min(512))?;
+    let clips = store.local_similarity_search(query, limit)?;
+    let output = AskOutput {
+        engine: "local-feature-hash-v1".into(),
+        semantic_model: false,
+        results: clips
+            .into_iter()
+            .map(|clip| AskResult {
+                id: clip.id.to_string_repr(),
+                kind: clip.meta.kind.label().into(),
+                preview: clip.preview(240),
+            })
+            .collect(),
+    };
+    Ok(serde_json::to_string(&output)?)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! Deduplication, recovery, and retention primitives.
 //!
 //! This module owns content lifecycle policy while `Store` remains responsible
-//! for SQLite transactions and CAS hydration.
+//! for store transactions and CAS hydration.
 
 use std::time::Duration;
 

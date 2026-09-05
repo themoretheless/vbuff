@@ -97,10 +97,87 @@ mod platform {
 
     pub(super) struct Guard;
 
+    pub(super) fn query_history(
+        _request: HistoryRequest,
+    ) -> io::Result<vbuff_types::ServerResponse> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "history endpoint unsupported",
+        ))
+    }
+
     pub(super) fn acquire(_intent: ClientIntent) -> io::Result<LaunchOutcome> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "single-instance guard is unsupported on this platform",
         ))
+    }
+}
+
+/// Queries are served by the resident store owner, never by a second database writer.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum HistoryRequest {
+    Ask { query: String, limit: usize },
+    Doctor,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum ControlRequest {
+    Intent(ClientIntent),
+    History(HistoryRequest),
+}
+
+type HistoryHandler = dyn Fn(HistoryRequest) -> anyhow::Result<String> + Send + Sync;
+static HISTORY_HANDLER: std::sync::OnceLock<std::sync::Arc<HistoryHandler>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn install_history_handler(
+    handler: impl Fn(HistoryRequest) -> anyhow::Result<String> + Send + Sync + 'static,
+) {
+    let _ = HISTORY_HANDLER.set(std::sync::Arc::new(handler));
+}
+
+fn history_response(request: HistoryRequest) -> vbuff_types::ServerResponse {
+    if let HistoryRequest::Ask { query, limit } = &request
+        && (query.trim().is_empty() || query.len() > 4096 || !(1..=512).contains(limit))
+    {
+        return vbuff_types::ServerResponse::Rejected {
+            message: "invalid history query".into(),
+        };
+    }
+    let Some(handler) = HISTORY_HANDLER.get() else {
+        return vbuff_types::ServerResponse::Rejected {
+            message: "history is still opening".into(),
+        };
+    };
+    match handler(request) {
+        Ok(json) if json.len() <= MAX_FRAME_BYTES / 2 => {
+            vbuff_types::ServerResponse::HistoryResult { json }
+        }
+        Ok(_) => vbuff_types::ServerResponse::Rejected {
+            message: "result is too large; reduce --limit".into(),
+        },
+        Err(_) => vbuff_types::ServerResponse::Rejected {
+            message: "history query failed".into(),
+        },
+    }
+}
+
+pub(crate) fn request_history(request: HistoryRequest) -> anyhow::Result<Option<String>> {
+    match platform::query_history(request) {
+        Ok(vbuff_types::ServerResponse::HistoryResult { json }) => Ok(Some(json)),
+        Ok(vbuff_types::ServerResponse::Rejected { message }) => anyhow::bail!("{message}"),
+        Ok(_) => anyhow::bail!("unexpected history response"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
     }
 }

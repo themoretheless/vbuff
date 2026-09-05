@@ -9,13 +9,117 @@ const MAX_DECODE_DIMENSION: u32 = 4_096;
 const MAX_DECODE_RGBA_BYTES: u64 = 64 * 1024 * 1024;
 const TEXTURE_EDGE: u32 = 320;
 
-pub(crate) fn build_thumbnail(
-    ctx: &egui::Context,
-    flavor: &vbuff_types::Flavor,
-    key: &str,
-) -> Option<TextureHandle> {
-    let color_image = decode_thumbnail(flavor)?;
-    Some(ctx.load_texture(key, color_image, egui::TextureOptions::LINEAR))
+/// Decode on one background worker, with bounded pending work and texture memory.
+/// No worker is started until the first visible image is requested.
+#[derive(Default)]
+pub(crate) struct ThumbnailCache {
+    entries: std::collections::HashMap<String, (Option<TextureHandle>, u64)>,
+    pending: std::collections::HashSet<String>,
+    worker: Option<ThumbnailWorker>,
+    tick: u64,
+    loader: Option<ThumbnailLoader>,
+}
+
+pub type ThumbnailLoader =
+    std::sync::Arc<dyn Fn(vbuff_types::ClipId) -> Option<vbuff_types::Flavor> + Send + Sync>;
+
+struct ThumbnailWorker {
+    sender: std::sync::mpsc::SyncSender<(String, vbuff_types::Flavor, egui::Context)>,
+    receiver: std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
+}
+
+impl ThumbnailCache {
+    // 32 RGBA textures of at most 320x320 pixels occupy at most 12.5 MiB.
+    const MAX_ENTRIES: usize = 32;
+    const MAX_PENDING: usize = 2;
+
+    pub(crate) fn set_loader(&mut self, loader: ThumbnailLoader) {
+        self.loader = Some(loader);
+        self.worker = None;
+        self.pending.clear();
+        self.entries.clear();
+    }
+
+    pub(crate) fn retain(&mut self, live: &std::collections::HashSet<String>) {
+        self.entries.retain(|key, _| live.contains(key));
+        // Pending completions are checked against live IDs before uploading.
+    }
+
+    pub(crate) fn poll(&mut self, ctx: &egui::Context, live: &std::collections::HashSet<String>) {
+        let Some(worker) = &self.worker else { return };
+        while let Ok((key, decoded)) = worker.receiver.try_recv() {
+            self.pending.remove(&key);
+            if !live.contains(&key) {
+                continue;
+            }
+            let texture =
+                decoded.map(|pixels| ctx.load_texture(&key, pixels, egui::TextureOptions::LINEAR));
+            self.entries.insert(key, (texture, self.tick));
+        }
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > Self::MAX_ENTRIES {
+            let key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = key {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        ctx: &egui::Context,
+        flavor: &vbuff_types::Flavor,
+        key: String,
+    ) -> Option<TextureHandle> {
+        self.tick = self.tick.wrapping_add(1);
+        if let Some((texture, used)) = self.entries.get_mut(&key) {
+            *used = self.tick;
+            return texture.clone();
+        }
+        if self.pending.contains(&key) || self.pending.len() >= Self::MAX_PENDING {
+            return None;
+        }
+        let loader = self.loader.clone();
+        let worker = self.worker.get_or_insert_with(|| {
+            let (sender, jobs) =
+                std::sync::mpsc::sync_channel::<(String, vbuff_types::Flavor, egui::Context)>(
+                    Self::MAX_PENDING,
+                );
+            let (completed, receiver) = std::sync::mpsc::sync_channel(Self::MAX_PENDING);
+            std::thread::spawn(move || {
+                while let Ok((key, flavor, ctx)) = jobs.recv() {
+                    let loaded = if matches!(flavor.body, Body::Spilled { .. }) {
+                        vbuff_types::ClipId::parse(&key)
+                            .ok()
+                            .and_then(|id| loader.as_ref().and_then(|load| load(id)))
+                    } else {
+                        Some(flavor)
+                    };
+                    let decoded = loaded.as_ref().and_then(decode_thumbnail);
+                    if completed.send((key, decoded)).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            });
+            ThumbnailWorker { sender, receiver }
+        });
+        if worker
+            .sender
+            .try_send((key.clone(), flavor.clone(), ctx.clone()))
+            .is_ok()
+        {
+            self.pending.insert(key);
+        }
+        None
+    }
 }
 
 fn decode_thumbnail(flavor: &vbuff_types::Flavor) -> Option<egui::ColorImage> {

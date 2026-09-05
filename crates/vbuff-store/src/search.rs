@@ -1,35 +1,3 @@
-use std::collections::VecDeque;
-use std::time::Duration;
-
-const FTS_ROW_THRESHOLD: usize = 250;
-const LIKE_P95_BUDGET: Duration = Duration::from_millis(8);
-const LATENCY_WINDOW: usize = 32;
-
-#[derive(Debug, Default)]
-pub(crate) struct SearchPlanner {
-    like_latencies: VecDeque<Duration>,
-    latency_promoted: bool,
-}
-
-impl SearchPlanner {
-    pub(crate) fn use_fts(&self, row_count: usize, query: &str) -> bool {
-        query.chars().count() >= 3 && (row_count >= FTS_ROW_THRESHOLD || self.latency_promoted)
-    }
-
-    pub(crate) fn record_like(&mut self, latency: Duration) {
-        if self.like_latencies.len() == LATENCY_WINDOW {
-            self.like_latencies.pop_front();
-        }
-        self.like_latencies.push_back(latency);
-        let mut sorted = self.like_latencies.iter().copied().collect::<Vec<_>>();
-        sorted.sort_unstable();
-        let index = (sorted.len().saturating_sub(1) * 95) / 100;
-        self.latency_promoted = sorted
-            .get(index)
-            .is_some_and(|latency| *latency > LIKE_P95_BUDGET);
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParsedQuery {
     pub text: String,
@@ -53,23 +21,9 @@ pub(crate) fn parse_query(query: &str) -> ParsedQuery {
     }
 }
 
-pub(crate) fn fts_literal(query: &str) -> String {
-    format!("\"{}\"", query.replace('"', "\"\""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn planner_promotes_large_histories_and_slow_like() {
-        let mut planner = SearchPlanner::default();
-        assert!(!planner.use_fts(20, "hello"));
-        assert!(planner.use_fts(1_000, "hello"));
-        planner.record_like(Duration::from_millis(20));
-        assert!(planner.use_fts(20, "hello"));
-        assert!(!planner.use_fts(1_000, "hi"));
-    }
 
     #[test]
     fn parser_separates_supported_facets() {
@@ -272,32 +226,5 @@ mod tests {
                 ("host".to_string(), "b".to_string()),
             ]
         );
-    }
-
-    /// `fts_literal` wraps the whole text tier in one FTS5 phrase and doubles
-    /// embedded double quotes. That neutralizes every FTS5 operator, but it
-    /// does nothing about LIKE metacharacters (that is `escape_like`'s job).
-    #[test]
-    fn fts_literal_quotes_the_query_and_doubles_inner_quotes() {
-        assert_eq!(fts_literal("plain"), "\"plain\"");
-        assert_eq!(fts_literal("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(fts_literal("\""), "\"\"\"\"");
-        assert_eq!(
-            fts_literal("a* OR b NEAR/2 c ^d -e"),
-            "\"a* OR b NEAR/2 c ^d -e\""
-        );
-        assert_eq!(fts_literal("100% _x_ c:\\tmp"), "\"100% _x_ c:\\tmp\"");
-        // Nothing guards against a token set that tokenizes to nothing; the
-        // caller only checks that the text tier is non-empty.
-        assert_eq!(fts_literal("***"), "\"***\"");
-    }
-
-    /// The FTS/LIKE tier choice counts characters, not bytes, so a two-glyph
-    /// multi-byte query stays on the LIKE tier.
-    #[test]
-    fn planner_counts_characters_not_bytes() {
-        let planner = SearchPlanner::default();
-        assert!(!planner.use_fts(1_000, "工作"));
-        assert!(planner.use_fts(1_000, "工作表"));
     }
 }

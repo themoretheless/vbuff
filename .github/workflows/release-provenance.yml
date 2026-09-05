@@ -46,7 +46,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --workspace --all-features --locked 2>&1 | tee "evidence/tests-${{ matrix.name }}.log"
+          cargo test --workspace --features duckdb,tray --locked 2>&1 | tee "evidence/tests-${{ matrix.name }}.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -91,7 +91,7 @@ jobs:
       - name: Generate CycloneDX SBOM
         shell: bash
         run: |
-          cargo cyclonedx --format json --describe binaries --all-features
+          cargo cyclonedx --format json --describe binaries --features duckdb,tray
           find . -path './evidence' -prune -o -name '*.cdx.json' -exec cp --parents '{}' evidence/ \;
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -154,7 +154,7 @@ jobs:
         run: cmp repro/vbuff-repro-one/vbuff repro/vbuff-repro-two/vbuff
       - name: Generate SBOM and checksums
         run: |
-          cargo cyclonedx --format json --describe binaries --all-features
+          cargo cyclonedx --format json --describe binaries --features duckdb,tray
           mkdir -p dist
           cp repro/vbuff-repro-one/vbuff dist/vbuff
           chmod +x dist/vbuff

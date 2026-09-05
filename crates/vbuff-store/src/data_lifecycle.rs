@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension as _, params};
+use duckdb::{OptionalExt as _, params};
 use serde::{Deserialize, Serialize};
 use vbuff_core::capture::{CaptureDecision, CaptureInput, CapturePolicy, SelectionSource};
 use vbuff_core::content_hash_from_flavors;
@@ -197,7 +197,7 @@ pub struct GarbageCollectionPreview {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CompactionForecast {
-    pub sqlite_free_bytes: u64,
+    pub database_free_bytes: u64,
     pub orphan_blob_bytes: u64,
     pub orphan_blob_count: usize,
     pub estimated_reclaimable_bytes: u64,
@@ -387,7 +387,7 @@ impl Store {
     pub fn set_archived(&self, id: ClipId, archived: bool) -> Result<()> {
         self.ensure_clip_exists(id)?;
         let changed = self.conn.execute(
-            "UPDATE clip_annotations SET archived = ?1 WHERE clip_id = ?2",
+            "UPDATE clip_annotations SET archived = $1 WHERE clip_id = $2",
             params![archived as i64, id.to_string_repr()],
         )?;
         require_lifecycle_update(changed, "clip annotation")
@@ -399,7 +399,7 @@ impl Store {
             .query_row(
                 r#"
                 SELECT archived, collection_id, preferred_mime, legal_hold
-                FROM clip_annotations WHERE clip_id = ?1
+                FROM clip_annotations WHERE clip_id = $1
                 "#,
                 [id.to_string_repr()],
                 |row| {
@@ -430,10 +430,10 @@ impl Store {
             SELECT {projection}
             FROM clips c
             JOIN clip_annotations a ON a.clip_id = c.id
-            WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
+            WHERE (c.expires_at IS NULL OR c.expires_at > $1)
             {archive_clause}
             ORDER BY c.pinned DESC, c.updated_at DESC, c.seq DESC
-            LIMIT ?2
+            LIMIT $2
             "#,
             projection = clip_projection("c"),
         );
@@ -456,7 +456,7 @@ impl Store {
                 SELECT {projection}
                 FROM clips c
                 JOIN clip_annotations a ON a.clip_id = c.id
-                WHERE (c.expires_at IS NULL OR c.expires_at > ?1)
+                WHERE (c.expires_at IS NULL OR c.expires_at > $1)
                   AND a.archived = 0
                 ORDER BY c.updated_at DESC, c.seq DESC
                 LIMIT 1
@@ -479,7 +479,7 @@ impl Store {
                     r#"
                 SELECT {projection}
                 FROM clips
-                WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+                WHERE id = $1 AND (expires_at IS NULL OR expires_at > $2)
                 "#,
                     projection = clip_projection("clips"),
                 ),
@@ -506,7 +506,7 @@ impl Store {
             r#"
             INSERT INTO collection_policies(
                 id, name, max_age_days, max_items, max_bytes
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ) VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 max_age_days = excluded.max_age_days,
@@ -533,7 +533,7 @@ impl Store {
                 return Err(StoreError::Maintenance("invalid collection id".into()));
             }
             let exists: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM collection_policies WHERE id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM collection_policies WHERE id = $1)",
                 [collection_id],
                 |row| row.get(0),
             )?;
@@ -542,7 +542,7 @@ impl Store {
             }
         }
         let changed = self.conn.execute(
-            "UPDATE clip_annotations SET collection_id = ?1 WHERE clip_id = ?2",
+            "UPDATE clip_annotations SET collection_id = $1 WHERE clip_id = $2",
             params![collection_id, id.to_string_repr()],
         )?;
         require_lifecycle_update(changed, "clip annotation")
@@ -562,7 +562,7 @@ impl Store {
             SELECT clips.id, clips.updated_at, clips.byte_size
             FROM clips
             JOIN clip_annotations a ON a.clip_id = clips.id
-            WHERE a.collection_id = ?1{guards}
+            WHERE a.collection_id = $1{guards}
             ORDER BY clips.updated_at DESC, clips.seq DESC
             "#,
             guards = DeleteGuards::SWEEP.sql(),
@@ -623,7 +623,7 @@ impl Store {
                 r#"
                 SELECT EXISTS (
                     SELECT 1 FROM clip_annotations
-                    WHERE clip_id = ?1 AND collection_id = ?2
+                    WHERE clip_id = $1 AND collection_id = $2
                 )
                 "#,
                 params![id.to_string_repr(), collection_id],
@@ -652,11 +652,11 @@ impl Store {
             .conn
             .query_row(
                 &format!(
-                    "SELECT {projection}, item_text != '' FROM clips WHERE id = ?1",
+                    "SELECT {projection}, item_text != '' FROM clips WHERE id = $1",
                     projection = clip_projection("clips"),
                 ),
                 [id.to_string_repr()],
-                |row| Ok((row_to_clip(row)?, row.get::<_, i64>(11)? != 0)),
+                |row| Ok((row_to_clip(row)?, row.get::<_, bool>(11)?)),
             )
             .optional()?
             .ok_or_else(|| StoreError::ClipNotFound(id.to_string_repr()))?;
@@ -695,9 +695,9 @@ impl Store {
                 SELECT 1 FROM blob_quarantine q
                 WHERE q.hash = r.hash AND q.kind = r.kind
             ) AND (
-                ?1 IS NULL OR r.hash > ?1 OR (r.hash = ?1 AND r.kind > ?2)
+                $1 IS NULL OR r.hash > $1 OR (r.hash = $1 AND r.kind > $2)
             )
-            ORDER BY r.hash, r.kind LIMIT ?3
+            ORDER BY r.hash, r.kind LIMIT $3
             "#,
         )?;
         let rows = statement.query_map(
@@ -714,7 +714,7 @@ impl Store {
                 ))
             },
         )?;
-        let references = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let references = rows.collect::<duckdb::Result<Vec<_>>>()?;
         drop(statement);
         let Some((last_hash, last_kind)) = references
             .last()
@@ -729,7 +729,7 @@ impl Store {
             WHERE r.refcount > 0 AND NOT EXISTS (
                 SELECT 1 FROM blob_quarantine q
                 WHERE q.hash = r.hash AND q.kind = r.kind
-            ) AND (r.hash > ?1 OR (r.hash = ?1 AND r.kind > ?2))
+            ) AND (r.hash > $1 OR (r.hash = $1 AND r.kind > $2))
             "#,
             params![last_hash, last_kind],
             |row| row.get::<_, i64>(0),
@@ -750,7 +750,7 @@ impl Store {
             self.conn.execute(
                 r#"
                 INSERT OR REPLACE INTO blob_quarantine(hash, kind, quarantined_at, reason)
-                VALUES (?1, ?2, ?3, 'integrity verification failed')
+                VALUES ($1, $2, $3, 'integrity verification failed')
                 "#,
                 params![blob_ref, kind.stored_discriminant(), now_millis()],
             )?;
@@ -777,21 +777,17 @@ impl Store {
     }
 
     pub fn compaction_forecast(&self) -> Result<CompactionForecast> {
-        let page_size: u64 = self
-            .conn
-            .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?
-            .max(0) as u64;
-        let free_pages: u64 = self
-            .conn
-            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?
-            .max(0) as u64;
+        let database_free_bytes: u64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(free_blocks * block_size),0)::UBIGINT FROM pragma_database_size()",
+            [],
+            |row| row.get(0),
+        )?;
         let gc = self.gc_dry_run()?;
-        let sqlite_free_bytes = page_size.saturating_mul(free_pages);
         Ok(CompactionForecast {
-            sqlite_free_bytes,
+            database_free_bytes,
             orphan_blob_bytes: gc.reclaimable_bytes,
             orphan_blob_count: gc.blob_count,
-            estimated_reclaimable_bytes: sqlite_free_bytes.saturating_add(gc.reclaimable_bytes),
+            estimated_reclaimable_bytes: database_free_bytes.saturating_add(gc.reclaimable_bytes),
         })
     }
 
@@ -803,7 +799,7 @@ impl Store {
             ResidencyTransition::Exported => "ever_exported",
         };
         let changed = self.conn.execute(
-            &format!("UPDATE clip_residency SET {column} = 1 WHERE clip_id = ?1"),
+            &format!("UPDATE clip_residency SET {column} = 1 WHERE clip_id = $1"),
             [id.to_string_repr()],
         )?;
         require_lifecycle_update(changed, "clip residency")
@@ -813,7 +809,7 @@ impl Store {
         self.ensure_clip_exists(id)?;
         self.conn
             .query_row(
-                "SELECT ever_on_disk, ever_synced, ever_exported FROM clip_residency WHERE clip_id = ?1",
+                "SELECT ever_on_disk, ever_synced, ever_exported FROM clip_residency WHERE clip_id = $1",
                 [id.to_string_repr()],
                 |row| {
                     Ok(SensitiveDataResidency {
@@ -843,7 +839,7 @@ impl Store {
             ));
         }
         let changed = self.conn.execute(
-            "UPDATE clip_annotations SET preferred_mime = ?1 WHERE clip_id = ?2",
+            "UPDATE clip_annotations SET preferred_mime = $1 WHERE clip_id = $2",
             params![mime, id.to_string_repr()],
         )?;
         require_lifecycle_update(changed, "clip annotation")
@@ -852,7 +848,7 @@ impl Store {
     pub fn set_legal_hold(&self, id: ClipId, held: bool) -> Result<()> {
         self.ensure_clip_exists(id)?;
         let changed = self.conn.execute(
-            "UPDATE clip_annotations SET legal_hold = ?1 WHERE clip_id = ?2",
+            "UPDATE clip_annotations SET legal_hold = $1 WHERE clip_id = $2",
             params![held as i64, id.to_string_repr()],
         )?;
         require_lifecycle_update(changed, "clip annotation")
@@ -865,7 +861,7 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO backup_state(singleton, verified_at, checksum)
-            VALUES (1, ?1, ?2)
+            VALUES (1, $1, $2)
             ON CONFLICT(singleton) DO UPDATE SET
                 verified_at = excluded.verified_at,
                 checksum = excluded.checksum
@@ -947,7 +943,7 @@ impl Store {
             INSERT INTO import_quarantine(
                 import_id, source_fingerprint, clip_id, staged_at,
                 byte_size, sensitive, payload_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
             params![
                 import_id,
@@ -966,7 +962,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT import_id, source_fingerprint, clip_id, staged_at, byte_size, sensitive
-            FROM import_quarantine ORDER BY staged_at, import_id LIMIT ?1
+            FROM import_quarantine ORDER BY staged_at, import_id LIMIT $1
             "#,
         )?;
         let rows = statement.query_map([limit.min(MAX_RESTORE_SELECTION) as i64], |row| {
@@ -1006,7 +1002,7 @@ impl Store {
             let payload = self
                 .conn
                 .query_row(
-                    "SELECT payload_json FROM import_quarantine WHERE import_id = ?1",
+                    "SELECT payload_json FROM import_quarantine WHERE import_id = $1",
                     [import_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -1037,8 +1033,8 @@ impl Store {
                     SELECT c.id, a.archived
                     FROM clips c
                     LEFT JOIN clip_annotations a ON a.clip_id = c.id
-                    WHERE c.content_hash = ?1
-                      AND (c.expires_at IS NULL OR c.expires_at > ?2)
+                    WHERE c.content_hash = $1
+                      AND (c.expires_at IS NULL OR c.expires_at > $2)
                     "#,
                     params![clip.content_hash.as_slice(), now_millis()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
@@ -1054,7 +1050,7 @@ impl Store {
                     self.set_archived(existing_id, false)?;
                 }
                 self.conn.execute(
-                    "DELETE FROM import_quarantine WHERE import_id = ?1",
+                    "DELETE FROM import_quarantine WHERE import_id = $1",
                     [import_id],
                 )?;
                 report.restored += 1;
@@ -1063,7 +1059,7 @@ impl Store {
             }
             self.insert(&clip)?;
             self.conn.execute(
-                "DELETE FROM import_quarantine WHERE import_id = ?1",
+                "DELETE FROM import_quarantine WHERE import_id = $1",
                 [import_id],
             )?;
             report.restored += 1;
@@ -1076,7 +1072,7 @@ impl Store {
             return Err(StoreError::Maintenance("invalid import id".into()));
         }
         let deleted = self.conn.execute(
-            "DELETE FROM import_quarantine WHERE import_id = ?1",
+            "DELETE FROM import_quarantine WHERE import_id = $1",
             [import_id],
         )?;
         if deleted > 0 {
@@ -1094,7 +1090,7 @@ impl Store {
     pub fn purge_import_quarantine(&self) -> Result<usize> {
         let cutoff = now_millis() - duration_millis_i64(IMPORT_QUARANTINE_MAX_AGE)?;
         let deleted = self.conn.execute(
-            "DELETE FROM import_quarantine WHERE staged_at <= ?1",
+            "DELETE FROM import_quarantine WHERE staged_at <= $1",
             params![cutoff],
         )?;
         if deleted > 0 {
@@ -1119,7 +1115,7 @@ impl Store {
         let transaction = self.conn.unchecked_transaction()?;
         for clip in &clips {
             let changed = transaction.execute(
-                "UPDATE clip_residency SET ever_exported = 1 WHERE clip_id = ?1",
+                "UPDATE clip_residency SET ever_exported = 1 WHERE clip_id = $1",
                 [clip.id.to_string_repr()],
             )?;
             require_lifecycle_update(changed, "clip residency")?;
@@ -1134,7 +1130,7 @@ impl Store {
         let held = self
             .conn
             .query_row(
-                "SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1",
+                "SELECT legal_hold FROM clip_annotations WHERE clip_id = $1",
                 [id.to_string_repr()],
                 |row| row.get::<_, i64>(0),
             )
@@ -1156,7 +1152,7 @@ impl Store {
     /// not held, because there is nothing left to protect.
     pub(crate) fn legal_hold_active(&self, id: ClipId) -> Result<bool> {
         let held: i64 = self.conn.query_row(
-            "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = ?1), 0)",
+            "SELECT COALESCE((SELECT legal_hold FROM clip_annotations WHERE clip_id = $1), 0)",
             [id.to_string_repr()],
             |row| row.get(0),
         )?;
@@ -1165,7 +1161,7 @@ impl Store {
 
     fn ensure_clip_exists(&self, id: ClipId) -> Result<()> {
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = $1)",
             [id.to_string_repr()],
             |row| row.get(0),
         )?;
@@ -1182,7 +1178,7 @@ impl Store {
             .query_row(
                 r#"
                 SELECT max_age_days, max_items, max_bytes
-                FROM collection_policies WHERE id = ?1
+                FROM collection_policies WHERE id = $1
                 "#,
                 [collection_id],
                 |row| {
@@ -1296,7 +1292,8 @@ fn portable_inline_size(clip: &Clip) -> Option<u64> {
 }
 
 fn to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value).map_err(|_| StoreError::Maintenance("value exceeds SQLite range".into()))
+    i64::try_from(value)
+        .map_err(|_| StoreError::Maintenance("value exceeds signed database integer range".into()))
 }
 
 #[cfg(test)]
@@ -1508,7 +1505,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE import_quarantine SET staged_at = ?1 WHERE import_id = ?2",
+                "UPDATE import_quarantine SET staged_at = $1 WHERE import_id = $2",
                 params![now_millis() - 8 * 24 * 60 * 60 * 1_000, stale_id],
             )
             .unwrap();
@@ -1580,7 +1577,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE import_quarantine SET payload_json = ?1 WHERE import_id = ?2",
+                "UPDATE import_quarantine SET payload_json = $1 WHERE import_id = $2",
                 params![serde_json::to_string(&tampered).unwrap(), import_id],
             )
             .unwrap();
@@ -1646,20 +1643,10 @@ mod tests {
         let second = clip("second export");
         store.insert(&first).unwrap();
         store.insert(&second).unwrap();
-        store
-            .conn
-            .execute_batch(&format!(
-                r#"
-                CREATE TRIGGER reject_one_export
-                BEFORE UPDATE OF ever_exported ON clip_residency
-                WHEN NEW.clip_id = '{}' AND NEW.ever_exported = 1
-                BEGIN
-                    SELECT RAISE(ABORT, 'test export failure');
-                END;
-                "#,
-                first.id.to_string_repr()
-            ))
-            .unwrap();
+        // A native CHECK constraint injects failure after an earlier residency update.
+        store.conn.execute_batch(&format!(
+            "ALTER TABLE clip_residency RENAME TO old_residency; CREATE TABLE clip_residency (clip_id TEXT PRIMARY KEY, ever_on_disk BIGINT, ever_synced BIGINT, ever_exported BIGINT CHECK(clip_id != '{}' OR ever_exported = 0)); INSERT INTO clip_residency SELECT * FROM old_residency; DROP TABLE old_residency;", first.id
+        )).unwrap();
 
         assert!(
             store
@@ -1741,7 +1728,7 @@ mod tests {
         store
             .conn
             .execute(
-                "DELETE FROM clip_residency WHERE clip_id = ?1",
+                "DELETE FROM clip_residency WHERE clip_id = $1",
                 [clip.id.to_string_repr()],
             )
             .unwrap();
@@ -1760,7 +1747,7 @@ mod tests {
         store
             .conn
             .execute(
-                "DELETE FROM clip_annotations WHERE clip_id = ?1",
+                "DELETE FROM clip_annotations WHERE clip_id = $1",
                 [clip.id.to_string_repr()],
             )
             .unwrap();
@@ -1791,7 +1778,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO backup_state(singleton, verified_at, checksum) VALUES (1, ?1, ?2)",
+                "INSERT INTO backup_state(singleton, verified_at, checksum) VALUES (1, $1, $2)",
                 params![now_millis(), "z".repeat(64)],
             )
             .unwrap();

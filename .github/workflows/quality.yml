@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
+        backend: [duckdb, sqlite]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -31,11 +32,11 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Test workspace
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --no-default-features --features ${{ matrix.backend }},tray --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.backend }},tray --locked -- -D warnings
       - name: Core-only build
-        run: cargo test -p vbuff --no-default-features --locked
+        run: cargo test -p vbuff --no-default-features --features ${{ matrix.backend }} --locked
 
   session-model:
     strategy:

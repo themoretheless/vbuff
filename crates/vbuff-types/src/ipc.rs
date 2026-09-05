@@ -16,6 +16,7 @@ pub enum ClientIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerResponse {
+    HistoryResult { json: String },
     Ack,
     Pong,
     Rejected { message: String },

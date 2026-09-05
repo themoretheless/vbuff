@@ -1,7 +1,7 @@
 //! Integration tests for `vbuff-store` against a real on-disk SQLite database.
 
+use crate::{DeletionReason, Store};
 use vbuff_core::content_hash_from_flavors;
-use vbuff_store::{DeletionReason, Store};
 use vbuff_types::{Clip, ClipId, ClipMeta, ContentKind, Flavor};
 
 fn make_clip(text: &str) -> Clip {
@@ -71,7 +71,7 @@ fn migrates_schema_five_to_lifecycle_schema_without_losing_clips() {
     let store = Store::open(&db).unwrap();
     assert_eq!(
         store.doctor().unwrap().schema_version,
-        vbuff_store::SCHEMA_VERSION
+        crate::SCHEMA_VERSION
     );
     assert_eq!(
         store.list(1).unwrap()[0].primary_text(),
@@ -115,7 +115,7 @@ fn migrates_schema_six_to_seven_and_backfills_lifecycle_sidecars() {
     let store = Store::open(&db).unwrap();
     assert_eq!(
         store.doctor().unwrap().schema_version,
-        vbuff_store::SCHEMA_VERSION
+        crate::SCHEMA_VERSION
     );
     let restored = store.list(1).unwrap().pop().unwrap();
     assert_eq!(restored.id, clip.id);
@@ -131,7 +131,7 @@ fn migrates_schema_six_to_seven_and_backfills_lifecycle_sidecars() {
     assert_eq!(store.annotations(clip.id).unwrap(), Default::default());
     assert_eq!(
         store.residency(clip.id).unwrap(),
-        vbuff_store::SensitiveDataResidency {
+        crate::SensitiveDataResidency {
             ever_on_disk: true,
             ever_synced: false,
             ever_exported: false,
@@ -241,7 +241,7 @@ fn expired_sensitive_clip_is_scrubbed_from_database_and_wal() {
     // The sensitive row never persists the normalized-text correlation token:
     // neither in the normalized_hash column nor as raw bytes in the files
     // scanned below.
-    let correlation_token = vbuff_store::normalized_text_fingerprint(canary)
+    let correlation_token = crate::normalized_text_fingerprint(canary)
         .expect("canary text normalizes to a fingerprint");
     {
         let inspection = rusqlite::Connection::open(&db).unwrap();

@@ -130,7 +130,11 @@ fn server_loop(listener: UnixListener, sender: Sender<ClientIntent>, shutdown: A
 }
 
 fn handle_stream(stream: &mut UnixStream, sender: &Sender<ClientIntent>) -> io::Result<()> {
-    let intent: ClientIntent = read_frame(stream)?;
+    let request: ControlRequest = read_frame(stream)?;
+    let intent = match request {
+        ControlRequest::History(request) => return write_frame(stream, &history_response(request)),
+        ControlRequest::Intent(intent) => intent,
+    };
     let response = match intent {
         ClientIntent::Ping => ServerResponse::Pong,
         ClientIntent::ShowPopup => match sender.send(intent) {
@@ -305,5 +309,74 @@ mod tests {
         assert!(intents.try_recv().is_err());
         drop(guard);
         cleanup(&path);
+    }
+}
+
+pub(super) fn query_history(request: HistoryRequest) -> io::Result<ServerResponse> {
+    query_history_at(&endpoint_path()?, request)
+}
+
+fn query_history_at(path: &Path, request: HistoryRequest) -> io::Result<ServerResponse> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write_frame(&mut stream, &ControlRequest::History(request))?;
+    read_frame(&mut stream)
+}
+
+#[cfg(test)]
+mod history_query_tests {
+    use super::*;
+    #[test]
+    fn resident_history_queries_use_the_owner_and_validate_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sock");
+        let owner = Arc::new(crate::store_owner::StoreOwner::new(
+            vbuff_store::Store::open_in_memory().unwrap(),
+        ));
+        let query_owner = owner.clone();
+        install_history_handler(move |request| {
+            query_owner.execute(move |store| match request {
+                HistoryRequest::Doctor => Ok(serde_json::to_string(&store.doctor()?)?),
+                HistoryRequest::Ask { query, limit } => {
+                    crate::ask::query_store(store, &query, limit)
+                }
+            })
+        });
+        let primary = acquire_at(path.clone(), ClientIntent::Ping).unwrap();
+        let ServerResponse::HistoryResult { json } =
+            query_history_at(&path, HistoryRequest::Doctor).unwrap()
+        else {
+            panic!("missing doctor response")
+        };
+        let report: vbuff_store::StoreDoctorReport = serde_json::from_str(&json).unwrap();
+        assert!(report.is_healthy());
+        assert!(matches!(
+            query_history_at(
+                &path,
+                HistoryRequest::Ask {
+                    query: "valid".into(),
+                    limit: 513
+                }
+            )
+            .unwrap(),
+            ServerResponse::Rejected { .. }
+        ));
+        let ServerResponse::HistoryResult { json } = query_history_at(
+            &path,
+            HistoryRequest::Ask {
+                query: "hello".into(),
+                limit: 10,
+            },
+        )
+        .unwrap() else {
+            panic!("missing ask response")
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["results"],
+            serde_json::json!([])
+        );
+        drop(primary);
+        owner.shutdown();
     }
 }

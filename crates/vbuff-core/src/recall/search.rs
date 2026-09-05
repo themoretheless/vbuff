@@ -51,6 +51,7 @@ pub fn search_recall<'a>(
     context: RecallSearchContext<'_>,
 ) -> Vec<RecallSearchResult<'a>> {
     let text_query = query.text.trim().to_lowercase();
+    let layout_queries = super::layout_variants(&text_query);
     let mut results = clips
         .iter()
         .enumerate()
@@ -78,6 +79,16 @@ pub fn search_recall<'a>(
                 } else if typo_matches(clip, &text_query) {
                     score += 35;
                     push_once(&mut explanations, MatchExplanation::TypoCorrection);
+                } else if let Some((layout_score, explanation)) =
+                    layout_queries.iter().skip(1).find_map(|variant| {
+                        score_text(clip, variant).or_else(|| {
+                            typo_matches(clip, variant)
+                                .then_some((35, MatchExplanation::TypoCorrection))
+                        })
+                    })
+                {
+                    score += layout_score - 200;
+                    push_once(&mut explanations, explanation);
                 } else {
                     return None;
                 }
@@ -122,7 +133,7 @@ fn matches_filters(clip: &Clip, query: &NaturalQuery, tags: Option<&ClipTags>) -
             clip.meta
                 .source_app
                 .as_deref()
-                .is_some_and(|source| source.to_lowercase().contains(app))
+                .is_some_and(|source| super::layout_contains(source, app))
         })
         && query.device.as_deref().is_none_or(|device| {
             clip.meta
@@ -360,6 +371,20 @@ mod tests {
     }
 
     #[test]
+    fn layout_matches_both_directions_without_exposing_sensitive_text() {
+        let now = Utc.timestamp_opt(1_000, 0).unwrap();
+        let clips = vec![
+            clip("привет мир", "Editor", ContentKind::Text, now),
+            clip("hello world", "Editor", ContentKind::Text, now),
+        ];
+        assert_eq!(hits(&clips, "ghbdtn", now), 1);
+        assert_eq!(hits(&clips, "руддщ", now), 1);
+        let mut secret = clip("привет", "Editor", ContentKind::Text, now);
+        secret.meta.sensitive = true;
+        assert_eq!(hits(&[secret], "ghbdtn", now), 0);
+    }
+
+    #[test]
     fn structured_search_explains_filters_and_context_boost() {
         let now = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
         let clips = vec![
@@ -471,26 +496,6 @@ mod tests {
     /// works. The free-text term does not have this problem because both sides
     /// of that comparison use `to_lowercase`.
     #[test]
-    fn app_facet_currently_misses_non_ascii_source_apps_typed_as_captured() {
-        let now = Utc.timestamp_opt(1_000, 0).unwrap();
-        let clips = vec![clip("Заметка о релизе", "Продукт", ContentKind::Text, now)];
-        let exact = parse_natural_query("app:Продукт", now).unwrap();
-        assert_eq!(exact.app.as_deref(), Some("Продукт"));
-        assert_eq!(hits(&clips, "app:Продукт", now), 0);
-        // The only spelling that works today is the already-lowercase one.
-        assert_eq!(hits(&clips, "app:продукт", now), 1);
-        // Contrast: the free-text path folds case correctly for non-ASCII.
-        assert_eq!(hits(&clips, "Заметка", now), 1);
-        assert_eq!(hits(&clips, "заметка", now), 1);
-    }
-
-    /// The behavior the T1 facet registry is expected to deliver: one shared
-    /// normalization for both sides of the `app:` comparison. Ignored because
-    /// it fails today, see the characterization test above for why. Unignore
-    /// (and delete the "currently misses" assertions) once the registry
-    /// normalizes the query value and `source_app` through one function.
-    #[test]
-    #[ignore = "known T1 bug: app: facet folds case with to_ascii_lowercase, source_app with Unicode to_lowercase"]
     fn app_facet_should_match_a_non_ascii_source_app_typed_as_captured() {
         let now = Utc.timestamp_opt(1_000, 0).unwrap();
         let clips = vec![clip("Заметка о релизе", "Продукт", ContentKind::Text, now)];

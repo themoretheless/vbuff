@@ -9,6 +9,11 @@ pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[cfg(feature = "duckdb")]
+    /// Native DuckDB error.
+    #[error("duckdb error: {0}")]
+    DuckDb(#[from] duckdb::Error),
+
     /// Filesystem error creating the data directory.
     #[error("io error: {0}")]
     Io(#[source] std::io::Error),

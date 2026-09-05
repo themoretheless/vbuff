@@ -12,6 +12,7 @@ mod media;
 mod navigation;
 mod projection;
 mod state;
+mod tag_manager;
 mod trust_view;
 mod view;
 
@@ -20,7 +21,9 @@ pub use experience::{
     DeliveryCapabilities, DensityMode, HandedMode, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT,
     UI_SCALE_MIN_PERCENT, UI_SCALE_PRESETS, UiPreferences, snap_ui_scale_percent,
 };
-pub use state::{AppState, ClipText, RestoredClip, SharedState, StarterPack, UiAction};
+pub use state::{
+    AppState, ClipText, HistorySearchResults, RestoredClip, SharedState, StarterPack, UiAction,
+};
 
 /// Preferred popup size used by the root composition layer.
 pub fn popup_size() -> [f32; 2] {
@@ -31,3 +34,5 @@ pub fn popup_size() -> [f32; 2] {
 pub fn popup_min_size() -> [f32; 2] {
     design::POPUP_MIN_SIZE
 }
+
+pub use media::ThumbnailLoader;

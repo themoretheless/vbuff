@@ -15,10 +15,23 @@ use vbuff_types::{
 
 use crate::experience::UiPreferences;
 
+/// Background recall results are tied to both the query and history revision.
+#[derive(Clone)]
+pub struct HistorySearchResults {
+    pub query: String,
+    pub scope: crate::experience::HistoryScope,
+    pub history_revision: u64,
+    pub clips: Arc<[Clip]>,
+    pub total: usize,
+    pub failed: bool,
+}
+
 /// The live state the GUI renders. Owned behind a [`SharedState`] lock so the
 /// background capture thread can push new clips while the GUI reads them.
 #[derive(Default)]
 pub struct AppState {
+    pub tags: Arc<vbuff_types::TagSnapshot>,
+    pub history_search: Option<HistorySearchResults>,
     /// The current clip list, already ordered (pinned first, then recency).
     ///
     /// Replace it only through [`AppState::set_clips`]. The GUI's projection
@@ -93,6 +106,7 @@ impl AppState {
 
     /// Replace the clip list and bump the revision.
     pub fn set_clips(&mut self, clips: Vec<Clip>) {
+        self.history_search = None;
         self.clips = Arc::from(clips);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -295,12 +309,14 @@ redaction_guarded_enum! {
     /// without a sample.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum UiAction {
+        EditTags(vbuff_types::TagCommand),
         /// Paste the given clip back into the previously focused app.
         Paste(ClipId),
         /// Paste an explicitly edited local composition draft.
         PasteText { text: ClipText, sensitive: bool },
         /// Pin or unpin a clip.
         SetPinned(ClipId, bool),
+        SetTtl(ClipId, Option<u64>),
         /// Exempt or unexempt a clip from capacity cleanup until this process exits.
         SetSessionProtected(ClipId, bool),
         /// Create a text-only derivative while preserving the canonical clip.
@@ -441,12 +457,18 @@ mod tests {
     /// variant can carry any.
     fn every_action() -> Vec<UiAction> {
         vec![
+            UiAction::EditTags(vbuff_types::TagCommand::Save {
+                id: None,
+                name: CLIP_CONTENT.into(),
+                color: [0; 3],
+            }),
             UiAction::Paste(ClipId::new()),
             UiAction::PasteText {
                 text: ClipText::new(CLIP_CONTENT),
                 sensitive: true,
             },
             UiAction::SetPinned(ClipId::new(), true),
+            UiAction::SetTtl(ClipId::new(), Some(3600)),
             UiAction::SetSessionProtected(ClipId::new(), true),
             UiAction::CreatePlainTextClone(ClipId::new()),
             UiAction::Delete(ClipId::new()),
@@ -474,9 +496,11 @@ mod tests {
     /// is the forcing function that keeps the redaction guard complete.
     fn variant_name(action: &UiAction) -> &'static str {
         match action {
+            UiAction::EditTags(_) => "EditTags",
             UiAction::Paste(_) => "Paste",
             UiAction::PasteText { .. } => "PasteText",
             UiAction::SetPinned(..) => "SetPinned",
+            UiAction::SetTtl(..) => "SetTtl",
             UiAction::SetSessionProtected(..) => "SetSessionProtected",
             UiAction::CreatePlainTextClone(_) => "CreatePlainTextClone",
             UiAction::Delete(_) => "Delete",

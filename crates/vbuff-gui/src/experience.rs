@@ -6,18 +6,24 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use vbuff_types::{Clip, ContentKind};
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HistoryScope {
     #[default]
     All,
     Kind(ContentKind),
     Snippets,
     Source(String),
+    Tagged {
+        base: Box<HistoryScope>,
+        ids: Vec<String>,
+        all: bool,
+    },
 }
 
 impl std::fmt::Debug for HistoryScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Tagged { .. } => formatter.write_str("Tagged"),
             Self::All => formatter.write_str("All"),
             Self::Kind(kind) => formatter.debug_tuple("Kind").field(kind).finish(),
             Self::Snippets => formatter.write_str("Snippets"),
@@ -27,8 +33,18 @@ impl std::fmt::Debug for HistoryScope {
 }
 
 impl HistoryScope {
+    pub fn matches_tags(&self, clip: &Clip, tags: &vbuff_types::TagSnapshot) -> bool {
+        self.matches(clip)
+            && match self {
+                Self::Tagged { base, ids, all } => {
+                    base.matches_tags(clip, tags) && tags.matches(clip.id, ids, *all)
+                }
+                _ => true,
+            }
+    }
     pub fn matches(&self, clip: &Clip) -> bool {
         match self {
+            Self::Tagged { base, .. } => base.matches(clip),
             Self::All => true,
             Self::Kind(kind) => clip.meta.kind == *kind,
             Self::Snippets => clip.pinned || clip.favorite,
@@ -38,6 +54,7 @@ impl HistoryScope {
 
     pub fn label(&self) -> String {
         match self {
+            Self::Tagged { base, .. } => base.label(),
             Self::All => "All kinds".into(),
             Self::Kind(kind) => kind.label().into(),
             Self::Snippets => "Snippets".into(),
@@ -109,8 +126,42 @@ pub fn snap_ui_scale_percent(percent: u16) -> u16 {
         .unwrap_or(UI_SCALE_DEFAULT_PERCENT)
 }
 
+/// Explicitly saved, owner-local query. Debug never reveals names or terms.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearch {
+    pub name: String,
+    pub query: String,
+    pub scope: HistoryScope,
+}
+
+impl std::fmt::Debug for SavedSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SavedSearch([redacted])")
+    }
+}
+
+impl SavedSearch {
+    pub fn is_valid(&self) -> bool {
+        !self.name.trim().is_empty()
+            && self.name.len() <= 80
+            && !self.name.chars().any(char::is_control)
+            && (!self.query.trim().is_empty() || self.scope != HistoryScope::All)
+            && vbuff_core::recall::parse_natural_query(&self.query, Utc::now()).is_ok()
+            && match &self.scope {
+                HistoryScope::Source(source) => {
+                    !source.is_empty()
+                        && source.len() <= 512
+                        && !source.chars().any(char::is_control)
+                }
+                _ => true,
+            }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiPreferences {
+    pub saved_searches: Vec<SavedSearch>,
     pub density: DensityMode,
     pub reduced_motion: bool,
     pub large_preview: bool,
@@ -154,6 +205,7 @@ impl DeliveryCapabilities {
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
+            saved_searches: Vec::new(),
             density: DensityMode::Auto,
             reduced_motion: false,
             large_preview: true,
@@ -201,6 +253,7 @@ impl ScrollTuner {
 
 #[derive(Debug)]
 pub struct FocusLossGuard {
+    acquired_focus: bool,
     lost_at: Option<Instant>,
     grace: Duration,
 }
@@ -208,6 +261,7 @@ pub struct FocusLossGuard {
 impl Default for FocusLossGuard {
     fn default() -> Self {
         Self {
+            acquired_focus: false,
             lost_at: None,
             grace: Duration::from_millis(700),
         }
@@ -217,7 +271,11 @@ impl Default for FocusLossGuard {
 impl FocusLossGuard {
     pub fn update(&mut self, focused: bool, now: Instant) -> FocusLossState {
         if focused {
+            self.acquired_focus = true;
             self.lost_at = None;
+            return FocusLossState::Focused;
+        }
+        if !self.acquired_focus {
             return FocusLossState::Focused;
         }
         let lost_at = *self.lost_at.get_or_insert(now);
@@ -233,6 +291,7 @@ impl FocusLossGuard {
     }
 
     pub fn reset(&mut self) {
+        self.acquired_focus = false;
         self.lost_at = None;
     }
 }
@@ -335,19 +394,9 @@ pub fn match_highlight_alpha(score: i64) -> u8 {
     (42.0 + confidence * 92.0).round() as u8
 }
 
-pub fn contextual_search_hint(clips: &[Clip]) -> &'static str {
-    if !clips.iter().any(|clip| clip.meta.kind == ContentKind::Url) {
-        "Search links..."
-    } else if !clips
-        .iter()
-        .any(|clip| clip.meta.kind == ContentKind::Color)
-    {
-        "Search colors..."
-    } else if !clips.iter().any(|clip| clip.meta.kind == ContentKind::Code) {
-        "Search code..."
-    } else {
-        "Search history..."
-    }
+/// Search spans the whole history regardless of the kinds currently visible.
+pub fn contextual_search_hint(_clips: &[Clip]) -> &'static str {
+    "Search clipboard history…"
 }
 
 pub fn contrast_ratio(left: [u8; 3], right: [u8; 3]) -> f32 {
@@ -448,9 +497,32 @@ mod tests {
     }
 
     #[test]
+    fn opening_waits_for_native_focus_and_reset_disarms_auto_hide() {
+        let start = Instant::now();
+        let mut guard = FocusLossGuard::default();
+        assert_eq!(guard.update(false, start), FocusLossState::Focused);
+        assert_eq!(
+            guard.update(false, start + Duration::from_secs(5)),
+            FocusLossState::Focused
+        );
+        guard.update(true, start + Duration::from_secs(6));
+        guard.update(false, start + Duration::from_secs(7));
+        assert_eq!(
+            guard.update(false, start + Duration::from_secs(8)),
+            FocusLossState::Expired
+        );
+        guard.reset();
+        assert_eq!(
+            guard.update(false, start + Duration::from_secs(9)),
+            FocusLossState::Focused
+        );
+    }
+
+    #[test]
     fn focus_loss_has_a_recoverable_window() {
         let start = Instant::now();
         let mut guard = FocusLossGuard::default();
+        assert_eq!(guard.update(true, start), FocusLossState::Focused);
         assert!(matches!(
             guard.update(false, start),
             FocusLossState::Grace { .. }

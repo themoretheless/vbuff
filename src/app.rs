@@ -104,7 +104,7 @@ pub(crate) fn run(
         ..Default::default()
     };
 
-    let mut runtime = Runtime::new(
+    let runtime = Runtime::new(
         services,
         event_waker,
         hotkey_events,
@@ -112,9 +112,11 @@ pub(crate) fn run(
         #[cfg(feature = "tray")]
         menu_events,
     );
-    let result = eframe::run_ui_native("vbuff", native_options, move |ui, frame| {
-        runtime.update(ui, frame);
-    });
+    let result = eframe::run_native(
+        "vbuff",
+        native_options,
+        Box::new(move |_| Ok(Box::new(runtime))),
+    );
 
     if let (Some(id), Some(backend)) = (hotkey_id, hotkey_backend.as_mut())
         && let Err(error) = backend.unregister(id)
@@ -134,6 +136,7 @@ fn request_event_repaint(target: &Arc<Mutex<Option<egui::Context>>>) {
 }
 
 struct Runtime {
+    history_search: crate::history_search::HistorySearch,
     history: History,
     shared: SharedState,
     diagnostics: Diagnostics,
@@ -154,6 +157,15 @@ struct Runtime {
     menu_events: Receiver<MenuEvent>,
     #[cfg(feature = "tray")]
     tray_attempted: bool,
+}
+
+impl eframe::App for Runtime {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_events(ctx);
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.render(ui, frame);
+    }
 }
 
 impl Runtime {
@@ -244,6 +256,14 @@ impl Runtime {
         }
 
         let mut popup = PopupApp::new(Arc::clone(&shared));
+        let preview_history = history.clone();
+        popup.set_thumbnail_loader(Arc::new(move |id| {
+            let clip = preview_history.find(id).ok().flatten()?;
+            if clip.meta.sensitive {
+                return None;
+            }
+            clip.primary_image().cloned()
+        }));
         // The GUI has no platform dependency of its own, so it is told what
         // session it is running in instead of reading the environment behind
         // the platform layer's back.
@@ -255,6 +275,10 @@ impl Runtime {
         });
 
         Self {
+            history_search: crate::history_search::HistorySearch::new(
+                history.clone(),
+                shared.clone(),
+            ),
             history,
             popup,
             shared,
@@ -278,8 +302,7 @@ impl Runtime {
         }
     }
 
-    fn update(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    fn process_events(&mut self, ctx: &egui::Context) {
         if let Ok(mut target) = self.event_waker.lock() {
             *target = Some(ctx.clone());
         }
@@ -299,7 +322,7 @@ impl Runtime {
                     // that was focused before the popup opened is no longer
                     // the one a later paste would reach.
                     self.paste.cancel_target();
-                    self.popup.request_hide(&ctx);
+                    self.popup.request_hide(ctx);
                 }
                 // Only an explicit Quit sets quit_requested; it is the sole
                 // path allowed past CancelClose.
@@ -310,7 +333,7 @@ impl Runtime {
 
         while let Ok(intent) = self.instance_intents.try_recv() {
             match intent {
-                ClientIntent::ShowPopup => self.handle(AppCommand::Show, &ctx),
+                ClientIntent::ShowPopup => self.handle(AppCommand::Show, ctx),
                 ClientIntent::Ping => {}
             }
         }
@@ -319,14 +342,20 @@ impl Runtime {
             if event.state == global_hotkey::HotKeyState::Pressed
                 && self.hotkey_id == Some(event.id)
             {
-                self.show_popup(&ctx, ShowOrigin::GlobalHotkey);
+                self.show_popup(ctx, ShowOrigin::GlobalHotkey);
             }
         }
 
         for command in self.tray_commands() {
-            self.handle(command, &ctx);
+            self.handle(command, ctx);
         }
 
+        self.popup.process_activation(ctx);
+        self.poll_pending_paste(ctx);
+    }
+
+    fn render(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.popup.ui(ui, frame);
         let popup_commands: Vec<AppCommand> = self
             .popup
@@ -338,7 +367,13 @@ impl Runtime {
             self.handle(command, &ctx);
         }
 
-        self.poll_pending_paste(&ctx);
+        let revision = self.shared.lock().map(|s| s.revision).unwrap_or_default();
+        let search_intent = self.popup.history_search_request();
+        let search_active = search_intent.is_some();
+        self.history_search.update(search_intent, revision, &ctx);
+        if !search_active && let Ok(mut state) = self.shared.lock() {
+            state.history_search = None;
+        }
     }
 
     #[cfg(feature = "tray")]
@@ -480,6 +515,17 @@ impl Runtime {
                 )];
                 self.start_paste_flavors(&flavors, sensitive, ctx);
             }
+            UiAction::SetTtl(id, seconds) => match self.history.set_ttl(id, seconds) {
+                Ok(()) => self.notice(
+                    NoticeLevel::Info,
+                    if seconds.is_some() {
+                        "Expiry updated; pinning does not override it"
+                    } else {
+                        "Explicit expiry removed; normal retention still applies"
+                    },
+                ),
+                Err(_) => self.notice(NoticeLevel::Error, "Could not update expiry"),
+            },
             UiAction::SetPinned(id, pinned) => {
                 if let Err(error) = self.history.set_pinned(id, pinned) {
                     self.notice(NoticeLevel::Error, "Couldn't update the pinned state");
@@ -529,6 +575,13 @@ impl Runtime {
                     }
                 }
             }
+            UiAction::EditTags(command) => match self.history.edit_tags(command) {
+                Ok(()) => self.notice(NoticeLevel::Info, "Tags updated"),
+                Err(_) => self.notice(
+                    NoticeLevel::Error,
+                    "Could not update tags. Check the name, selection and limits.",
+                ),
+            },
             UiAction::Delete(id) => match self.history.delete(id) {
                 Ok(()) => self.notice(NoticeLevel::Info, "Clip deleted"),
                 Err(error) => {

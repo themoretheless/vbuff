@@ -13,7 +13,7 @@ repository = "https://github.com/vbuff/vbuff"
 # Internal crates
 vbuff-types = { path = "crates/vbuff-types", version = "0.1.0" }
 vbuff-core = { path = "crates/vbuff-core", version = "0.1.0" }
-vbuff-store = { path = "crates/vbuff-store", version = "0.1.0" }
+vbuff-store = { path = "crates/vbuff-store", version = "0.1.0", default-features = false }
 vbuff-platform = { path = "crates/vbuff-platform", version = "0.1.0" }
 vbuff-gui = { path = "crates/vbuff-gui", version = "0.1.0" }
 vbuff-sync = { path = "crates/vbuff-sync", version = "0.1.0" }
@@ -36,6 +36,7 @@ url = "2"
 semver = { version = "1", features = ["serde"] }
 
 # Storage
+duckdb = { version = "=1.10505.0", features = ["bundled", "json"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 
 # GUI
@@ -100,8 +101,10 @@ path = "src/main.rs"
 
 [features]
 # The tray integration is enabled by default; if it ever proves troublesome to
-# build/run on a given platform it can be disabled with `--no-default-features`.
-default = ["tray"]
+# build/run on a given platform use `--no-default-features --features duckdb`.
+default = ["tray", "duckdb"]
+duckdb = ["vbuff-store/duckdb"]
+sqlite = ["vbuff-store/sqlite"]
 tray = ["dep:tray-icon"]
 
 [dependencies]
@@ -136,4 +139,5 @@ regex.workspace = true
 memory-stats.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 vbuff-ipc.workspace = true

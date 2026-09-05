@@ -118,6 +118,8 @@ pub struct PopupApp {
     state: SharedState,
     /// Current search query.
     query: String,
+    save_search_name: Option<String>,
+    tag_manager: crate::tag_manager::TagManager,
     /// Index of the selected row within the filtered results.
     selected: usize,
     /// Keyboard-selected completion for the focused history query.
@@ -134,7 +136,7 @@ pub struct PopupApp {
     /// new data.
     last_revision: u64,
     /// Cached image-thumbnail textures, keyed by clip id string.
-    thumbnails: std::collections::HashMap<String, Option<TextureHandle>>,
+    thumbnails: crate::media::ThumbnailCache,
     /// Set when we want the wiring to know we just emitted a Paste so it can
     /// sequence the hide + keystroke. Mirrors the action queue but is simpler
     /// to consume.
@@ -190,6 +192,8 @@ impl PopupApp {
         PopupApp {
             state,
             query: String::new(),
+            save_search_name: None,
+            tag_manager: Default::default(),
             selected: 0,
             query_completion_selected: 0,
             dismissed_completion_query: None,
@@ -197,7 +201,7 @@ impl PopupApp {
             actions: VecDeque::new(),
             visible: false,
             last_revision: u64::MAX,
-            thumbnails: std::collections::HashMap::new(),
+            thumbnails: crate::media::ThumbnailCache::default(),
             request_focus_next_frame: false,
             design_signature: None,
             applied_ui_scale: 1.0,
@@ -237,6 +241,18 @@ impl PopupApp {
     }
 
     /// Show the popup (called by the wiring on hotkey/tray).
+    /// Process activation even when eframe skips drawing the hidden viewport.
+    pub fn process_activation(&mut self, ctx: &egui::Context) {
+        let requested = self
+            .state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.show_requested))
+            .unwrap_or(false);
+        if requested {
+            self.show(ctx);
+        }
+    }
+
     fn show(&mut self, ctx: &egui::Context) {
         self.visible = true;
         self.query.clear();
@@ -245,6 +261,7 @@ impl PopupApp {
         self.query_completion_selected = 0;
         self.dismissed_completion_query = None;
         self.scroll_selection_into_view = false;
+        self.save_search_name = None;
         self.confirm_clear_history = false;
         self.confirm_delete = None;
         self.confirm_profile = None;
@@ -360,6 +377,19 @@ impl PopupApp {
         self.hide(ctx);
     }
 
+    /// Resolve external preview bodies on the thumbnail worker, never the UI thread.
+    pub fn set_thumbnail_loader(&mut self, loader: crate::media::ThumbnailLoader) {
+        self.thumbnails.set_loader(loader);
+    }
+
+    /// Search intent consumed by the resident worker; never logged.
+    pub fn history_search_request(&self) -> Option<(String, HistoryScope)> {
+        (self.visible
+            && self.surface == PopupSurface::History
+            && (!self.query.trim().is_empty() || self.history_scope != HistoryScope::All))
+            .then(|| (self.query.clone(), self.history_scope.clone()))
+    }
+
     /// Build the current filtered view of clips.
     ///
     /// `now` is passed in rather than read here so that one frame's projection
@@ -371,13 +401,19 @@ impl PopupApp {
         revision: u64,
         now: DateTime<Utc>,
     ) -> Arc<[FilteredClip]> {
-        self.projection_cache.projection(
+        let tags = self
+            .state
+            .lock()
+            .map(|s| s.tags.clone())
+            .unwrap_or_default();
+        self.projection_cache.projection_with_tags(
             clips,
             revision,
             &self.query,
             &self.history_scope,
             &self.expanded_duplicates,
             now,
+            &tags,
         )
     }
 }
@@ -463,7 +499,15 @@ impl eframe::App for PopupApp {
             };
             let recoverable_skip = s.skipped_recovery_available(std::time::Instant::now());
             (
-                Arc::clone(&s.clips),
+                s.history_search
+                    .as_ref()
+                    .filter(|r| {
+                        r.query == self.query
+                            && r.scope == self.history_scope
+                            && r.history_revision == s.revision
+                            && !r.failed
+                    })
+                    .map_or_else(|| Arc::clone(&s.clips), |r| Arc::clone(&r.clips)),
                 s.paused,
                 s.pause_reason,
                 s.capture_health,
@@ -486,19 +530,29 @@ impl eframe::App for PopupApp {
                 s.hotkey_label.clone(),
                 s.launch_at_login,
                 s.show_hotkey_coachmark,
-                s.revision,
+                s.revision.wrapping_mul(2).wrapping_add(u64::from(
+                    s.history_search.as_ref().is_some_and(|r| {
+                        r.query == self.query
+                            && r.scope == self.history_scope
+                            && r.history_revision == s.revision
+                            && !r.failed
+                    }),
+                )),
             )
         };
 
         let revision_changed = revision != self.last_revision;
-        if revision_changed {
-            self.last_revision = revision;
+        {
             let live_ids = clips
                 .iter()
                 .filter(|clip| !clip.meta.sensitive)
                 .map(|clip| clip.id.to_string_repr())
                 .collect::<std::collections::HashSet<_>>();
-            self.thumbnails.retain(|id, _| live_ids.contains(id));
+            if revision_changed {
+                self.last_revision = revision;
+                self.thumbnails.retain(&live_ids);
+            }
+            self.thumbnails.poll(&ctx, &live_ids);
         }
 
         // 3. Hide only after a recoverable focus-loss grace period.
@@ -615,7 +669,8 @@ impl eframe::App for PopupApp {
         let mut dismiss_completions = false;
         let selected_before_keys = self.selected;
         let completion_before_keys = self.query_completion_selected;
-        if !self.confirm_clear_history
+        if self.save_search_name.is_none()
+            && !self.confirm_clear_history
             && self.confirm_delete.is_none()
             && self.confirm_profile.is_none()
             && self.action_flyout.is_none()
@@ -897,6 +952,43 @@ impl eframe::App for PopupApp {
                 match self.surface {
                     PopupSurface::History => {
                         self.render_search_field(ui, paused, &clips);
+                        self.render_saved_searches(ui);
+                        let tags = self
+                            .state
+                            .lock()
+                            .map(|s| s.tags.clone())
+                            .unwrap_or_default();
+                        if self.history_search_request().is_some() {
+                            let status = self.state.lock().ok().map(|s| {
+                                match s.history_search.as_ref().filter(|r| {
+                                    r.query == self.query
+                                        && r.scope == self.history_scope
+                                        && r.history_revision == s.revision
+                                }) {
+                                    Some(r) if r.failed => {
+                                        "History search failed; showing recent items".to_owned()
+                                    }
+                                    Some(r) if r.total > r.clips.len() => format!(
+                                        "{} matches · best {} shown · refine search",
+                                        r.total,
+                                        r.clips.len()
+                                    ),
+                                    Some(r) => format!(
+                                        "{} {} across history",
+                                        r.total,
+                                        if r.total == 1 { "match" } else { "matches" }
+                                    ),
+                                    None => "Searching all history…".to_owned(),
+                                }
+                            });
+                            if let Some(status) = status {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(design::SPACE_M);
+                                    ui.label(RichText::new(status).small());
+                                });
+                            }
+                        }
+
                         if let Some(health) = health_alert {
                             self.render_health_alert(ui, health, size_budget_alert.is_some());
                         } else if let Some(alert) = size_budget_alert {
@@ -923,7 +1015,16 @@ impl eframe::App for PopupApp {
                                 bottom: design::SPACE_XS as i8,
                             })
                             .show(ui, |ui| {
-                                self.render_history_filters(ui, &clips);
+                                ui.horizontal_wrapped(|ui| {
+                                    self.render_history_filters(ui, &clips);
+                                    self.tag_manager.render(
+                                        ui,
+                                        &tags,
+                                        &mut self.history_scope,
+                                        selected_clip.map(|c| c.id),
+                                        &mut self.actions,
+                                    );
+                                });
                             });
 
                         if total == 0 {
@@ -1014,6 +1115,7 @@ impl eframe::App for PopupApp {
                 }
             });
 
+        self.render_save_search(&ctx);
         self.render_clear_history_confirmation(&ctx);
         self.render_delete_confirmation(&ctx);
         self.render_profile_confirmation(&ctx, health_digest.stored_items);
@@ -1394,60 +1496,62 @@ impl PopupApp {
             return;
         }
         let recent_apps = recent_source_apps(clips, 3);
-        ui.horizontal_wrapped(|ui| {
-            let previous_scope = self.history_scope.clone();
-            egui::ComboBox::from_id_salt("history_kind_scope")
-                .selected_text(self.history_scope.label())
-                .width(116.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.history_scope, HistoryScope::All, "All kinds");
-                    for kind in [
-                        ContentKind::Url,
-                        ContentKind::Image,
-                        ContentKind::Code,
-                        ContentKind::File,
-                        ContentKind::Color,
-                        ContentKind::Text,
-                    ] {
-                        ui.selectable_value(
-                            &mut self.history_scope,
-                            HistoryScope::Kind(kind),
-                            kind.label(),
-                        );
-                    }
-                    ui.selectable_value(
-                        &mut self.history_scope,
-                        HistoryScope::Snippets,
-                        "Snippets",
-                    );
-                });
-            if self.history_scope != previous_scope {
-                self.selected = 0;
-                self.preview_clip_id = None;
-            }
+        let previous_scope = self.history_scope.clone();
+        let mut base = match &self.history_scope {
+            HistoryScope::Tagged { base, .. } => (**base).clone(),
+            other => other.clone(),
+        };
+        egui::ComboBox::from_id_salt("history_kind_scope")
+            .selected_text(base.label())
+            .width(116.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut base, HistoryScope::All, "All kinds");
+                for kind in [
+                    ContentKind::Url,
+                    ContentKind::Image,
+                    ContentKind::Code,
+                    ContentKind::File,
+                    ContentKind::Color,
+                    ContentKind::Text,
+                ] {
+                    ui.selectable_value(&mut base, HistoryScope::Kind(kind), kind.label());
+                }
+                ui.selectable_value(&mut base, HistoryScope::Snippets, "Snippets");
+            });
+        ui.menu_button("Source", |ui| {
+            ui.label(RichText::new("Recent applications").small().weak());
             for app in recent_apps {
-                let selected = self.history_scope == HistoryScope::Source(app.clone());
                 if ui
-                    .selectable_label(selected, format!("Source: {}", short_app_name(&app)))
+                    .selectable_label(
+                        base == HistoryScope::Source(app.clone()),
+                        short_app_name(&app),
+                    )
                     .clicked()
                 {
-                    self.history_scope = if selected {
-                        HistoryScope::All
-                    } else {
-                        HistoryScope::Source(app)
-                    };
-                    self.selected = 0;
-                    self.preview_clip_id = None;
+                    base = HistoryScope::Source(app);
+                    ui.close();
                 }
             }
-            if self.history_scope != HistoryScope::All
-                && design::icon_button(ui, Icon::Close, "Clear history filter", false).clicked()
-            {
-                self.history_scope = HistoryScope::All;
-                self.selected = 0;
-                self.preview_clip_id = None;
-            }
         });
+        self.history_scope = match &previous_scope {
+            HistoryScope::Tagged { ids, all, .. } => HistoryScope::Tagged {
+                base: Box::new(base),
+                ids: ids.clone(),
+                all: *all,
+            },
+            _ => base,
+        };
+        if self.history_scope != previous_scope {
+            self.selected = 0;
+            self.preview_clip_id = None;
+        }
+        if self.history_scope != HistoryScope::All
+            && design::icon_button(ui, Icon::Close, "Clear history filter", false).clicked()
+        {
+            self.history_scope = HistoryScope::All;
+            self.selected = 0;
+            self.preview_clip_id = None;
+        }
     }
 
     fn render_health_alert(
@@ -1996,6 +2100,25 @@ impl PopupApp {
                     .clicked()
             {
                 command = Some(PaletteCommand::PinSelected);
+            }
+            if !memory_only && !clip.meta.sensitive {
+                ui.menu_button("Set expiry", |ui| {
+                    ui.label("Pinning does not override expiry");
+                    for (label, seconds) in [
+                        ("15 minutes", Some(900)),
+                        ("1 hour", Some(3600)),
+                        ("1 day", Some(86400)),
+                        ("7 days", Some(604800)),
+                        ("30 days", Some(2592000)),
+                        ("No explicit expiry", None),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.actions.push_back(UiAction::SetTtl(id, seconds));
+                            self.action_flyout = None;
+                            ui.close();
+                        }
+                    }
+                });
             }
             if clip.meta.sensitive {
                 if ui.button("Peek").clicked() {
@@ -2635,7 +2758,11 @@ impl PopupApp {
                     .size(12.0)
                     .color(design::text_primary(ui)),
             );
-            for badge in clip_badges(clip).into_iter().take(2) {
+            for badge in clip_badges(clip)
+                .into_iter()
+                .filter(|badge| !matches!(badge, ClipBadge::Lossless | ClipBadge::LocalOnly))
+                .take(2)
+            {
                 let color = badge_color(ui, badge);
                 design::badge_pill(
                     ui,
@@ -3171,7 +3298,7 @@ impl PopupApp {
                                     meta.push("Safe copy unavailable".into());
                                 }
                             }
-                            for badge in clip_badges(clip).into_iter().take(2) {
+                            for badge in clip_badges(clip).into_iter().filter(|badge| !matches!(badge, ClipBadge::Lossless | ClipBadge::LocalOnly)).take(2) {
                                 meta.push(badge.label().into());
                             }
                             if let Some(expires_at) = clip.meta.expires_at {
@@ -3381,11 +3508,14 @@ impl PopupApp {
 
         let (cancel, delete) = response.inner;
         if delete {
-            let deleted_clip = self
-                .state
-                .lock()
-                .ok()
-                .and_then(|state| state.clips.iter().find(|clip| clip.id == id).cloned());
+            let deleted_clip = self.state.lock().ok().and_then(|state| {
+                state
+                    .clips
+                    .iter()
+                    .chain(state.history_search.iter().flat_map(|r| r.clips.iter()))
+                    .find(|clip| clip.id == id)
+                    .cloned()
+            });
             self.actions.push_back(UiAction::Delete(id));
             if let Some(clip) = deleted_clip {
                 self.undo_slot = Some(UndoSlot {
@@ -3461,6 +3591,92 @@ impl PopupApp {
         }
     }
 
+    fn render_saved_searches(&mut self, ui: &mut egui::Ui) {
+        if self.preferences.saved_searches.is_empty()
+            && self.query.is_empty()
+            && self.history_scope == HistoryScope::All
+        {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(design::SPACE_M);
+            if !self.preferences.saved_searches.is_empty() {
+                ui.menu_button("Saved searches", |ui| {
+                    let mut remove = None;
+                    for (index, saved) in self.preferences.saved_searches.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&saved.name).clicked() {
+                                self.query = saved.query.clone();
+                                self.history_scope = saved.scope.clone();
+                                self.selected = 0;
+                                self.preview_clip_id = None;
+                                self.request_focus_next_frame = true;
+                                ui.close();
+                            }
+                            if ui
+                                .small_button("Remove")
+                                .on_hover_text("Remove saved search")
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove {
+                        self.preferences.saved_searches.remove(index);
+                    }
+                });
+            }
+            let can_save = self.preferences.saved_searches.len() < 24
+                && (!self.query.trim().is_empty() || self.history_scope != HistoryScope::All)
+                && parse_natural_query(&self.query, Utc::now()).is_ok();
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save search"))
+                .clicked()
+            {
+                self.save_search_name = Some(String::new());
+            }
+        });
+    }
+
+    fn render_save_search(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.save_search_name.as_mut() else {
+            return;
+        };
+        let response = egui::Modal::new(egui::Id::new("save_history_search")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.heading("Save search");
+            ui.label("Name");
+            ui.add(egui::TextEdit::singleline(name).char_limit(80));
+            ui.label("Saved on this device. Results update as history changes.");
+            let saved = crate::experience::SavedSearch {
+                name: name.trim().to_owned(),
+                query: self.query.clone(),
+                scope: self.history_scope.clone(),
+            };
+            ui.horizontal(|ui| {
+                let save = ui
+                    .add_enabled(
+                        saved.is_valid() && self.preferences.saved_searches.len() < 24,
+                        egui::Button::new("Save"),
+                    )
+                    .clicked();
+                let cancel = ui.button("Cancel").clicked();
+                (save.then_some(saved), cancel)
+            })
+            .inner
+        });
+        ctx_accessible_dialog(ctx, response.response.id, "Save search", true);
+        let should_close = response.should_close();
+        let (saved, cancel) = response.inner;
+        if let Some(saved) = saved {
+            self.preferences.saved_searches.push(saved);
+            self.save_search_name = None;
+        } else if cancel || should_close {
+            self.save_search_name = None;
+        }
+    }
+
     /// Get or build a thumbnail texture for an image clip.
     fn thumbnail(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<TextureHandle> {
         if clip.meta.sensitive {
@@ -3468,12 +3684,7 @@ impl PopupApp {
         }
         let image = clip.primary_image()?;
         let key = clip.id.to_string_repr();
-        if let Some(cached) = self.thumbnails.get(&key) {
-            return cached.clone();
-        }
-        let tex = crate::media::build_thumbnail(ctx, image, &key);
-        self.thumbnails.insert(key, tex.clone());
-        tex
+        self.thumbnails.get(ctx, image, key)
     }
 }
 
@@ -3554,8 +3765,7 @@ fn render_security_status(
         SecurityPostureLevel::Partial => "Protection partial",
         SecurityPostureLevel::Blocked => "Protection blocked",
     };
-    let label =
-        privacy_score.map_or_else(|| label.to_owned(), |score| format!("{label} · {score}"));
+    let label = label.to_owned();
     let (fill, border) = match posture.level {
         SecurityPostureLevel::Partial => (design::warning_bg(ui), design::warning_border(ui)),
         SecurityPostureLevel::Protected | SecurityPostureLevel::Blocked => (
@@ -3595,7 +3805,7 @@ fn render_security_status(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
     });
     response.on_hover_text(format!(
-        "Open privacy and status · {} active, {} degraded, {} unavailable{}",
+        "Open privacy and status · {} active, {} degraded, {} unavailable{}{}",
         posture.active,
         posture.degraded,
         posture.unavailable,
@@ -3603,7 +3813,8 @@ fn render_security_status(
             " · strict mode"
         } else {
             ""
-        }
+        },
+        privacy_score.map_or_else(String::new, |score| format!(" · score {score}"))
     ))
 }
 

@@ -10,6 +10,8 @@
 pub mod grammar;
 
 mod graph;
+mod layout;
+pub use layout::{layout_contains, layout_variants};
 mod memory;
 mod query;
 mod search;

@@ -25,7 +25,7 @@ struct Endpoint {
 #[derive(Serialize, Deserialize)]
 struct AuthenticatedIntent {
     token: String,
-    intent: ClientIntent,
+    intent: ControlRequest,
 }
 
 pub(super) struct Guard {
@@ -168,9 +168,15 @@ fn handle_stream(
             message: "invalid control token".into(),
         }
     } else {
-        match request.intent {
+        let intent = match request.intent {
+            ControlRequest::History(request) => {
+                return write_frame(stream, &history_response(request));
+            }
+            ControlRequest::Intent(intent) => intent,
+        };
+        match intent {
             ClientIntent::Ping => ServerResponse::Pong,
-            ClientIntent::ShowPopup => match sender.send(request.intent) {
+            ClientIntent::ShowPopup => match sender.send(intent) {
                 Ok(()) => ServerResponse::Ack,
                 Err(_) => ServerResponse::Rejected {
                     message: "resident event loop unavailable".into(),
@@ -191,7 +197,7 @@ fn forward(path: &Path, intent: ClientIntent) -> io::Result<()> {
         &mut stream,
         &AuthenticatedIntent {
             token: endpoint.token,
-            intent,
+            intent: ControlRequest::Intent(intent),
         },
     )?;
     match read_frame::<ServerResponse>(&mut stream)? {
@@ -281,4 +287,21 @@ mod tests {
         assert!(!path.exists());
         cleanup(&path);
     }
+}
+
+#[cfg(windows)]
+pub(super) fn query_history(request: HistoryRequest) -> io::Result<ServerResponse> {
+    let endpoint: Endpoint =
+        serde_json::from_reader(File::open(endpoint_path()?)?).map_err(invalid_data)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", endpoint.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write_frame(
+        &mut stream,
+        &AuthenticatedIntent {
+            token: endpoint.token,
+            intent: ControlRequest::History(request),
+        },
+    )?;
+    read_frame(&mut stream)
 }
