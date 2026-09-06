@@ -45,3 +45,9 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
+
+# Mozilla root certificates use a data license; keep this allowance scoped
+# to the certificate bundle rather than all application dependencies.
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]

@@ -231,6 +231,23 @@ fn forward_with_retry(path: &Path, intent: ClientIntent) -> io::Result<()> {
     }))
 }
 
+#[cfg(windows)]
+pub(super) fn query_history(request: HistoryRequest) -> io::Result<ServerResponse> {
+    let endpoint: Endpoint =
+        serde_json::from_reader(File::open(endpoint_path()?)?).map_err(invalid_data)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", endpoint.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write_frame(
+        &mut stream,
+        &AuthenticatedIntent {
+            token: endpoint.token,
+            intent: ControlRequest::History(request),
+        },
+    )?;
+    read_frame(&mut stream)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -287,21 +304,4 @@ mod tests {
         assert!(!path.exists());
         cleanup(&path);
     }
-}
-
-#[cfg(windows)]
-pub(super) fn query_history(request: HistoryRequest) -> io::Result<ServerResponse> {
-    let endpoint: Endpoint =
-        serde_json::from_reader(File::open(endpoint_path()?)?).map_err(invalid_data)?;
-    let mut stream = TcpStream::connect(("127.0.0.1", endpoint.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    write_frame(
-        &mut stream,
-        &AuthenticatedIntent {
-            token: endpoint.token,
-            intent: ControlRequest::History(request),
-        },
-    )?;
-    read_frame(&mut stream)
 }
