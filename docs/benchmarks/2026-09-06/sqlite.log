@@ -1,0 +1,8 @@
+   Compiling serde_json v1.0.151
+   Compiling vbuff-types v0.1.0 (/Users/themoretheless/Documents/Sources/vbuff/crates/vbuff-types)
+   Compiling vbuff-core v0.1.0 (/Users/themoretheless/Documents/Sources/vbuff/crates/vbuff-core)
+   Compiling vbuff-store v0.1.0 (/Users/themoretheless/Documents/Sources/vbuff/crates/vbuff-store)
+    Finished `release` profile [optimized] target(s) in 4.75s
+     Running `target/release/examples/storage_benchmark`
+backend=sqlite rows=1000 disk_bytes=5459968
+backend=sqlite rows=10000 disk_bytes=52084736

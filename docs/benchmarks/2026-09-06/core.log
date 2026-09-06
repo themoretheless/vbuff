@@ -1,0 +1,25 @@
+   Compiling getrandom v0.4.3
+   Compiling crypto-common v0.2.2
+   Compiling cipher v0.5.2
+   Compiling digest v0.11.3
+   Compiling universal-hash v0.6.1
+   Compiling aead v0.6.1
+   Compiling poly1305 v0.9.1
+   Compiling sha2 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling curve25519-dalek v5.0.0
+   Compiling chacha20 v0.10.1
+   Compiling rand v0.10.2
+   Compiling chacha20poly1305 v0.11.0
+   Compiling ed25519-dalek v3.0.0
+   Compiling ulid v3.0.0
+   Compiling vbuff-types v0.1.0 (/Users/themoretheless/Documents/Sources/vbuff/crates/vbuff-types)
+   Compiling vbuff-core v0.1.0 (/Users/themoretheless/Documents/Sources/vbuff/crates/vbuff-core)
+    Finished `release` profile [optimized] target(s) in 4.24s
+     Running tests/performance_budget.rs (target/release/deps/performance_budget-faa5610c3e42631e)
+
+running 1 test
+metric=core_capture_hash_classify iterations=10000 elapsed_ms=184 budget_ms=3000
+test capture_classification_and_hashing_stay_inside_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s

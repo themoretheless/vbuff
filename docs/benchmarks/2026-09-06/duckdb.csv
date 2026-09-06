@@ -1,0 +1,15 @@
+backend,rows,operation,samples,total_ms,p50_ms,p95_ms
+duckdb,1000,insert,1000,1271.888,1.222,1.476
+duckdb,1000,deduplicate,100,145.868,1.426,1.669
+duckdb,1000,list_50,100,75.884,0.746,0.847
+duckdb,1000,search_common,100,213.675,2.115,2.301
+duckdb,1000,search_missing,100,216.821,2.153,2.283
+duckdb,1000,recall_page_64,100,121.603,1.161,1.508
+duckdb,1000,reopen,10,144.846,14.295,15.575
+duckdb,10000,insert,10000,13837.613,1.307,1.721
+duckdb,10000,deduplicate,100,203.057,1.998,2.283
+duckdb,10000,list_50,100,353.791,3.515,3.717
+duckdb,10000,search_common,100,1656.286,16.488,17.173
+duckdb,10000,search_missing,100,1801.666,18.030,18.391
+duckdb,10000,recall_page_64,100,491.391,4.916,5.151
+duckdb,10000,reopen,10,235.110,23.158,27.243
