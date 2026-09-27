@@ -34,9 +34,9 @@ use vbuff_types::{
 use crate::design::{self, Icon};
 use crate::experience::{
     ClipBadge, DeliveryCapabilities, DensityMode, FocusLossGuard, FocusLossState, HandedMode,
-    HistoryScope, MotionBudget, ScrollTuner, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_PRESETS,
-    UiPreferences, clip_badges, contextual_search_hint, contrast_ratio, match_highlight_alpha,
-    snap_ui_scale_percent,
+    HistoryScope, LayoutVariant, MotionBudget, ScrollTuner, UI_SCALE_DEFAULT_PERCENT,
+    UI_SCALE_PRESETS, UiPreferences, clip_badges, contextual_search_hint, contrast_ratio,
+    match_highlight_alpha, snap_ui_scale_percent,
 };
 use crate::navigation::PopupSurface;
 use crate::projection::{FilteredClip, ProjectionCache, clip_is_expired};
@@ -661,8 +661,8 @@ impl eframe::App for PopupApp {
         let keyboard_page = (logical_viewport_size(&ctx).y
             / self
                 .preferences
-                .density
-                .row_height(logical_viewport_size(&ctx).y))
+                .layout
+                .row_height(self.preferences.density, logical_viewport_size(&ctx).y))
         .floor()
         .max(1.0) as usize;
         let mut accepted_completion = None;
@@ -876,40 +876,75 @@ impl eframe::App for PopupApp {
         let viewport = logical_viewport_size(&ctx);
         let visuals = ctx.style_of(ctx.theme()).visuals.clone();
 
-        // 6a. Full-width 50px header with the History/Stack segmented control.
+        let layout = self.preferences.layout;
+        let privacy_score_value = privacy_score.as_ref().map(|score| score.value);
+
+        // 6a. Rail layout: a 44px icon rail owns navigation for every surface.
+        if layout == LayoutVariant::Rail {
+            egui::Panel::left("nav_rail")
+                .exact_size(design::RAIL_WIDTH + 1.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(visuals.extreme_bg_color))
+                .show(root_ui, |ui| {
+                    self.render_nav_rail(ui, security_posture, privacy_score_value);
+                });
+        }
+
+        // 6b. Full-width 50px header: segmented pills (Cockpit), the search
+        // field (Rail) or underlined tabs (Cards).
         egui::Panel::top("popup_header")
             .exact_size(design::HEADER_HEIGHT + 1.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(visuals.panel_fill))
-            .show(root_ui, |ui| {
-                self.render_surface_header(
+            .frame(egui::Frame::new().fill(if layout == LayoutVariant::Cards {
+                visuals.panel_fill
+            } else {
+                visuals.window_fill
+            }))
+            .show(root_ui, |ui| match layout {
+                LayoutVariant::Cockpit => {
+                    self.render_surface_header(ui, paused, security_posture, privacy_score_value)
+                }
+                LayoutVariant::Rail => self.render_rail_header(
                     ui,
                     paused,
                     security_posture,
-                    privacy_score.as_ref().map(|score| score.value),
-                );
+                    privacy_score_value,
+                    &clips,
+                ),
+                LayoutVariant::Cards => self.render_cards_header(ui, paused, security_posture),
             });
 
-        // 6b. Permanent preview panel on the right; hidden on narrow windows.
+        // 6c. Permanent preview panel on the right; hidden on narrow windows.
         let show_preview_panel = self.preferences.large_preview
             && self.surface == PopupSurface::History
             && viewport.x >= design::PREVIEW_PANEL_MIN_WINDOW;
         if show_preview_panel && let Some(clip) = selected_clip {
+            let (width, fill) = match layout {
+                LayoutVariant::Cockpit => (design::PREVIEW_PANEL_WIDTH, visuals.window_fill),
+                LayoutVariant::Rail => (design::RAIL_PREVIEW_PANEL_WIDTH, visuals.window_fill),
+                LayoutVariant::Cards => (design::CARDS_PREVIEW_PANEL_WIDTH, visuals.panel_fill),
+            };
             egui::Panel::right("large_clip_preview")
-                .exact_size(design::PREVIEW_PANEL_WIDTH)
+                .exact_size(width)
                 .resizable(false)
-                .frame(egui::Frame::new().fill(visuals.window_fill))
+                .frame(egui::Frame::new().fill(fill))
                 .show(root_ui, |ui| {
-                    self.render_preview_pane(ui, &ctx, clip, self.selected, total);
+                    self.render_preview_pane(ui, &ctx, clip, self.selected, total, layout);
                 });
         }
 
-        // 6c. The 32px status footer under the list column.
+        // 6d. The 32px status footer under the list column.
         if self.surface == PopupSurface::History {
             egui::Panel::bottom("status_footer")
                 .exact_size(design::FOOTER_HEIGHT)
                 .resizable(false)
-                .frame(egui::Frame::new().fill(visuals.panel_fill))
+                .frame(
+                    egui::Frame::new().fill(if layout == LayoutVariant::Cockpit {
+                        visuals.panel_fill
+                    } else {
+                        visuals.window_fill
+                    }),
+                )
                 .show(root_ui, |ui| {
                     self.render_status_footer(
                         ui,
@@ -919,6 +954,7 @@ impl eframe::App for PopupApp {
                         clips.len(),
                         health_digest,
                         capture_stats,
+                        security_posture,
                     );
                 });
         }
@@ -951,7 +987,16 @@ impl eframe::App for PopupApp {
 
                 match self.surface {
                     PopupSurface::History => {
-                        self.render_search_field(ui, paused, &clips);
+                        match layout {
+                            LayoutVariant::Cockpit => {
+                                self.render_search_field(ui, paused, &clips);
+                            }
+                            // The rail header already holds the search field.
+                            LayoutVariant::Rail => {}
+                            LayoutVariant::Cards => {
+                                self.render_cards_search(ui, paused, &clips);
+                            }
+                        }
                         self.render_saved_searches(ui);
                         let tags = self
                             .state
@@ -1007,25 +1052,56 @@ impl eframe::App for PopupApp {
                                 }
                             });
                         }
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin {
-                                left: design::SPACE_M as i8,
-                                right: design::SPACE_M as i8,
-                                top: 0,
-                                bottom: design::SPACE_XS as i8,
-                            })
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    self.render_history_filters(ui, &clips);
-                                    self.tag_manager.render(
-                                        ui,
-                                        &tags,
-                                        &mut self.history_scope,
-                                        selected_clip.map(|c| c.id),
-                                        &mut self.actions,
-                                    );
+                        // The Cards search heading already carries the kind
+                        // and source filters on its right.
+                        if layout != LayoutVariant::Cards {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: design::SPACE_M as i8,
+                                    right: design::SPACE_M as i8,
+                                    top: if layout == LayoutVariant::Rail {
+                                        design::SPACE_S as i8
+                                    } else {
+                                        0
+                                    },
+                                    bottom: design::SPACE_XS as i8,
+                                })
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        self.render_history_filters(ui, &clips);
+                                        self.tag_manager.render(
+                                            ui,
+                                            &tags,
+                                            &mut self.history_scope,
+                                            selected_clip.map(|c| c.id),
+                                            &mut self.actions,
+                                        );
+                                    });
                                 });
-                            });
+                        } else {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: design::SPACE_L as i8,
+                                    right: design::SPACE_L as i8,
+                                    top: 0,
+                                    bottom: design::SPACE_XS as i8,
+                                })
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        self.tag_manager.render(
+                                            ui,
+                                            &tags,
+                                            &mut self.history_scope,
+                                            selected_clip.map(|c| c.id),
+                                            &mut self.actions,
+                                        );
+                                    });
+                                });
+                        }
+                        if layout == LayoutVariant::Rail && total > 0 {
+                            design::section_rule(ui, "Recent", total);
+                            ui.add_space(design::SPACE_XS);
+                        }
 
                         if total == 0 {
                             self.render_empty_history(
@@ -1037,7 +1113,8 @@ impl eframe::App for PopupApp {
                             );
                         } else {
                             // Stable-height virtualized rows keep controls from shifting.
-                            let row_height = self.preferences.density.row_height(viewport.y);
+                            let row_height =
+                                layout.row_height(self.preferences.density, viewport.y);
                             let cheap_rows = self.scroll_tuner.rapid();
                             let visible_height = ui.available_height();
                             let mut scroll =
@@ -1058,21 +1135,46 @@ impl eframe::App for PopupApp {
                                             continue;
                                         };
                                         let selected = row == self.selected;
-                                        let option_id = self.render_row(
-                                            ui,
-                                            &ctx,
-                                            row,
-                                            clip,
-                                            *hit,
-                                            selected,
-                                            cheap_rows,
-                                            modifier_down,
-                                            total,
-                                            row_height,
-                                            session_protected.contains(&clip.id),
-                                            memory_only_clips.contains(&clip.id),
-                                            encryption_at_rest,
-                                        );
+                                        let option_id = match layout {
+                                            LayoutVariant::Cockpit => self.render_row(
+                                                ui,
+                                                &ctx,
+                                                row,
+                                                clip,
+                                                *hit,
+                                                selected,
+                                                cheap_rows,
+                                                modifier_down,
+                                                total,
+                                                row_height,
+                                                session_protected.contains(&clip.id),
+                                                memory_only_clips.contains(&clip.id),
+                                                encryption_at_rest,
+                                            ),
+                                            LayoutVariant::Rail => self.render_row_rail(
+                                                ui,
+                                                &ctx,
+                                                row,
+                                                clip,
+                                                *hit,
+                                                selected,
+                                                modifier_down,
+                                                total,
+                                                row_height,
+                                            ),
+                                            LayoutVariant::Cards => self.render_row_card(
+                                                ui,
+                                                &ctx,
+                                                row,
+                                                clip,
+                                                *hit,
+                                                selected,
+                                                modifier_down,
+                                                total,
+                                                row_height,
+                                                memory_only_clips.contains(&clip.id),
+                                            ),
+                                        };
                                         if selected {
                                             active_history_option = Some(option_id);
                                         }
@@ -1144,6 +1246,25 @@ impl eframe::App for PopupApp {
 }
 
 impl PopupApp {
+    /// Make the empty parts of a strip drag the window. Registered before the
+    /// strip's own widgets so buttons and fields still win the hit test.
+    fn window_drag_zone(ui: &mut egui::Ui, id: &'static str, rect: egui::Rect) {
+        let response = ui.interact(rect, ui.id().with(id), egui::Sense::drag());
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+    }
+
+    /// Make the whole row a hit target, not only its title. Registered before
+    /// the row's widgets so the keycap, pin and menu buttons still win.
+    fn row_hit_zone(ui: &mut egui::Ui, row: usize, row_height: f32) -> egui::Response {
+        let rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), row_height),
+        );
+        ui.interact(rect, ui.id().with(("row_hit", row)), egui::Sense::click())
+    }
+
     fn render_surface_header(
         &mut self,
         ui: &mut egui::Ui,
@@ -1152,6 +1273,7 @@ impl PopupApp {
         privacy_score: Option<u8>,
     ) {
         let mut hide_requested = false;
+        Self::window_drag_zone(ui, "cockpit_header_drag", ui.max_rect());
         let header = ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), design::HEADER_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -1237,6 +1359,346 @@ impl PopupApp {
         }
     }
 
+    /// Rail layout (1c): the 44px vertical rail with the logo, one icon per
+    /// surface, the protection dot and the close button at the bottom.
+    fn render_nav_rail(
+        &mut self,
+        ui: &mut egui::Ui,
+        posture: SecurityPostureSummary,
+        privacy_score: Option<u8>,
+    ) {
+        let rect = ui.max_rect();
+        ui.painter().vline(
+            rect.right() - 0.5,
+            rect.y_range(),
+            Stroke::new(1.0_f32, design::border(ui)),
+        );
+        Self::window_drag_zone(ui, "rail_drag", rect);
+        let mut hide_requested = false;
+        let mut next_surface = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(design::RAIL_WIDTH, ui.available_height()),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = design::SPACE_XS;
+                ui.add_space(design::SPACE_S + 2.0);
+                let logo = design::logo_tile(ui).on_hover_text("Drag window");
+                if logo.drag_started() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                ui.add_space(design::SPACE_S);
+                for (surface, icon) in [
+                    (PopupSurface::History, Icon::History),
+                    (PopupSurface::Compose, Icon::Stack),
+                    (PopupSurface::Trust, Icon::Shield),
+                    (PopupSurface::Settings, Icon::Settings),
+                ] {
+                    if design::rail_button(ui, icon, surface.label(), self.surface == surface)
+                        .clicked()
+                    {
+                        next_surface = Some(surface);
+                    }
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.add_space(design::SPACE_S + 2.0);
+                    if design::rail_button(ui, Icon::Close, "Close vbuff window", false).clicked() {
+                        hide_requested = true;
+                    }
+                    let color = security_color(ui, posture.level);
+                    let (dot_rect, dot) = ui.allocate_exact_size(
+                        egui::Vec2::splat(design::SPACE_M),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, color);
+                    let dot = dot.on_hover_text(format!(
+                        "{}{}",
+                        security_label(posture.level),
+                        privacy_score.map_or_else(String::new, |score| format!(" · {score}"))
+                    ));
+                    if dot.clicked() {
+                        next_surface = Some(PopupSurface::Trust);
+                    }
+                });
+            },
+        );
+        if let Some(surface) = next_surface {
+            self.surface = surface;
+            self.request_focus_next_frame = surface == PopupSurface::History;
+            self.action_flyout = None;
+        }
+        if hide_requested {
+            self.actions.push_back(UiAction::Hide);
+            self.hide(ui.ctx());
+        }
+    }
+
+    /// Rail layout header: the pill search field takes the whole width, with
+    /// the protection count and the actions menu on the right.
+    fn render_rail_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        paused: bool,
+        posture: SecurityPostureSummary,
+        privacy_score: Option<u8>,
+        clips: &[Clip],
+    ) {
+        Self::window_drag_zone(ui, "rail_header_drag", ui.max_rect());
+        let header = ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), design::HEADER_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(design::SPACE_M);
+                let trailing = design::ICON_BUTTON_SIZE * 2.0 + design::SPACE_M * 2.0 + 44.0;
+                let field_width = (ui.available_width() - trailing).max(160.0);
+                if self.surface == PopupSurface::History {
+                    let hint = if paused {
+                        "Search paused history..."
+                    } else {
+                        contextual_search_hint(clips)
+                    };
+                    egui::Frame::new()
+                        .fill(design::surface_raised(ui))
+                        .stroke(Stroke::new(1.0_f32, design::border(ui)))
+                        .corner_radius(17.0)
+                        .inner_margin(egui::Margin::symmetric(design::SPACE_M as i8, 0))
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(field_width - design::SPACE_M * 2.0, 34.0 - 2.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let response = self.search_text_edit(
+                                        ui,
+                                        hint,
+                                        ui.available_width() - 44.0,
+                                        13.5,
+                                    );
+                                    if self.query.is_empty() {
+                                        design::keycap(ui, "⌘F", false);
+                                    } else if design::icon_button_kind(
+                                        ui,
+                                        Icon::Close,
+                                        "Clear search",
+                                        false,
+                                        design::IconButtonKind::Ghost,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.query.clear();
+                                        self.selected = 0;
+                                        self.preview_clip_id = None;
+                                        self.request_focus_next_frame = true;
+                                    }
+                                    self.render_query_completions(ui, &response);
+                                },
+                            );
+                        });
+                } else {
+                    let title = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(self.surface.label())
+                                    .strong()
+                                    .size(14.0)
+                                    .color(design::text_primary(ui)),
+                            )
+                            .sense(egui::Sense::drag()),
+                        )
+                        .on_hover_text("Drag window");
+                    if title.drag_started() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(design::SPACE_M);
+                    self.render_action_menu(ui, paused);
+                    let color = security_color(ui, posture.level);
+                    let count = privacy_score.map_or_else(
+                        || security_label(posture.level).to_owned(),
+                        |score| score.to_string(),
+                    );
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(count.len() as f32 * 7.0 + 30.0, 24.0),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().rect_filled(rect, 12.0, design::warning_bg(ui));
+                    ui.painter().circle_filled(
+                        egui::pos2(rect.left() + 12.0, rect.center().y),
+                        3.0,
+                        color,
+                    );
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 20.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        count,
+                        egui::FontId::proportional(11.0),
+                        color,
+                    );
+                    if response
+                        .on_hover_text(format!(
+                            "Open privacy and status · {}",
+                            security_label(posture.level)
+                        ))
+                        .clicked()
+                    {
+                        self.surface = PopupSurface::Trust;
+                        self.request_focus_next_frame = false;
+                    }
+                });
+            },
+        );
+        let rect = header.response.rect;
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            Stroke::new(1.0_f32, design::border(ui)),
+        );
+    }
+
+    /// Cards layout header (1d): logo, four underlined tabs and the close
+    /// button, on the canvas with no rule underneath.
+    fn render_cards_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        paused: bool,
+        posture: SecurityPostureSummary,
+    ) {
+        let mut hide_requested = false;
+        Self::window_drag_zone(ui, "cards_header_drag", ui.max_rect());
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), design::HEADER_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(design::SPACE_L);
+                let logo = design::logo_tile(ui).on_hover_text("Drag window");
+                if logo.drag_started() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                ui.add_space(design::SPACE_XS);
+                ui.spacing_mut().item_spacing.x = design::SPACE_M;
+                for surface in [
+                    PopupSurface::History,
+                    PopupSurface::Compose,
+                    PopupSurface::Trust,
+                    PopupSurface::Settings,
+                ] {
+                    if design::underline_tab(ui, surface.label(), self.surface == surface).clicked()
+                    {
+                        self.surface = surface;
+                        self.request_focus_next_frame = surface == PopupSurface::History;
+                        self.action_flyout = None;
+                    }
+                    if surface == PopupSurface::Trust
+                        && posture.level != SecurityPostureLevel::Protected
+                    {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(6.0, 24.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            egui::pos2(dot_rect.center().x - 8.0, dot_rect.top() + 9.0),
+                            3.0,
+                            security_color(ui, posture.level),
+                        );
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(design::SPACE_L);
+                    if design::icon_button_kind(
+                        ui,
+                        Icon::Close,
+                        "Close vbuff window",
+                        false,
+                        design::IconButtonKind::Ghost,
+                    )
+                    .clicked()
+                    {
+                        hide_requested = true;
+                    }
+                    self.render_action_menu(ui, paused);
+                });
+            },
+        );
+        if hide_requested {
+            self.actions.push_back(UiAction::Hide);
+            self.hide(ui.ctx());
+        }
+    }
+
+    /// Cards layout: the query is a 22px heading with the kind and source
+    /// filters on its right and a rule underneath.
+    fn render_cards_search(&mut self, ui: &mut egui::Ui, paused: bool, clips: &[Clip]) {
+        // The 22px heading has less room than a field, so drop the ellipsis
+        // and the word "clipboard" from the contextual hint.
+        let hint = if paused {
+            "Search paused history".to_owned()
+        } else {
+            contextual_search_hint(clips)
+                .trim_end_matches("...")
+                .replace("clipboard ", "")
+        };
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: design::SPACE_L as i8,
+                right: design::SPACE_L as i8,
+                top: design::SPACE_XS as i8,
+                bottom: design::SPACE_S as i8,
+            })
+            .show(ui, |ui| {
+                let row = ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 34.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let filters_width = if clips.is_empty() { 0.0 } else { 224.0 };
+                        let response = self.search_text_edit(
+                            ui,
+                            &hint,
+                            (ui.available_width() - filters_width).max(160.0),
+                            22.0,
+                        );
+                        self.render_query_completions(ui, &response);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(filters_width, 30.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| self.render_history_filters(ui, clips),
+                            );
+                        });
+                    },
+                );
+                let rect = row.response.rect;
+                ui.add_space(design::SPACE_S);
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() + design::SPACE_S,
+                    Stroke::new(1.0_f32, design::border(ui)),
+                );
+                ui.add_space(2.0);
+            });
+    }
+
+    /// The frameless history query editor shared by all three layouts.
+    fn search_text_edit(
+        &mut self,
+        ui: &mut egui::Ui,
+        hint: &str,
+        width: f32,
+        font_size: f32,
+    ) -> egui::Response {
+        // The hint keeps its own font, so size it explicitly to match.
+        let edit = egui::TextEdit::singleline(&mut self.query)
+            .id(history_search_id())
+            .hint_text(RichText::new(hint).size(font_size))
+            .font(egui::FontId::proportional(font_size))
+            .vertical_align(egui::Align::Center)
+            .frame(egui::Frame::NONE);
+        let height = (font_size * 1.4).max(design::ICON_BUTTON_SIZE);
+        let response = ui.add_sized([width, height], edit);
+        if self.request_focus_next_frame {
+            response.request_focus();
+            self.request_focus_next_frame = false;
+        }
+        ctx_accessible_name(ui.ctx(), response.id, "Search clipboard history");
+        response
+    }
+
     /// The rounded search field at the top of the History list column.
     fn render_search_field(&mut self, ui: &mut egui::Ui, paused: bool, clips: &[Clip]) {
         let hint = if paused {
@@ -1268,21 +1730,8 @@ impl PopupApp {
                                     };
                                     let search_width =
                                         (ui.available_width() - trailing_width).max(160.0);
-                                    let edit = egui::TextEdit::singleline(&mut self.query)
-                                        .id(history_search_id())
-                                        .hint_text(hint)
-                                        .frame(egui::Frame::NONE);
-                                    let response = ui
-                                        .add_sized([search_width, design::ICON_BUTTON_SIZE], edit);
-                                    if self.request_focus_next_frame {
-                                        response.request_focus();
-                                        self.request_focus_next_frame = false;
-                                    }
-                                    ctx_accessible_name(
-                                        ui.ctx(),
-                                        response.id,
-                                        "Search clipboard history",
-                                    );
+                                    let response =
+                                        self.search_text_edit(ui, hint, search_width, 13.0);
                                     if self.query.is_empty() {
                                         design::keycap(ui, "⌘F", false);
                                     } else if design::icon_button(
@@ -1318,18 +1767,25 @@ impl PopupApp {
         clip_count: usize,
         health_digest: ClipboardHealthDigest,
         capture_stats: vbuff_types::CaptureSessionStats,
+        posture: SecurityPostureSummary,
     ) {
+        let layout = self.preferences.layout;
         let rect = ui.max_rect();
         ui.painter().hline(
             rect.x_range(),
             rect.top(),
             Stroke::new(1.0_f32, design::border(ui)),
         );
+        let side_margin = if layout == LayoutVariant::Cards {
+            design::SPACE_L
+        } else {
+            design::SPACE_M
+        };
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), design::FOOTER_HEIGHT - 1.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.add_space(design::SPACE_M);
+                ui.add_space(side_margin);
                 render_capture_status(ui, paused, pause_reason, capture_health);
                 ui.label(
                     RichText::new(format!(
@@ -1346,15 +1802,49 @@ impl PopupApp {
                     compact_count(capture_stats.lost)
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(design::SPACE_M);
-                    ui.label(
-                        RichText::new(format!(
-                            "Arrows select · Enter {}",
-                            self.delivery.action_label().to_lowercase()
-                        ))
-                        .small()
-                        .color(design::faint_text(ui)),
-                    );
+                    ui.add_space(side_margin);
+                    match layout {
+                        LayoutVariant::Cockpit => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Arrows select · Enter {}",
+                                    self.delivery.action_label().to_lowercase()
+                                ))
+                                .small()
+                                .color(design::faint_text(ui)),
+                            );
+                        }
+                        LayoutVariant::Rail => {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "↵ {} · ⌘K · ⌘1-9",
+                                        self.delivery.action_label().to_lowercase()
+                                    ))
+                                    .small()
+                                    .monospace()
+                                    .color(design::faint_text(ui)),
+                                )
+                                .truncate(),
+                            );
+                        }
+                        LayoutVariant::Cards => {
+                            let color = security_color(ui, posture.level);
+                            let response = ui.add(
+                                egui::Label::new(
+                                    RichText::new(security_label(posture.level))
+                                        .small()
+                                        .color(color),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            design::status_dot(ui, color);
+                            if response.clicked() {
+                                self.surface = PopupSurface::Trust;
+                                self.request_focus_next_frame = false;
+                            }
+                        }
+                    }
                     if self.undo_slot.is_some()
                         && design::icon_button_kind(
                             ui,
@@ -1767,6 +2257,23 @@ impl PopupApp {
 
                 ui.add_space(design::SPACE_L);
                 design::section_heading(ui, "Appearance", None);
+                ui.horizontal(|ui| {
+                    ui.label("Layout");
+                    for layout in LayoutVariant::ALL {
+                        ui.selectable_value(&mut self.preferences.layout, layout, layout.label())
+                            .on_hover_text(match layout {
+                                LayoutVariant::Cockpit => {
+                                    "List with a permanent preview column and segmented tabs"
+                                }
+                                LayoutVariant::Rail => {
+                                    "Icon rail on the left, search in the header, one-line rows"
+                                }
+                                LayoutVariant::Cards => {
+                                    "Underlined tabs, the search as a heading, card rows"
+                                }
+                            });
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label("Density");
                     ui.selectable_value(&mut self.preferences.density, DensityMode::Auto, "Auto");
@@ -2625,7 +3132,7 @@ impl PopupApp {
                             .color(design::on_accent(ui)),
                     )
                     .corner_radius(7.0)
-                    .fill(design::accent(ui)),
+                    .fill(design::accent_fill(ui)),
                 )
                 .clicked()
             {
@@ -2724,23 +3231,79 @@ impl PopupApp {
         clip: &Clip,
         index: usize,
         total: usize,
+        layout: LayoutVariant,
     ) {
         let panel_rect = ui.max_rect();
-        ui.painter().vline(
-            panel_rect.left(),
-            panel_rect.y_range(),
-            Stroke::new(1.0_f32, design::border(ui)),
-        );
-        egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: design::SPACE_L as i8,
-                right: design::SPACE_L as i8,
-                top: design::SPACE_M as i8,
-                bottom: design::SPACE_M as i8,
-            })
-            .show(ui, |ui| {
-                self.render_preview_pane_content(ui, ctx, clip, index, total);
-            });
+        match layout {
+            LayoutVariant::Cockpit | LayoutVariant::Rail => {
+                ui.painter().vline(
+                    panel_rect.left(),
+                    panel_rect.y_range(),
+                    Stroke::new(1.0_f32, design::border(ui)),
+                );
+                let side = if layout == LayoutVariant::Rail {
+                    design::SPACE_M + 2.0
+                } else {
+                    design::SPACE_L
+                };
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: side as i8,
+                        right: side as i8,
+                        top: design::SPACE_M as i8,
+                        bottom: design::SPACE_M as i8,
+                    })
+                    .show(ui, |ui| {
+                        self.render_preview_pane_content(ui, ctx, clip, index, total);
+                    });
+            }
+            // 1d: a floating charcoal code card with a 12px margin, cream text.
+            LayoutVariant::Cards => {
+                egui::Frame::new()
+                    .outer_margin(egui::Margin {
+                        left: 0,
+                        right: design::SPACE_M as i8,
+                        top: design::SPACE_M as i8,
+                        bottom: design::SPACE_M as i8,
+                    })
+                    .fill(design::code_bg(ui))
+                    .stroke(Stroke::new(1.0_f32, design::code_border(ui)))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin {
+                        left: design::SPACE_L as i8,
+                        right: design::SPACE_L as i8,
+                        top: design::SPACE_M as i8,
+                        bottom: design::SPACE_M as i8,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_height(ui.available_height());
+                        let code_text = design::code_text(ui);
+                        let visuals = ui.visuals_mut();
+                        visuals.override_text_color = Some(code_text);
+                        let tile = Color32::from_rgb(0x3A, 0x37, 0x33);
+                        let border = Color32::from_rgb(0x54, 0x50, 0x4A);
+                        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border);
+                        visuals.widgets.inactive.weak_bg_fill = tile;
+                        visuals.widgets.inactive.bg_fill = tile;
+                        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border);
+                        visuals.widgets.hovered.weak_bg_fill = border;
+                        visuals.widgets.hovered.bg_fill = border;
+                        visuals.widgets.active.weak_bg_fill = border;
+                        visuals.widgets.active.bg_fill = border;
+                        visuals.widgets.open.weak_bg_fill = tile;
+                        visuals.widgets.open.bg_fill = tile;
+                        for widget in [
+                            &mut visuals.widgets.inactive,
+                            &mut visuals.widgets.hovered,
+                            &mut visuals.widgets.active,
+                            &mut visuals.widgets.open,
+                        ] {
+                            widget.fg_stroke.color = code_text;
+                        }
+                        self.render_preview_pane_content(ui, ctx, clip, index, total);
+                    });
+            }
+        }
     }
 
     fn render_preview_pane_content(
@@ -2756,7 +3319,7 @@ impl PopupApp {
                 RichText::new(clip.meta.kind.label())
                     .strong()
                     .size(12.0)
-                    .color(design::text_primary(ui)),
+                    .color(ui.visuals().text_color()),
             );
             for badge in clip_badges(clip)
                 .into_iter()
@@ -2787,7 +3350,7 @@ impl PopupApp {
                 ui.label(
                     RichText::new(format!("{} of {}", index + 1, total))
                         .small()
-                        .color(design::faint_text(ui)),
+                        .color(preview_faint(ui)),
                 );
             });
         });
@@ -2812,7 +3375,7 @@ impl PopupApp {
                         ui.label(
                             RichText::new("Reveal for two seconds; does not copy")
                                 .small()
-                                .color(design::secondary_text(ui)),
+                                .color(preview_muted(ui)),
                         );
                         if design::icon_button(ui, Icon::Eye, "Peek", false).clicked() {
                             self.peek_sensitive =
@@ -2874,11 +3437,7 @@ impl PopupApp {
         }
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Transform")
-                    .small()
-                    .color(design::secondary_text(ui)),
-            );
+            ui.label(RichText::new("Transform").small().color(preview_muted(ui)));
             let picker_width = ui.available_width().clamp(120.0, 184.0);
             egui::ComboBox::from_id_salt("preview_transform_picker")
                 .selected_text(preview_transform_label(self.preview_transform))
@@ -2940,6 +3499,8 @@ impl PopupApp {
                     .inner_margin(design::SPACE_M as i8)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        // Cream on charcoal in both themes.
+                        ui.visuals_mut().override_text_color = Some(design::code_text(ui));
                         egui::ScrollArea::vertical()
                             .max_height(content_height)
                             .auto_shrink([false, true])
@@ -2962,7 +3523,7 @@ impl PopupApp {
                             ))
                             .small()
                             .monospace()
-                            .color(design::faint_text(ui)),
+                            .color(preview_faint(ui)),
                         );
                     });
 
@@ -2982,7 +3543,7 @@ impl PopupApp {
                                         .color(design::on_accent(ui)),
                                 )
                                 .corner_radius(7.0)
-                                .fill(design::accent(ui)),
+                                .fill(design::accent_fill(ui)),
                             )
                         })
                         .inner
@@ -3058,12 +3619,12 @@ impl PopupApp {
         ui.add_space(design::SPACE_XS);
         for (label, value) in rows {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(label).small().color(design::faint_text(ui)));
+                ui.label(RichText::new(label).small().color(preview_faint(ui)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(value)
                             .small()
-                            .color(design::secondary_text(ui)),
+                            .color(ui.visuals().text_color()),
                     );
                 });
             });
@@ -3149,6 +3710,8 @@ impl PopupApp {
         encryption_at_rest: bool,
     ) -> egui::Id {
         let accessible_name = row_preview_with_peek(clip, false);
+        let row_hit = Self::row_hit_zone(ui, row, row_height);
+        self.handle_row_click(&row_hit, row, clip);
         let frame = egui::Frame::new()
             .fill(if selected {
                 design::selected_row_bg(ui)
@@ -3437,6 +4000,357 @@ impl PopupApp {
                 },
             );
         });
+        ctx.accesskit_node_builder(row_output.response.id, |node| {
+            node.set_role(egui::accesskit::Role::ListBoxOption);
+            node.set_label(accessible_name);
+            node.set_selected(selected);
+            node.set_position_in_set(row + 1);
+            node.set_size_of_set(total);
+        });
+        row_output.response.id
+    }
+
+    /// Select the row on click, deliver it on double click; shared by the
+    /// Rail and Cards rows, whose title label is the whole hit target.
+    fn handle_row_click(&mut self, response: &egui::Response, row: usize, clip: &Clip) {
+        let delivery_allowed = self.delivery.allows(clip.meta.sensitive);
+        if response.double_clicked() {
+            self.selected = row;
+            self.preview_clip_id = Some(clip.id);
+            if delivery_allowed {
+                self.actions.push_back(UiAction::Paste(clip.id));
+            }
+        } else if response.clicked() {
+            self.selected = row;
+            self.preview_clip_id = Some(clip.id);
+        }
+    }
+
+    /// Row title: highlighted while searching, monospace for code and colors.
+    fn row_title_label(
+        &self,
+        ui: &egui::Ui,
+        clip: &Clip,
+        hit: FilteredClip,
+        size: f32,
+    ) -> egui::Label {
+        let preview = row_preview_with_peek(clip, self.is_peeking(clip.id));
+        if !clip.meta.sensitive && !self.query.trim().is_empty() {
+            return egui::Label::new(highlighted_preview(ui, &preview, &self.query, hit.score));
+        }
+        let mut text = RichText::new(preview)
+            .size(size)
+            .color(design::text_primary(ui));
+        if matches!(clip.meta.kind, ContentKind::Code | ContentKind::Color) {
+            text = text.monospace().size(size);
+        }
+        egui::Label::new(text)
+    }
+
+    /// Row kind glyph: a warning-coloured lock-style marker for sensitive clips,
+    /// accent when selected, muted otherwise.
+    fn row_glyph_color(&self, ui: &egui::Ui, clip: &Clip, selected: bool) -> Color32 {
+        if clip.meta.sensitive {
+            design::warning(ui)
+        } else if selected {
+            design::accent(ui)
+        } else {
+            design::secondary_text(ui)
+        }
+    }
+
+    /// Rail layout (1c): one 40px line per clip, `glyph · title · kind · app`,
+    /// then the relative time and the quick-pick keycap.
+    #[allow(clippy::too_many_arguments)]
+    fn render_row_rail(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        row: usize,
+        clip: &Clip,
+        hit: FilteredClip,
+        selected: bool,
+        quick_pick: bool,
+        total: usize,
+        row_height: f32,
+    ) -> egui::Id {
+        let accessible_name = row_preview_with_peek(clip, false);
+        let row_hit = Self::row_hit_zone(ui, row, row_height);
+        self.handle_row_click(&row_hit, row, clip);
+        if row_hit.secondary_clicked() {
+            self.action_flyout = Some(clip.id);
+        }
+        let frame = egui::Frame::new()
+            .fill(if selected {
+                design::selected_row_bg(ui)
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(if selected {
+                Stroke::new(1.0_f32, design::selected_row_border(ui))
+            } else {
+                Stroke::NONE
+            })
+            .corner_radius(design::RADIUS_CARD)
+            .outer_margin(egui::Margin {
+                left: design::SPACE_S as i8,
+                right: design::SPACE_S as i8,
+                top: 0,
+                bottom: 0,
+            })
+            .inner_margin(egui::Margin::symmetric(design::SPACE_S as i8, 0));
+        let row_output = frame.show(ui, |ui| {
+            let inner = ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row_height - 2.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let glyph_color = self.row_glyph_color(ui, clip, selected);
+                    let (glyph_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    ui.painter().text(
+                        glyph_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        clip.meta.kind.icon(),
+                        egui::FontId::monospace(11.0),
+                        glyph_color,
+                    );
+                    let keycap_width = if row < 9 { 36.0 } else { 0.0 };
+                    let trailing = keycap_width + 44.0 + 20.0;
+                    let content_width = (ui.available_width() - trailing).max(120.0);
+                    let mut meta = vec![clip.meta.kind.label().to_string()];
+                    if let Some(app) = &clip.meta.source_app {
+                        meta.push(short_app_name(app));
+                    }
+                    if clip.pinned {
+                        meta.push("Pinned".into());
+                    }
+                    if clip.meta.sensitive {
+                        meta.push(masked_preview_label(clip).into());
+                    }
+                    if hit.variant_of.is_some() {
+                        meta.push("Variant".into());
+                    }
+                    let meta = meta.join(" · ");
+                    let meta_color = if selected {
+                        design::selected_secondary_text(ui)
+                    } else {
+                        design::secondary_text(ui)
+                    };
+                    let meta_width = ui
+                        .painter()
+                        .layout_no_wrap(meta.clone(), egui::FontId::proportional(11.0), meta_color)
+                        .rect
+                        .width()
+                        .min(content_width * 0.45);
+                    let title_width = (content_width - meta_width - 10.0).max(60.0);
+                    let title = self.row_title_label(ui, clip, hit, 12.5);
+                    let response = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(title_width, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.add(title.truncate().sense(egui::Sense::click())),
+                        )
+                        .inner;
+                    let response = if self.delivery.allows(clip.meta.sensitive) {
+                        response
+                    } else {
+                        response.on_hover_text(
+                            "Selection and preview are available; safe sensitive output requires proven OS-history exclusion",
+                        )
+                    };
+                    self.handle_row_click(&response, row, clip);
+                    ui.add(
+                        egui::Label::new(RichText::new(meta).size(11.0).color(meta_color))
+                            .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if row < 9 {
+                            design::keycap(ui, &format!("⌘{}", row + 1), selected || quick_pick);
+                        }
+                        let time = relative_time(clip.meta.created_at, Utc::now());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(time)
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(meta_color),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
+            if inner.response.secondary_clicked() {
+                self.selected = row;
+                self.preview_clip_id = Some(clip.id);
+                self.action_flyout = Some(clip.id);
+            }
+        });
+        if row_output.response.hovered() && !selected {
+            ui.painter().rect_filled(
+                row_output.response.rect,
+                design::RADIUS_CARD,
+                design::surface_hover(ui).gamma_multiply(0.5),
+            );
+        }
+        ctx.accesskit_node_builder(row_output.response.id, |node| {
+            node.set_role(egui::accesskit::Role::ListBoxOption);
+            node.set_label(accessible_name);
+            node.set_selected(selected);
+            node.set_position_in_set(row + 1);
+            node.set_size_of_set(total);
+        });
+        row_output.response.id
+    }
+
+    /// Cards layout (1d): a raised card per clip with a mono metadata line
+    /// above the title, the keycap top-right and a status badge bottom-right.
+    #[allow(clippy::too_many_arguments)]
+    fn render_row_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        row: usize,
+        clip: &Clip,
+        hit: FilteredClip,
+        selected: bool,
+        quick_pick: bool,
+        total: usize,
+        row_height: f32,
+        memory_only: bool,
+    ) -> egui::Id {
+        let accessible_name = row_preview_with_peek(clip, false);
+        let card_gap = 6.0;
+        let row_hit = Self::row_hit_zone(ui, row, row_height - card_gap);
+        self.handle_row_click(&row_hit, row, clip);
+        if row_hit.secondary_clicked() {
+            self.action_flyout = Some(clip.id);
+        }
+        let frame = egui::Frame::new()
+            .fill(if selected {
+                design::selected_row_bg(ui)
+            } else {
+                design::surface_raised(ui)
+            })
+            .stroke(Stroke::new(
+                1.0_f32,
+                if selected {
+                    design::selected_row_border(ui)
+                } else {
+                    design::border(ui)
+                },
+            ))
+            .corner_radius(10.0)
+            .outer_margin(egui::Margin {
+                left: design::SPACE_L as i8,
+                right: design::SPACE_L as i8,
+                top: 0,
+                bottom: card_gap as i8,
+            })
+            .inner_margin(egui::Margin::symmetric(design::SPACE_M as i8, 0));
+        let row_output = frame.show(ui, |ui| {
+            let inner = ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row_height - card_gap - 2.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let trailing = 64.0;
+                    let content_width = (ui.available_width() - trailing).max(120.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(content_width, row_height - card_gap - 2.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.add_space(design::SPACE_XS);
+                            let glyph_color = self.row_glyph_color(ui, clip, selected);
+                            let meta_color = if selected {
+                                design::selected_secondary_text(ui)
+                            } else {
+                                design::secondary_text(ui)
+                            };
+                            let mut meta = vec![clip.meta.kind.label().to_uppercase()];
+                            if let Some(app) = &clip.meta.source_app {
+                                meta.push(short_app_name(app));
+                            }
+                            meta.push(relative_time(clip.meta.created_at, Utc::now()));
+                            if clip.pinned {
+                                meta.push("pinned".into());
+                            }
+                            if hit.variant_of.is_some() {
+                                meta.push("variant".into());
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = design::SPACE_S;
+                                ui.label(
+                                    RichText::new(clip.meta.kind.icon())
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(glyph_color),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(meta.join(" · "))
+                                            .monospace()
+                                            .size(10.5)
+                                            .color(meta_color),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            let title = self.row_title_label(ui, clip, hit, 13.0);
+                            let response = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), 20.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| ui.add(title.truncate().sense(egui::Sense::click())),
+                                )
+                                .inner;
+                            let response = if self.delivery.allows(clip.meta.sensitive) {
+                                response
+                            } else {
+                                response.on_hover_text(
+                                    "Selection and preview are available; safe sensitive output requires proven OS-history exclusion",
+                                )
+                            };
+                            self.handle_row_click(&response, row, clip);
+                        },
+                    );
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.add_space(design::SPACE_XS + 2.0);
+                        if row < 9 {
+                            design::keycap(ui, &format!("⌘{}", row + 1), selected || quick_pick);
+                        } else {
+                            ui.add_space(18.0);
+                        }
+                        let (label, color, wash) = if clip.meta.sensitive {
+                            (
+                                if memory_only { "memory only" } else { "masked" },
+                                design::warning(ui),
+                                design::warning_bg(ui),
+                            )
+                        } else {
+                            ("read ok", design::success(ui), design::success_wash(ui))
+                        };
+                        design::badge_pill(ui, label, color, wash, None);
+                    });
+                },
+            );
+            if inner.response.secondary_clicked() {
+                self.selected = row;
+                self.preview_clip_id = Some(clip.id);
+                self.action_flyout = Some(clip.id);
+            }
+        });
+        let card_rect = row_output.response.rect;
+        if row_output.response.hovered() && !selected {
+            ui.painter().rect_stroke(
+                card_rect,
+                10.0,
+                Stroke::new(1.0_f32, design::border_strong(ui)),
+                egui::StrokeKind::Inside,
+            );
+        }
         ctx.accesskit_node_builder(row_output.response.id, |node| {
             node.set_role(egui::accesskit::Role::ListBoxOption);
             node.set_label(accessible_name);
@@ -3760,12 +4674,7 @@ fn render_security_status(
     privacy_score: Option<u8>,
 ) -> egui::Response {
     let color = security_color(ui, posture.level);
-    let label = match posture.level {
-        SecurityPostureLevel::Protected => "Protected",
-        SecurityPostureLevel::Partial => "Protection partial",
-        SecurityPostureLevel::Blocked => "Protection blocked",
-    };
-    let label = label.to_owned();
+    let label = security_label(posture.level).to_owned();
     let (fill, border) = match posture.level {
         SecurityPostureLevel::Partial => (design::warning_bg(ui), design::warning_border(ui)),
         SecurityPostureLevel::Protected | SecurityPostureLevel::Blocked => (
@@ -3816,6 +4725,32 @@ fn render_security_status(
         },
         privacy_score.map_or_else(String::new, |score| format!(" · score {score}"))
     ))
+}
+
+/// Preview-pane muted text: cream-on-charcoal when the Cards code card has
+/// overridden the text colour, the theme's secondary text otherwise.
+fn preview_muted(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().override_text_color.is_some() {
+        Color32::from_rgb(0xB8, 0xAA, 0x8F)
+    } else {
+        design::secondary_text(ui)
+    }
+}
+
+fn preview_faint(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().override_text_color.is_some() {
+        Color32::from_rgb(0x8E, 0x85, 0x74)
+    } else {
+        design::faint_text(ui)
+    }
+}
+
+const fn security_label(level: SecurityPostureLevel) -> &'static str {
+    match level {
+        SecurityPostureLevel::Protected => "Protected",
+        SecurityPostureLevel::Partial => "Protection partial",
+        SecurityPostureLevel::Blocked => "Protection blocked",
+    }
 }
 
 fn security_color(ui: &egui::Ui, level: SecurityPostureLevel) -> Color32 {

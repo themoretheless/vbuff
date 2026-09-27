@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use vbuff_core::capture::UnknownEvidencePolicy;
 use vbuff_core::onboarding::DefaultProfile;
 use vbuff_gui::{
-    DensityMode, HandedMode, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT, UI_SCALE_MIN_PERCENT,
-    UiPreferences, snap_ui_scale_percent,
+    DensityMode, HandedMode, LayoutVariant, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT,
+    UI_SCALE_MIN_PERCENT, UiPreferences, snap_ui_scale_percent,
 };
 
 const CONFIG_SCHEMA_VERSION: u16 = 2;
@@ -75,6 +75,8 @@ pub struct Config {
     pub hotkey_coachmark_seen: bool,
     /// Native history-row density.
     pub ui_density: UiDensity,
+    /// Which of the three History layouts the popup renders.
+    pub ui_layout: UiLayout,
     /// Disable non-essential native popup animation.
     pub ui_reduced_motion: Option<bool>,
     /// Show the wide clip preview when the viewport has enough room.
@@ -107,6 +109,7 @@ impl fmt::Debug for Config {
             .field("unknown_evidence_policy", &self.unknown_evidence_policy)
             .field("hotkey_coachmark_seen", &self.hotkey_coachmark_seen)
             .field("ui_density", &self.ui_density)
+            .field("ui_layout", &self.ui_layout)
             .field("ui_reduced_motion", &self.ui_reduced_motion)
             .field("ui_large_preview", &self.ui_large_preview)
             .field("ui_handed_mode", &self.ui_handed_mode)
@@ -143,6 +146,7 @@ impl Default for Config {
             auto_pause_remote: true,
             hotkey_coachmark_seen: false,
             ui_density: UiDensity::Auto,
+            ui_layout: UiLayout::Cockpit,
             ui_reduced_motion: None,
             ui_large_preview: true,
             ui_handed_mode: UiHandedMode::Off,
@@ -243,6 +247,36 @@ impl From<DensityMode> for UiDensity {
             DensityMode::Auto => Self::Auto,
             DensityMode::Compact => Self::Compact,
             DensityMode::Comfortable => Self::Comfortable,
+        }
+    }
+}
+
+/// Which History layout the popup renders, as persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayout {
+    #[default]
+    Cockpit,
+    Rail,
+    Cards,
+}
+
+impl From<UiLayout> for LayoutVariant {
+    fn from(layout: UiLayout) -> Self {
+        match layout {
+            UiLayout::Cockpit => Self::Cockpit,
+            UiLayout::Rail => Self::Rail,
+            UiLayout::Cards => Self::Cards,
+        }
+    }
+}
+
+impl From<LayoutVariant> for UiLayout {
+    fn from(layout: LayoutVariant) -> Self {
+        match layout {
+            LayoutVariant::Cockpit => Self::Cockpit,
+            LayoutVariant::Rail => Self::Rail,
+            LayoutVariant::Cards => Self::Cards,
         }
     }
 }
@@ -479,6 +513,7 @@ impl Config {
         UiPreferences {
             saved_searches: self.saved_searches.clone(),
             density: self.ui_density.into(),
+            layout: self.ui_layout.into(),
             reduced_motion: self
                 .ui_reduced_motion
                 .or_else(vbuff_platform::desktop::reduced_motion_preference)
@@ -498,6 +533,7 @@ impl Config {
     ) {
         self.saved_searches = preferences.saved_searches.clone();
         self.ui_density = preferences.density.into();
+        self.ui_layout = preferences.layout.into();
         if reduced_motion_changed {
             self.ui_reduced_motion = Some(preferences.reduced_motion);
         }
@@ -874,6 +910,7 @@ fn validate_runtime_config_keys(value: &toml::Value) -> anyhow::Result<()> {
         "auto_pause_remote",
         "hotkey_coachmark_seen",
         "ui_density",
+        "ui_layout",
         "ui_reduced_motion",
         "ui_large_preview",
         "ui_handed_mode",
@@ -1097,6 +1134,7 @@ mod tests {
         for (key, accepted) in [
             ("unknown_evidence_policy", ["guard", "skip", "allow"]),
             ("ui_density", ["auto", "compact", "comfortable"]),
+            ("ui_layout", ["cockpit", "rail", "cards"]),
             ("ui_handed_mode", ["off", "left", "right"]),
         ] {
             let text = format!("schema_version = 2\n{key} = \"yolo\"\n");
@@ -1137,6 +1175,13 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&handed).unwrap(), spelling);
         }
+        for (layout, spelling) in [
+            (UiLayout::Cockpit, "\"cockpit\""),
+            (UiLayout::Rail, "\"rail\""),
+            (UiLayout::Cards, "\"cards\""),
+        ] {
+            assert_eq!(serde_json::to_string(&layout).unwrap(), spelling);
+        }
     }
 
     #[test]
@@ -1148,6 +1193,9 @@ mod tests {
         }
         for handed in [UiHandedMode::Off, UiHandedMode::Left, UiHandedMode::Right] {
             assert_eq!(UiHandedMode::from(HandedMode::from(handed)), handed);
+        }
+        for layout in [UiLayout::Cockpit, UiLayout::Rail, UiLayout::Cards] {
+            assert_eq!(UiLayout::from(LayoutVariant::from(layout)), layout);
         }
     }
 
@@ -1178,6 +1226,7 @@ auto_pause_on_lock = true
 auto_pause_remote = true
 hotkey_coachmark_seen = true
 ui_density = "comfortable"
+ui_layout = "rail"
 ui_reduced_motion = true
 ui_large_preview = false
 ui_handed_mode = "left"
@@ -1193,6 +1242,7 @@ action = "capture_sensitive"
         config.validate().unwrap();
         assert_eq!(config.unknown_evidence_policy, UnknownEvidenceMode::Skip);
         assert_eq!(config.ui_density, UiDensity::Comfortable);
+        assert_eq!(config.ui_layout, UiLayout::Rail);
         assert_eq!(config.ui_handed_mode, UiHandedMode::Left);
         assert_eq!(config.default_profile, Some(DefaultProfile::PrivacyMax));
         assert_eq!(config.excluded_apps, vec!["private-bank-app"]);
@@ -1417,6 +1467,7 @@ action = "skip"
         let preferences = UiPreferences {
             saved_searches: Vec::new(),
             density: DensityMode::Compact,
+            layout: LayoutVariant::Cards,
             reduced_motion: true,
             large_preview: false,
             handed_mode: HandedMode::Left,

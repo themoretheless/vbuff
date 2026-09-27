@@ -5,9 +5,13 @@ use egui::{
     WidgetInfo, WidgetType,
 };
 
-// "Split Cockpit" (direction 1b): list + permanent preview panel on the
-// right, segmented History/Stack pills in the header, a 32px status footer,
-// and two-line 46px rows. Window 860x560; the panel hides below 720.
+// Unified Style Guide tokens: warm neutrals (canvas / surface / raised),
+// a terracotta accent, IBM Plex-style sizes, radius 8 for cards and 12 for the
+// window. Three History layouts share them:
+//   Cockpit (1b): list + permanent 320px preview column, segmented pills.
+//   Rail (1c): 44px icon rail, search in the header, one-line rows, 300px preview.
+//   Cards (1d): underlined tabs, search as a heading, card rows, 340px code card.
+// Window 860x560; the preview column hides below 720.
 pub(crate) const POPUP_SIZE: [f32; 2] = [860.0, 560.0];
 pub(crate) const POPUP_MIN_SIZE: [f32; 2] = [520.0, 420.0];
 pub(crate) const SPACE_XS: f32 = 4.0;
@@ -26,13 +30,65 @@ pub(crate) const HEADER_HEIGHT: f32 = 50.0;
 pub(crate) const FOOTER_HEIGHT: f32 = 32.0;
 pub(crate) const SEARCH_HEIGHT: f32 = 36.0;
 pub(crate) const PREVIEW_PANEL_WIDTH: f32 = 320.0;
+/// Rail layout: a narrower 300px preview column next to the 44px rail.
+pub(crate) const RAIL_PREVIEW_PANEL_WIDTH: f32 = 300.0;
+/// Cards layout: the floating 340px code card (12px margin included).
+pub(crate) const CARDS_PREVIEW_PANEL_WIDTH: f32 = 340.0;
+/// Width of the vertical navigation rail in the Rail layout.
+pub(crate) const RAIL_WIDTH: f32 = 44.0;
+/// Rail-layout navigation buttons.
+pub(crate) const RAIL_BUTTON_SIZE: f32 = 30.0;
 /// Below this window width the preview side panel is hidden.
 pub(crate) const PREVIEW_PANEL_MIN_WINDOW: f32 = 720.0;
-pub(crate) const WARNING: Color32 = Color32::from_rgb(239, 190, 98);
-pub(crate) const DANGER: Color32 = Color32::from_rgb(249, 130, 146);
+pub(crate) const WARNING: Color32 = Color32::from_rgb(0xD9, 0xA0, 0x57);
+pub(crate) const DANGER: Color32 = Color32::from_rgb(0xF0, 0x70, 0x5E);
 
+/// Text-safe accent: terracotta on dark, a darker ink on the light canvas.
 pub(crate) fn accent(ui: &Ui) -> Color32 {
     accent_for(ui.visuals().dark_mode)
+}
+
+/// Solid accent fill for primary buttons and active pills (pair with
+/// [`on_accent`]). Follows the guide's `accent` token in both themes.
+pub(crate) fn accent_fill(ui: &Ui) -> Color32 {
+    accent_fill_for(ui.visuals().dark_mode)
+}
+
+/// 13%-alpha accent wash behind accent-coloured badges.
+pub(crate) fn accent_wash(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(0x3A, 0x2C, 0x22)
+    } else {
+        Color32::from_rgb(0xF1, 0xDF, 0xCF)
+    }
+}
+
+/// Hover fill for rows and rail buttons (`surfaceHover` in the guide).
+pub(crate) fn surface_hover(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(0x3A, 0x37, 0x33)
+    } else {
+        Color32::from_rgb(0xEE, 0xE9, 0xDF)
+    }
+}
+
+/// Raised card fill (`surfaceRaised`): search field, active pill, cards.
+pub(crate) fn surface_raised(ui: &Ui) -> Color32 {
+    sunken_bg_for(ui.visuals().dark_mode)
+}
+
+/// Text inside the dark code block; the same cream in both themes.
+pub(crate) fn code_text(_ui: &Ui) -> Color32 {
+    Color32::from_rgb(0xF1, 0xE6, 0xC4)
+}
+
+/// 13%-alpha success wash behind `read ok` style badges.
+pub(crate) fn success_wash(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(0x28, 0x35, 0x2E)
+    } else {
+        Color32::from_rgb(0xDC, 0xE8, 0xE0)
+    }
 }
 
 pub(crate) fn success(ui: &Ui) -> Color32 {
@@ -85,9 +141,9 @@ pub(crate) fn tile_bg(ui: &Ui) -> Color32 {
 
 pub(crate) fn tile_bg_selected(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0x15, 0x30, 0x3A)
+        Color32::from_rgb(0x4A, 0x32, 0x20)
     } else {
-        Color32::from_rgb(0xCF, 0xE7, 0xEC)
+        Color32::from_rgb(0xF3, 0xDC, 0xC8)
     }
 }
 
@@ -101,67 +157,67 @@ pub(crate) fn selected_row_border(ui: &Ui) -> Color32 {
 
 pub(crate) fn warning_bg(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0x2A, 0x24, 0x18)
+        Color32::from_rgb(0x41, 0x38, 0x28)
     } else {
-        Color32::from_rgb(0xFB, 0xF3, 0xE1)
+        Color32::from_rgb(0xEC, 0xE1, 0xD1)
     }
 }
 
 pub(crate) fn warning_border(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0x3E, 0x35, 0x22)
+        Color32::from_rgb(0x5C, 0x4A, 0x2E)
     } else {
-        Color32::from_rgb(0xEB, 0xD9, 0xAE)
+        Color32::from_rgb(0xE0, 0xC9, 0xA6)
     }
 }
 
+/// The code block is a dark cream-on-charcoal card in both themes.
 pub(crate) fn code_bg(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0x0C, 0x0F, 0x13)
+        Color32::from_rgb(0x15, 0x14, 0x12)
     } else {
-        Color32::from_rgb(0xF2, 0xF5, 0xF8)
+        Color32::from_rgb(0x2B, 0x2A, 0x26)
     }
 }
 
 pub(crate) fn code_border(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        Color32::from_rgb(0x23, 0x29, 0x33)
+        Color32::from_rgb(0x54, 0x50, 0x4A)
     } else {
-        Color32::from_rgb(0xE2, 0xE8, 0xEE)
+        Color32::from_rgb(0x2B, 0x2A, 0x26)
     }
 }
 
 pub(crate) fn segment_active_bg(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(0x23, 0x2B, 0x34)
-    } else {
-        Color32::from_rgb(0xE7, 0xED, 0xF2)
-    }
+    sunken_bg_for(ui.visuals().dark_mode)
 }
 
 pub(crate) fn on_accent(ui: &Ui) -> Color32 {
     on_accent_for(ui.visuals().dark_mode)
 }
 
+/// `canvas`: the window background.
 const fn window_bg_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x14, 0x17, 0x1C)
+        Color32::from_rgb(0x1F, 0x1E, 0x1B)
     } else {
-        Color32::from_rgb(0xF7, 0xF8, 0xFA)
+        Color32::from_rgb(0xF4, 0xF1, 0xEA)
     }
 }
 
+/// `surface`: header, footer and preview column fill.
 const fn panel_bg_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x17, 0x1B, 0x21)
+        Color32::from_rgb(0x2A, 0x28, 0x25)
     } else {
-        Color32::WHITE
+        Color32::from_rgb(0xFB, 0xF9, 0xF4)
     }
 }
 
+/// `surfaceRaised`: search field, active pill, cards.
 const fn sunken_bg_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x0F, 0x12, 0x15)
+        Color32::from_rgb(0x33, 0x30, 0x2C)
     } else {
         Color32::WHITE
     }
@@ -169,65 +225,71 @@ const fn sunken_bg_for(dark: bool) -> Color32 {
 
 const fn border_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x26, 0x2B, 0x33)
+        Color32::from_rgb(0x54, 0x50, 0x4A)
     } else {
-        Color32::from_rgb(0xE7, 0xEA, 0xEE)
+        Color32::from_rgb(0xDE, 0xD7, 0xCA)
     }
 }
 
 const fn text_primary_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0xE9, 0xED, 0xF1)
+        Color32::from_rgb(0xF1, 0xE6, 0xC4)
     } else {
-        Color32::from_rgb(0x17, 0x1D, 0x24)
+        Color32::from_rgb(0x2B, 0x2A, 0x26)
     }
 }
 
+/// `textDisabled`.
 const fn faint_text_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x5A, 0x65, 0x72)
+        Color32::from_rgb(0x7A, 0x73, 0x6A)
     } else {
-        Color32::from_rgb(0x96, 0xA0, 0xAB)
+        Color32::from_rgb(0xA3, 0x9C, 0x90)
     }
 }
 
 const fn tile_bg_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x1C, 0x22, 0x2B)
+        Color32::from_rgb(0x33, 0x30, 0x2C)
     } else {
-        Color32::from_rgb(0xED, 0xF1, 0xF5)
+        Color32::from_rgb(0xEE, 0xE9, 0xDF)
     }
 }
 
+/// Accent selection wash (38% on dark, 22% on light) flattened over the canvas.
 const fn selected_row_bg_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x1D, 0x27, 0x32)
+        Color32::from_rgb(0x5E, 0x3B, 0x24)
     } else {
-        Color32::from_rgb(0xE3, 0xF0, 0xF4)
+        Color32::from_rgb(0xEF, 0xD3, 0xBC)
     }
 }
 
 const fn selected_row_border_for(dark: bool) -> Color32 {
-    if dark {
-        Color32::from_rgb(0x2E, 0x45, 0x5A)
-    } else {
-        Color32::from_rgb(0xB9, 0xDA, 0xE2)
-    }
+    accent_fill_for(dark)
 }
 
 const fn accent_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x5C, 0xC9, 0xD8)
+        Color32::from_rgb(0xF2, 0x85, 0x3A)
     } else {
-        Color32::from_rgb(0x0B, 0x60, 0x72)
+        Color32::from_rgb(0xA5, 0x4E, 0x1F)
+    }
+}
+
+const fn accent_fill_for(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0xF2, 0x85, 0x3A)
+    } else {
+        Color32::from_rgb(0xDE, 0x6A, 0x19)
     }
 }
 
 const fn success_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x66, 0xD6, 0x9C)
+        Color32::from_rgb(0x6F, 0xB0, 0x8F)
     } else {
-        Color32::from_rgb(0x12, 0x81, 0x3F)
+        Color32::from_rgb(0x2F, 0x6A, 0x50)
     }
 }
 
@@ -235,7 +297,7 @@ const fn warning_for(dark: bool) -> Color32 {
     if dark {
         WARNING
     } else {
-        Color32::from_rgb(0x8A, 0x5E, 0x00)
+        Color32::from_rgb(0x8A, 0x5A, 0x1A)
     }
 }
 
@@ -243,45 +305,46 @@ const fn danger_for(dark: bool) -> Color32 {
     if dark {
         DANGER
     } else {
-        Color32::from_rgb(151, 28, 47)
+        Color32::from_rgb(0xB9, 0x2E, 0x1E)
     }
 }
 
 const fn info_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(126, 198, 238)
+        Color32::from_rgb(0x7E, 0xC6, 0xEE)
     } else {
-        Color32::from_rgb(16, 89, 135)
+        Color32::from_rgb(0x2C, 0x5F, 0x8A)
     }
 }
 
+/// `textMuted`.
 const fn secondary_text_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x87, 0x92, 0xA0)
+        Color32::from_rgb(0xB8, 0xAA, 0x8F)
     } else {
-        Color32::from_rgb(0x66, 0x71, 0x7E)
+        Color32::from_rgb(0x6B, 0x66, 0x5C)
     }
 }
 
 const fn selected_secondary_text_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(205, 213, 224)
+        Color32::from_rgb(0xF1, 0xE6, 0xC4)
     } else {
-        Color32::from_rgb(61, 72, 86)
+        Color32::from_rgb(0x5C, 0x4A, 0x3A)
     }
 }
 
 const fn border_strong_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(112, 122, 136)
+        Color32::from_rgb(0x7A, 0x73, 0x6A)
     } else {
-        Color32::from_rgb(102, 113, 126)
+        Color32::from_rgb(0x8A, 0x83, 0x77)
     }
 }
 
 const fn on_accent_for(dark: bool) -> Color32 {
     if dark {
-        Color32::from_rgb(0x08, 0x26, 0x2C)
+        Color32::from_rgb(0x1F, 0x1E, 0x1B)
     } else {
         Color32::WHITE
     }
@@ -290,7 +353,9 @@ const fn on_accent_for(dark: bool) -> Color32 {
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
     Delete,
-    Pin { filled: bool },
+    Pin {
+        filled: bool,
+    },
     Close,
     Add,
     Copy,
@@ -302,6 +367,12 @@ pub(crate) enum Icon {
     Settings,
     Eye,
     Undo,
+    /// Rail navigation: a clock face for History.
+    History,
+    /// Rail navigation: stacked layers for Stack.
+    Stack,
+    /// Rail navigation: a shield for Privacy.
+    Shield,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,15 +427,24 @@ pub(crate) fn apply(ctx: &egui::Context, reduced_motion: bool) {
     style.visuals.faint_bg_color = tile_bg_for(dark);
     style.visuals.extreme_bg_color = sunken_bg_for(dark);
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border_for(dark));
-    if dark {
-        style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x7B, 0xD8, 0xE4));
-        style.visuals.hyperlink_color = Color32::from_rgb(0x7B, 0xD8, 0xE4);
-        style.visuals.code_bg_color = Color32::from_rgb(0x0C, 0x0F, 0x13);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, accent_fill_for(dark));
+    style.visuals.hyperlink_color = accent_for(dark);
+    style.visuals.code_bg_color = tile_bg_for(dark);
+    style.visuals.widgets.inactive.weak_bg_fill = tile_bg_for(dark);
+    style.visuals.widgets.hovered.weak_bg_fill = if dark {
+        Color32::from_rgb(0x3A, 0x37, 0x33)
     } else {
-        style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x0B, 0x60, 0x72));
-        style.visuals.hyperlink_color = Color32::from_rgb(0x0B, 0x60, 0x72);
-        style.visuals.code_bg_color = Color32::from_rgb(0xF2, 0xF5, 0xF8);
-    }
+        Color32::from_rgb(0xEE, 0xE9, 0xDF)
+    };
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, border_strong_for(dark));
+    style.visuals.widgets.active.weak_bg_fill = selected_row_bg_for(dark);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent_fill_for(dark));
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border_for(dark));
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text_primary_for(dark));
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, text_primary_for(dark));
+    style.visuals.widgets.active.fg_stroke = Stroke::new(2.0_f32, text_primary_for(dark));
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text_primary_for(dark));
+    style.visuals.override_text_color = None;
     ctx.set_style_of(theme, style);
 }
 
@@ -478,7 +558,7 @@ pub(crate) fn section_heading(ui: &mut Ui, title: &str, detail: Option<&str>) {
 /// The 22px rounded accent "v" mark from the header.
 pub(crate) fn logo_tile(ui: &mut Ui) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::drag());
-    ui.painter().rect_filled(rect, 6.0, accent(ui));
+    ui.painter().rect_filled(rect, 6.0, accent_fill(ui));
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -509,7 +589,7 @@ pub(crate) fn icon_button_kind(
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON_SIZE), Sense::click());
     let visuals = ui.style().interact_selectable(&response, selected);
     let semantic = match kind {
-        IconButtonKind::Primary => accent(ui),
+        IconButtonKind::Primary => accent_fill(ui),
         IconButtonKind::Danger => danger(ui),
         IconButtonKind::Ghost | IconButtonKind::Toolbar => visuals.fg_stroke.color,
     };
@@ -556,12 +636,150 @@ pub(crate) fn icon_button_kind(
         Icon::Settings => draw_settings(ui, center, stroke),
         Icon::Eye => draw_eye(ui, center, stroke),
         Icon::Undo => draw_undo(ui, center, stroke),
+        Icon::History => draw_history(ui, center, stroke),
+        Icon::Stack => draw_stack(ui, center, stroke),
+        Icon::Shield => draw_shield(ui, center, stroke),
     }
 
     response.widget_info(|| {
         WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, tooltip)
     });
     response.on_hover_text(tooltip)
+}
+
+/// Rail layout: a 30px icon button with a 2px accent bar on its left when
+/// selected (the `r.bar` marker from 1c).
+pub(crate) fn rail_button(
+    ui: &mut Ui,
+    icon: Icon,
+    tooltip: &'static str,
+    selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(RAIL_BUTTON_SIZE), Sense::click());
+    let hovered = response.hovered() || response.has_focus();
+    let fill = if selected {
+        accent_wash(ui)
+    } else if hovered {
+        surface_hover(ui)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 7.0, fill);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            7.0,
+            Stroke::new(1.5_f32, accent_fill(ui)),
+            StrokeKind::Inside,
+        );
+    }
+    if selected {
+        let bar = Rect::from_min_size(
+            Pos2::new(rect.left() - 7.0, rect.top() + 8.0),
+            Vec2::new(2.0, 14.0),
+        );
+        ui.painter().rect_filled(bar, 1.0, accent_fill(ui));
+    }
+    let color = if selected {
+        accent(ui)
+    } else if hovered {
+        text_primary(ui)
+    } else {
+        secondary_text(ui)
+    };
+    let stroke = Stroke::new(1.5_f32, color);
+    let center = rect.center();
+    match icon {
+        Icon::History => draw_history(ui, center, stroke),
+        Icon::Stack => draw_stack(ui, center, stroke),
+        Icon::Shield => draw_shield(ui, center, stroke),
+        Icon::Settings => draw_settings(ui, center, stroke),
+        Icon::Close => draw_close(ui, center, stroke),
+        Icon::Menu => draw_menu(ui, center, stroke),
+        _ => draw_add(ui, center, stroke),
+    }
+    response.widget_info(|| {
+        WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, tooltip)
+    });
+    response.on_hover_text(tooltip)
+}
+
+/// Cards layout: a text tab with a 2px accent underline when selected.
+pub(crate) fn underline_tab(ui: &mut Ui, label: &'static str, selected: bool) -> Response {
+    let font = FontId::proportional(12.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER);
+    let size = Vec2::new(galley.rect.width() + 4.0, 24.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered() || response.has_focus();
+    let color = if selected || hovered {
+        text_primary(ui)
+    } else {
+        secondary_text(ui)
+    };
+    ui.painter().text(
+        Pos2::new(rect.left() + 2.0, rect.top() + 9.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        color,
+    );
+    if selected {
+        let underline = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.bottom() - 2.0),
+            Vec2::new(rect.width(), 2.0),
+        );
+        ui.painter().rect_filled(underline, 1.0, accent_fill(ui));
+    } else if response.has_focus() {
+        let underline = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.bottom() - 2.0),
+            Vec2::new(rect.width(), 2.0),
+        );
+        ui.painter().rect_filled(underline, 1.0, border_strong(ui));
+    }
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, label));
+    response
+}
+
+/// A small uppercase mono section label with a hairline and a trailing count:
+/// `TODAY ─────── 3` from the Rail layout.
+pub(crate) fn section_rule(ui: &mut Ui, title: &str, count: usize) {
+    let font = FontId::monospace(10.0);
+    let color = secondary_text(ui);
+    let title = title.to_uppercase();
+    let count = count.to_string();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+    let title_galley = ui
+        .painter()
+        .layout_no_wrap(title.clone(), font.clone(), color);
+    let count_galley = ui
+        .painter()
+        .layout_no_wrap(count.clone(), font.clone(), color);
+    ui.painter().text(
+        Pos2::new(rect.left() + SPACE_M, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        font.clone(),
+        color,
+    );
+    ui.painter().text(
+        Pos2::new(rect.right() - SPACE_M, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        count,
+        font,
+        color,
+    );
+    let line_left = rect.left() + SPACE_M + title_galley.rect.width() + 6.0;
+    let line_right = rect.right() - SPACE_M - count_galley.rect.width() - 6.0;
+    if line_right > line_left {
+        ui.painter().hline(
+            line_left..=line_right,
+            rect.center().y,
+            Stroke::new(1.0_f32, border(ui)),
+        );
+    }
 }
 
 pub(crate) fn status_dot(ui: &mut Ui, color: Color32) {
@@ -722,6 +940,59 @@ fn draw_preview(ui: &Ui, center: Pos2, stroke: Stroke) {
 
 fn draw_eye(ui: &Ui, center: Pos2, stroke: Stroke) {
     draw_preview(ui, center, stroke);
+}
+
+fn draw_history(ui: &Ui, center: Pos2, stroke: Stroke) {
+    ui.painter().circle_stroke(center, 6.0, stroke);
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(0.0, -3.5),
+            center + egui::vec2(0.0, 0.5),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [center + egui::vec2(0.0, 0.5), center + egui::vec2(2.5, 2.0)],
+        stroke,
+    );
+}
+
+fn draw_stack(ui: &Ui, center: Pos2, stroke: Stroke) {
+    for offset in [-3.5, 0.0, 3.5] {
+        let points = vec![
+            center + egui::vec2(-6.0, offset),
+            center + egui::vec2(0.0, offset - 3.0),
+            center + egui::vec2(6.0, offset),
+            center + egui::vec2(0.0, offset + 3.0),
+        ];
+        ui.painter().add(Shape::closed_line(points, stroke));
+    }
+}
+
+fn draw_shield(ui: &Ui, center: Pos2, stroke: Stroke) {
+    let points = vec![
+        center + egui::vec2(0.0, -6.5),
+        center + egui::vec2(5.5, -4.0),
+        center + egui::vec2(5.0, 2.0),
+        center + egui::vec2(0.0, 6.5),
+        center + egui::vec2(-5.0, 2.0),
+        center + egui::vec2(-5.5, -4.0),
+    ];
+    ui.painter().add(Shape::closed_line(points, stroke));
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-2.5, 0.0),
+            center + egui::vec2(-0.5, 2.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-0.5, 2.0),
+            center + egui::vec2(3.0, -2.0),
+        ],
+        stroke,
+    );
 }
 
 fn draw_undo(ui: &Ui, center: Pos2, stroke: Stroke) {

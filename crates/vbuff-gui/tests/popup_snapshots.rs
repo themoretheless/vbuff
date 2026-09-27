@@ -99,6 +99,40 @@ fn popup_responsive_goldens_cover_minimum_and_wide_layouts() {
     }
 }
 
+/// The Rail and Cards layouts from the Unified Style Guide redesign, at the
+/// same wide size as the Cockpit golden so the preview column is visible.
+#[test]
+fn popup_layout_variants_cover_rail_and_cards() {
+    let mut results = SnapshotResults::new();
+    let snapshots = SnapshotOptions::new()
+        .output_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots"));
+    for (theme_name, theme) in [("light", egui::Theme::Light), ("dark", egui::Theme::Dark)] {
+        for (layout_name, layout) in [
+            ("rail", vbuff_gui::LayoutVariant::Rail),
+            ("cards", vbuff_gui::LayoutVariant::Cards),
+        ] {
+            let state = Arc::new(Mutex::new(snapshot_state(Surface::Populated)));
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(820.0, 620.0))
+                .with_pixels_per_point(1.0)
+                .with_theme(theme)
+                .wgpu()
+                .build_eframe(|_| PopupApp::new(state));
+            let preferences = vbuff_gui::UiPreferences {
+                layout,
+                ..Default::default()
+            };
+            harness.state_mut().set_preferences(preferences);
+            harness.run_steps(2);
+            harness.snapshot_options(
+                format!("popup_{theme_name}_1x_wide_{layout_name}"),
+                &snapshots,
+            );
+            results.extend(harness.take_snapshot_results());
+        }
+    }
+}
+
 #[test]
 fn popup_settings_golden_covers_non_default_interface_scale() {
     let mut results = SnapshotResults::new();

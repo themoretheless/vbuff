@@ -18,8 +18,9 @@ mod view;
 
 pub use app::PopupApp;
 pub use experience::{
-    DeliveryCapabilities, DensityMode, HandedMode, UI_SCALE_DEFAULT_PERCENT, UI_SCALE_MAX_PERCENT,
-    UI_SCALE_MIN_PERCENT, UI_SCALE_PRESETS, UiPreferences, snap_ui_scale_percent,
+    DeliveryCapabilities, DensityMode, HandedMode, LayoutVariant, UI_SCALE_DEFAULT_PERCENT,
+    UI_SCALE_MAX_PERCENT, UI_SCALE_MIN_PERCENT, UI_SCALE_PRESETS, UiPreferences,
+    snap_ui_scale_percent,
 };
 pub use state::{
     AppState, ClipText, HistorySearchResults, RestoredClip, SharedState, StarterPack, UiAction,

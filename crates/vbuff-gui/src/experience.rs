@@ -99,6 +99,47 @@ impl DensityMode {
     }
 }
 
+/// The three History layouts from the Unified Style Guide redesign.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayoutVariant {
+    /// 1b: list plus a permanent preview column, segmented header pills.
+    #[default]
+    Cockpit,
+    /// 1c: a 44px icon rail on the left, search in the header, one-line rows.
+    Rail,
+    /// 1d: underlined tabs, the search field as a heading, card rows.
+    Cards,
+}
+
+impl LayoutVariant {
+    pub const ALL: [Self; 3] = [Self::Cockpit, Self::Rail, Self::Cards];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cockpit => "Cockpit",
+            Self::Rail => "Rail",
+            Self::Cards => "Cards",
+        }
+    }
+
+    /// History row height: the rail uses one-line 40px rows, cards stack a
+    /// metadata line above the title, and the cockpit follows the density.
+    pub fn row_height(self, density: DensityMode, viewport_height: f32) -> f32 {
+        match self {
+            Self::Cockpit => density.row_height(viewport_height),
+            Self::Rail => match density {
+                DensityMode::Comfortable => 44.0,
+                DensityMode::Compact | DensityMode::Auto => 40.0,
+            },
+            Self::Cards => match density {
+                DensityMode::Compact => 60.0,
+                DensityMode::Comfortable => 72.0,
+                DensityMode::Auto => 66.0,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HandedMode {
     #[default]
@@ -163,6 +204,7 @@ impl SavedSearch {
 pub struct UiPreferences {
     pub saved_searches: Vec<SavedSearch>,
     pub density: DensityMode,
+    pub layout: LayoutVariant,
     pub reduced_motion: bool,
     pub large_preview: bool,
     pub handed_mode: HandedMode,
@@ -207,6 +249,7 @@ impl Default for UiPreferences {
         Self {
             saved_searches: Vec::new(),
             density: DensityMode::Auto,
+            layout: LayoutVariant::Cockpit,
             reduced_motion: false,
             large_preview: true,
             handed_mode: HandedMode::Off,
