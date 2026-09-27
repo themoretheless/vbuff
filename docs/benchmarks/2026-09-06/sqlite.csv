@@ -1,0 +1,15 @@
+backend,rows,operation,samples,total_ms,p50_ms,p95_ms
+sqlite,1000,insert,1000,476.197,0.409,0.646
+sqlite,1000,deduplicate,100,57.259,0.507,0.730
+sqlite,1000,list_50,100,172.955,1.705,2.016
+sqlite,1000,search_common,100,853.189,8.556,8.829
+sqlite,1000,search_missing,100,56.728,0.535,0.704
+sqlite,1000,recall_page_64,100,39.702,0.386,0.460
+sqlite,1000,reopen,10,61.520,6.150,6.451
+sqlite,10000,insert,10000,4986.051,0.388,0.613
+sqlite,10000,deduplicate,100,106.509,0.980,1.293
+sqlite,10000,list_50,100,1396.991,13.950,14.589
+sqlite,10000,search_common,100,87401.490,873.779,886.795
+sqlite,10000,search_missing,100,613.481,6.101,6.494
+sqlite,10000,recall_page_64,100,39.709,0.392,0.441
+sqlite,10000,reopen,10,516.552,51.449,52.945

@@ -99,6 +99,7 @@ fn migrates_schema_six_to_seven_and_backfills_lifecycle_sidecars() {
         }
     );
 
+    drop(store); // Release the Windows file lock before independent inspection.
     let connection = inspection(&db).unwrap();
     let lifecycle_tables: i64 = connection
         .query_row(
@@ -442,6 +443,7 @@ fn encrypted_grace_bin_is_self_contained_and_scrubs_large_cas_plaintext() {
     // pre-delete frames are truncated away before the plaintext scan below.
     assert!(store.scrub_wal_if_dirty().unwrap());
 
+    drop(store); // Raw file reads require the DuckDB handle to be closed on Windows.
     for path in [db.clone(), dir.path().join("history.duckdb.wal")] {
         if path.exists() {
             let bytes = std::fs::read(&path).unwrap();
@@ -455,6 +457,7 @@ fn encrypted_grace_bin_is_self_contained_and_scrubs_large_cas_plaintext() {
         }
     }
 
+    let store = Store::open(&db).unwrap();
     assert_eq!(
         store.restore_from_grace(&recovery_id, &key).unwrap(),
         clip.id
