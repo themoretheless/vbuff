@@ -1822,13 +1822,6 @@ impl PopupApp {
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(side_margin);
-                    let outcome = self.delivery.outcome_label();
-                    ui.label(RichText::new(outcome).small().strong())
-                        .on_hover_text(if self.delivery.automatic_paste {
-                            "Enter hides vbuff, restores the previous app and pastes."
-                        } else {
-                            "Enter copies to the clipboard; paste it yourself."
-                        });
                     match layout {
                         LayoutVariant::Cockpit => {
                             ui.label(
