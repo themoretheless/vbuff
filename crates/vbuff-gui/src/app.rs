@@ -113,6 +113,31 @@ enum StackRowAction {
     Delete(PasteStackItemId),
 }
 
+/// What Enter means for the current modifier state in History.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterIntent {
+    /// Ctrl/Cmd+Enter while the queue has items: deliver the next queued item.
+    PasteNextQueued,
+    /// Alt+Enter: append the selected clip to the queue.
+    AddToQueue,
+    /// Shift+Enter: deliver the selected clip as plain text.
+    PastePlain,
+    /// Enter: deliver the selected clip as captured.
+    Paste,
+}
+
+fn enter_intent(modifiers: egui::Modifiers, queue_has_items: bool) -> EnterIntent {
+    if (modifiers.command || modifiers.ctrl) && queue_has_items {
+        EnterIntent::PasteNextQueued
+    } else if modifiers.alt {
+        EnterIntent::AddToQueue
+    } else if modifiers.shift {
+        EnterIntent::PastePlain
+    } else {
+        EnterIntent::Paste
+    }
+}
+
 /// The eframe application driving the popup.
 pub struct PopupApp {
     state: SharedState,
@@ -762,21 +787,54 @@ impl eframe::App for PopupApp {
                     self.selected = self.selected.saturating_sub(keyboard_page);
                     self.scroll_selection_into_view = true;
                 }
-                let queue_next = history_shortcuts_enabled
-                    && modifier_down
-                    && i.key_pressed(Key::Enter)
-                    && !self.paste_stack.items().is_empty();
-                if queue_next {
-                    self.paste_next_queued();
-                }
-                if history_shortcuts_enabled
-                    && !queue_next
-                    && i.key_pressed(Key::Enter)
-                    && total > 0
-                    && selected_delivery_allowed
-                    && let Some(hit) = filtered.get(self.selected)
-                {
-                    self.actions.push_back(UiAction::Paste(hit.id));
+                let enter_intent = if history_shortcuts_enabled && i.key_pressed(Key::Enter) {
+                    Some(enter_intent(
+                        i.modifiers,
+                        !self.paste_stack.items().is_empty(),
+                    ))
+                } else {
+                    None
+                };
+                match enter_intent {
+                    Some(EnterIntent::PasteNextQueued) => self.paste_next_queued(),
+                    Some(EnterIntent::AddToQueue) => {
+                        if let Some(hit) = filtered.get(self.selected)
+                            && let Some(clip) = clips.iter().find(|clip| clip.id == hit.id)
+                            && !clip.meta.sensitive
+                            && let Some(text) = clip.primary_text()
+                            && let Ok(item_id) = self.paste_stack.add(clip.meta.kind.label(), text)
+                        {
+                            self.undo_slot = Some(UndoSlot {
+                                action: UndoAction::Stack {
+                                    clip_id: clip.id,
+                                    item_id,
+                                },
+                                expires_at: Instant::now() + Duration::from_secs(5),
+                            });
+                        }
+                    }
+                    Some(EnterIntent::PastePlain) => {
+                        if selected_delivery_allowed
+                            && let Some(hit) = filtered.get(self.selected)
+                            && let Some(clip) = clips.iter().find(|clip| clip.id == hit.id)
+                            && !clip.meta.sensitive
+                            && let Some(text) = clip.primary_text()
+                        {
+                            self.actions.push_back(UiAction::PasteText {
+                                text: ClipText::new(text.to_owned()),
+                                sensitive: false,
+                            });
+                        }
+                    }
+                    Some(EnterIntent::Paste) => {
+                        if total > 0
+                            && selected_delivery_allowed
+                            && let Some(hit) = filtered.get(self.selected)
+                        {
+                            self.actions.push_back(UiAction::Paste(hit.id));
+                        }
+                    }
+                    None => {}
                 }
                 // Cmd/Ctrl + 1..9 quick select.
                 if history_shortcuts_enabled && modifier_down {
@@ -2487,7 +2545,7 @@ impl PopupApp {
             (PaletteCommand::Settings, "Settings".to_owned(), true),
             (
                 PaletteCommand::PasteSelected,
-                format!("{} selected clip", self.delivery.action_label()),
+                format!("{} selected clip (Enter)", self.delivery.action_label()),
                 delivery_allowed,
             ),
             (
@@ -2499,7 +2557,7 @@ impl PopupApp {
             ),
             (
                 PaletteCommand::AddSelectedToStack,
-                "Add selected clip to Stack".to_owned(),
+                "Add selected clip to Stack (Alt+Enter)".to_owned(),
                 true,
             ),
             (
@@ -5147,6 +5205,29 @@ mod tests {
             pinned: false,
             favorite: false,
         }
+    }
+
+    #[test]
+    fn enter_modifiers_map_to_one_intent() {
+        let none = egui::Modifiers::NONE;
+        assert_eq!(enter_intent(none, false), EnterIntent::Paste);
+        assert_eq!(
+            enter_intent(egui::Modifiers::SHIFT, false),
+            EnterIntent::PastePlain
+        );
+        assert_eq!(
+            enter_intent(egui::Modifiers::ALT, false),
+            EnterIntent::AddToQueue
+        );
+        // Ctrl/Cmd+Enter keeps its old meaning when there is no queue.
+        assert_eq!(
+            enter_intent(egui::Modifiers::COMMAND, false),
+            EnterIntent::Paste
+        );
+        assert_eq!(
+            enter_intent(egui::Modifiers::COMMAND, true),
+            EnterIntent::PasteNextQueued
+        );
     }
 
     #[test]
