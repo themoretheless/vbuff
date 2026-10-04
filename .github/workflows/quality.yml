@@ -33,6 +33,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test workspace
         run: cargo test --workspace --no-default-features --features ${{ matrix.backend }},tray --locked
+      # Failed popup snapshot tests leave their actual output next to the goldens.
+      # Keep it so goldens for each OS can be taken from real CI renders.
+      - name: Upload popup snapshot output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: popup-snapshots-${{ matrix.os }}-${{ matrix.backend }}
+          path: |
+            crates/vbuff-gui/tests/snapshots/*.new.png
+            crates/vbuff-gui/tests/snapshots/*.diff.png
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.backend }},tray --locked -- -D warnings
       - name: Core-only build
