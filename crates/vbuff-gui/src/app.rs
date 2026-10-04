@@ -836,6 +836,25 @@ impl eframe::App for PopupApp {
                     }
                     None => {}
                 }
+                // Cmd/Ctrl + P toggles the pin on the selected clip.
+                if history_shortcuts_enabled
+                    && modifier_down
+                    && !i.modifiers.alt
+                    && i.key_pressed(Key::P)
+                    && let Some(hit) = filtered.get(self.selected)
+                    && !memory_only_clips.contains(&hit.id)
+                    && let Some(clip) = clips.iter().find(|clip| clip.id == hit.id)
+                {
+                    self.actions
+                        .push_back(UiAction::SetPinned(hit.id, !clip.pinned));
+                    self.undo_slot = Some(UndoSlot {
+                        action: UndoAction::Pin {
+                            id: hit.id,
+                            previous: clip.pinned,
+                        },
+                        expires_at: Instant::now() + Duration::from_secs(5),
+                    });
+                }
                 // Cmd/Ctrl + 1..9 quick select.
                 if history_shortcuts_enabled && modifier_down {
                     for (n, key) in [
@@ -2550,7 +2569,7 @@ impl PopupApp {
             ),
             (
                 PaletteCommand::PinSelected,
-                "Pin selected clip".to_owned(),
+                "Pin selected clip (Ctrl/Cmd+P)".to_owned(),
                 filtered
                     .get(self.selected)
                     .is_some_and(|hit| !memory_only_clips.contains(&hit.id)),
