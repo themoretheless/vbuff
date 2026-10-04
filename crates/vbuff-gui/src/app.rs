@@ -762,7 +762,15 @@ impl eframe::App for PopupApp {
                     self.selected = self.selected.saturating_sub(keyboard_page);
                     self.scroll_selection_into_view = true;
                 }
+                let queue_next = history_shortcuts_enabled
+                    && modifier_down
+                    && i.key_pressed(Key::Enter)
+                    && !self.paste_stack.items().is_empty();
+                if queue_next {
+                    self.paste_next_queued();
+                }
                 if history_shortcuts_enabled
+                    && !queue_next
                     && i.key_pressed(Key::Enter)
                     && total > 0
                     && selected_delivery_allowed
@@ -930,6 +938,17 @@ impl eframe::App for PopupApp {
                 .frame(egui::Frame::new().fill(fill))
                 .show(root_ui, |ui| {
                     self.render_preview_pane(ui, &ctx, clip, self.selected, total, layout);
+                });
+        }
+
+        // 6c. Queue tray: only exists while the queue has items.
+        if self.surface == PopupSurface::History && !self.paste_stack.items().is_empty() {
+            egui::Panel::bottom("queue_tray")
+                .exact_size(design::FOOTER_HEIGHT)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(visuals.faint_bg_color))
+                .show(root_ui, |ui| {
+                    self.render_queue_tray(ui);
                 });
         }
 
@@ -1867,6 +1886,64 @@ impl PopupApp {
                 });
             },
         );
+    }
+
+    /// Take the first queued item and deliver it as a one-shot paste.
+    fn paste_next_queued(&mut self) {
+        let Some(id) = self.paste_stack.items().first().map(|item| item.id) else {
+            return;
+        };
+        if let Ok(item) = self.paste_stack.remove(id) {
+            self.actions.push_back(UiAction::PasteText {
+                text: ClipText::new(item.text),
+                sensitive: false,
+            });
+        }
+    }
+
+    fn render_queue_tray(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            Stroke::new(1.0_f32, design::border(ui)),
+        );
+        let count = self.paste_stack.items().len();
+        let next = self
+            .paste_stack
+            .items()
+            .first()
+            .map(|item| bounded_preview(&item.text.replace('\n', " "), 40))
+            .unwrap_or_default();
+        let verb = self.delivery.action_label();
+        ui.horizontal_centered(|ui| {
+            ui.add_space(design::SPACE_M);
+            ui.label(RichText::new(format!("Queue · {count}")).small().strong());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("next: {next}"))
+                        .small()
+                        .color(design::secondary_text(ui)),
+                )
+                .truncate(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(design::SPACE_M);
+                if ui.small_button("Clear").clicked() {
+                    self.paste_stack.clear();
+                }
+                if ui.small_button("Edit").clicked() {
+                    self.surface = PopupSurface::Compose;
+                    self.request_focus_next_frame = false;
+                }
+                if ui
+                    .small_button(format!("{verb} next  Ctrl/\u{2318}\u{21b5}"))
+                    .clicked()
+                {
+                    self.paste_next_queued();
+                }
+            });
+        });
     }
 
     fn render_action_menu(&mut self, ui: &mut egui::Ui, paused: bool) {
