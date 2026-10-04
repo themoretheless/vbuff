@@ -12,6 +12,8 @@ pub(crate) fn init() {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .fmt_fields(fields)
+        // Logs never share stdout with machine-readable output such as `doctor --json`.
+        .with_writer(std::io::stderr)
         .init();
 }
 
