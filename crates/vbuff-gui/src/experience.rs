@@ -239,6 +239,15 @@ impl DeliveryCapabilities {
         }
     }
 
+    /// Outcome of Enter, stated before the user acts.
+    pub const fn outcome_label(self) -> &'static str {
+        if self.automatic_paste {
+            "\u{2192} Pastes into previous app"
+        } else {
+            "Copy only"
+        }
+    }
+
     pub const fn allows(self, sensitive: bool) -> bool {
         !sensitive || self.sensitive_copy
     }
@@ -639,6 +648,7 @@ mod tests {
     fn delivery_defaults_to_non_sensitive_copy_only() {
         let delivery = DeliveryCapabilities::default();
         assert_eq!(delivery.action_label(), "Copy");
+        assert_eq!(delivery.outcome_label(), "Copy only");
         assert!(!delivery.automatic_paste);
         assert!(delivery.allows(false));
         assert!(!delivery.allows(true));
