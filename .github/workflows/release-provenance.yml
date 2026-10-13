@@ -47,7 +47,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --features duckdb,tray --locked 2>&1 | tee "evidence/tests-${{ matrix.name }}.log"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: vbuff-test-evidence-${{ matrix.name }}
@@ -93,7 +93,7 @@ jobs:
         run: |
           cargo cyclonedx --format json --describe binaries --features duckdb,tray
           find . -path './evidence' -prune -o -name '*.cdx.json' -exec cp --parents '{}' evidence/ \;
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: vbuff-security-performance-evidence
@@ -125,7 +125,7 @@ jobs:
           cargo auditable build --release --locked
           mkdir -p dist
           cp target/release/vbuff dist/vbuff
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vbuff-repro-${{ matrix.replica }}
           path: dist/vbuff
@@ -173,7 +173,7 @@ jobs:
             printf 'attestation_id=%s\n' "${{ steps.attest.outputs.attestation-id }}"
             printf 'attestation_url=%s\n' "${{ steps.attest.outputs.attestation-url }}"
           } > dist/provenance.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vbuff-linux-x86_64
           path: dist
@@ -213,7 +213,7 @@ jobs:
           find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/VBUFF-EVIDENCE-MANIFEST.sha256"
           mv "$RUNNER_TEMP/VBUFF-EVIDENCE-MANIFEST.sha256" MANIFEST.sha256
           sha256sum --check MANIFEST.sha256
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vbuff-release-evidence-${{ github.run_id }}
           path: evidence
