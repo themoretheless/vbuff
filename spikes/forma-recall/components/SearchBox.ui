@@ -1,0 +1,22 @@
+// The command bar input.
+component SearchBox {
+    width: 640;
+    height: 44;
+    value: '';
+    placeholder: 'Search clips';
+
+    Rectangle {
+        radius: 8;
+        background: Brush { color: #0F1114; };
+        TextInput {
+            width: 620;
+            height: 44;
+            value: props.value;
+            placeholder: props.placeholder;
+            color: #E8EAED;
+            placeholderColor: #7C8490;
+            fontSize: 18;
+        }
+        PointerArea { clicked -> events.clicked(); }
+    }
+}

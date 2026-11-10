@@ -1,0 +1,23 @@
+// Scene-level multi-line text pinned to the top-left of its box.
+component Block {
+    text: '';
+    color: #E8EAED;
+    fontSize: 13;
+
+    Rectangle {
+        radius: 0;
+        background: Brush { color: #00000000; };
+        Frame {
+            rows: [-, *];
+            clip: true;
+            Text {
+                row: 1;
+                width: 450;
+                wrap: true;
+                text: props.text;
+                color: props.color;
+                fontSize: props.fontSize;
+            }
+        }
+    }
+}

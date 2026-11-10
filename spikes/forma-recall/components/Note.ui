@@ -1,0 +1,17 @@
+// Passive start-aligned text.
+component Note {
+    text: '';
+    color: #9AA1AB;
+    fontSize: 12;
+
+    Frame {
+        columns: [-, *];
+        clip: true;
+        Text {
+            cell: 1 1;
+            text: props.text;
+            color: props.color;
+            fontSize: props.fontSize;
+        }
+    }
+}

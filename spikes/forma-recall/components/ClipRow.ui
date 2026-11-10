@@ -1,0 +1,41 @@
+// One history row: kind tag, first line, source and a selection badge.
+component ClipRow {
+    width: 394;
+    height: 40;
+    kind: '';
+    title: '';
+    place: '';
+    badge: '';
+    selected: false;
+    fill: match props.selected {
+        true => #222A14;
+        _ => #00000000;
+    };
+    hoverFill: match props.selected {
+        true => #222A14;
+        _ => #1A1D22;
+    };
+    badgeColor: match props.selected {
+        true => #D4F25A;
+        _ => #9AA1AB;
+    };
+
+    Rectangle {
+        radius: 7;
+        background: Brush {
+            color: props.fill;
+            hover: props.hoverFill;
+            pressed: #222A14;
+        };
+        Frame {
+            columns: [34, *, 96, 10];
+            padding: 0 12;
+            gap: 8;
+            Note { cell: 1 1; text: props.kind; fontSize: 11; }
+            Note { cell: 1 2; text: props.title; color: #E8EAED; fontSize: 13; }
+            Note { cell: 1 3; text: props.place; fontSize: 11; }
+            Note { cell: 1 4; text: props.badge; color: props.badgeColor; fontSize: 11; }
+        }
+        PointerArea { clicked -> events.clicked(); }
+    }
+}

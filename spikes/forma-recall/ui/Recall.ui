@@ -1,0 +1,68 @@
+component Recall {
+    contextType: 'crate::RecallVm';
+    event picked(id: String);
+    event queryChanged();
+
+    Frame {
+        width: 900;
+        height: 580;
+        background: #0F1114;
+        columns: [*];
+        rows: [64, *, 42];
+
+        Row {
+            cell: 1 1;
+            padding: 0 20;
+            gap: 14;
+            Line { width: 14; height: 44; text: '›'; color: #D4F25A; fontSize: 18; }
+            SearchBox {
+                key: 'search';
+                value <-> state.query;
+                changed -> events.queryChanged();
+            }
+            Line { width: 178; height: 44; text: state.target; color: #E8EAED; fontSize: 12; }
+        }
+
+        Row {
+            cell: 2 1;
+            gap: 0;
+
+            Column {
+                width: 410;
+                padding: 6 8;
+                gap: 2;
+                Line { width: 394; height: 22; text: state.heading; color: #7C8490; fontSize: 11; }
+                for row in state.rows key row.id {
+                    ClipRow {
+                        key: 'row';
+                        kind: row.kind;
+                        title: row.title;
+                        place: row.place;
+                        badge: row.badge;
+                        selected: row.selected;
+                        clicked -> events.picked(row.id);
+                    }
+                } empty {
+                    Line { width: 394; height: 40; text: 'No clips match. The whole history was searched.'; fontSize: 13; }
+                }
+            }
+
+            Column {
+                width: 490;
+                padding: 18 20;
+                gap: 12;
+                Line { width: 450; height: 16; text: 'THIS IS WHAT GETS PASTED'; color: #7C8490; fontSize: 11; }
+                Block { width: 450; height: 340; text: state.preview; }
+                Line { width: 450; height: 16; text: state.meta; fontSize: 12; }
+            }
+        }
+
+        Row {
+            cell: 3 1;
+            padding: 0 20;
+            gap: 16;
+            Line { width: 560; height: 42; text: state.status; fontSize: 12; }
+            Line { width: 284; height: 42; text: state.action; color: #E8EAED; fontSize: 12; }
+        }
+    }
+}

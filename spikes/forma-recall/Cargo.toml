@@ -1,0 +1,20 @@
+[package]
+name = "vbuff-forma-recall-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike: the Recall screen of vbuff drawn with Forma instead of egui."
+
+# Standalone on purpose: the main workspace must keep building without a
+# sibling checkout of the Forma repository.
+[workspace]
+
+[dependencies]
+forma = { path = "../../../forma/crates/forma" }
+vbuff-types = { path = "../../crates/vbuff-types" }
+vbuff-core = { path = "../../crates/vbuff-core" }
+vbuff-gui = { path = "../../crates/vbuff-gui" }
+winit = "0.30"
+softbuffer = "0.4"
+png = "0.17"
+chrono = "0.4"
