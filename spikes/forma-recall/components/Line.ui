@@ -1,0 +1,13 @@
+// Scene-level passive text. A control placed directly in a scene needs a
+// Rectangle root, so this wraps the Note leaf in a transparent one.
+component Line {
+    text: '';
+    color: #9AA1AB;
+    fontSize: 12;
+
+    Rectangle {
+        radius: 0;
+        background: Brush { color: #00000000; };
+        Note { text: props.text; color: props.color; fontSize: props.fontSize; }
+    }
+}
